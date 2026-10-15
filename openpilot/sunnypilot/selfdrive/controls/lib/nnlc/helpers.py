@@ -20,7 +20,8 @@ MOCK_MODEL_PATH = os.path.join(TORQUE_NN_MODEL_PATH, "MOCK.json")
 NN_MODEL_SUBSTITUTES = {
   # No Inster model exists. On the owner's 14 Oct 2026 drive the Kona EV model matched the Inster as well as any
   # Hyundai/Kia model, at the right strength for the Inster's 384 limit (within about 5%). Without this entry the
-  # closest-name search picks the Palisade, which matched that drive noticeably worse.
+  # closest-name search ties between the Palisade and the Santa Fe and takes whichever the file system lists first
+  # (the owner's device took the Santa Fe), so the result depended on the device.
   "HYUNDAI_INSTER": "HYUNDAI_KONA_EV",
 }
 
