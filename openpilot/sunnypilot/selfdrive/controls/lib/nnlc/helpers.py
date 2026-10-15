@@ -15,6 +15,15 @@ TORQUE_NN_MODEL_PATH = os.path.join(BASEDIR, "openpilot", "sunnypilot", "neural_
 TORQUE_NN_MODEL_SUBSTITUTE_PATH = os.path.join(BASEDIR, "opendbc_repo", "opendbc", "car", "torque_data/substitute.toml")
 MOCK_MODEL_PATH = os.path.join(TORQUE_NN_MODEL_PATH, "MOCK.json")
 
+# Stand-in neural models for cars that have no model of their own. Kept here rather than in opendbc's
+# torque_data/substitute.toml, which must not list a car that also has its own torque values (override.toml).
+NN_MODEL_SUBSTITUTES = {
+  # No Inster model exists. On the owner's 14 Oct 2026 drive the Kona EV model matched the Inster as well as any
+  # Hyundai/Kia model, at the right strength for the Inster's 384 limit (within about 5%). Without this entry the
+  # closest-name search picks the Palisade, which matched that drive noticeably worse.
+  "HYUNDAI_INSTER": "HYUNDAI_KONA_EV",
+}
+
 
 def similarity(s1: str, s2: str) -> float:
   return SequenceMatcher(None, s1, s2).ratio()
@@ -53,7 +62,7 @@ def get_nn_model_path(CP: structs.CarParams) -> tuple[str, str, bool]:
     if 0.0 <= max_similarity < 0.9:
       with open(TORQUE_NN_MODEL_SUBSTITUTE_PATH, 'rb') as f:
         sub = tomllib.load(f)
-      sub_candidate = sub.get(car_fingerprint, car_fingerprint)
+      sub_candidate = NN_MODEL_SUBSTITUTES.get(car_fingerprint, sub.get(car_fingerprint, car_fingerprint))
 
       for candidate in [car_fingerprint, sub_candidate]:
         model_path, max_similarity = check_nn_path(candidate)
