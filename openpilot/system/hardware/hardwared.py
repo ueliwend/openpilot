@@ -194,6 +194,54 @@ def hw_state_thread(end_event, hw_queue):
     time.sleep(DT_HW)
 
 
+class LoopTimer:
+  """Diagnostics only: when a published hardware_thread iteration, the time since the previous one, or the time
+  between two deviceState sends exceeds THRESHOLD, log how long each step took. Logs at most once per LOG_INTERVAL
+  and never raises."""
+  THRESHOLD = 1.0  # s
+  LOG_INTERVAL = 10.  # s
+
+  def __init__(self):
+    self.t0 = self.t = self.prev_end = self.send_t = self.prev_send_t = time.monotonic()
+    self.wait = 0.  # longest sm.update() wait since the previous published iteration
+    self.steps: dict[str, float] = {}
+    self.last_log: float | None = None
+    self.suppressed = 0
+
+  def start(self, wait_start: float) -> None:
+    # called right after sm.update() on every iteration, so an iteration that skips publishing leaves nothing behind
+    self.t0 = self.t = time.monotonic()
+    self.wait = max(self.wait, self.t0 - wait_start)
+    self.steps = {}
+
+  def mark(self, step: str) -> None:
+    now = time.monotonic()
+    self.steps[step] = now - self.t
+    self.t = now
+    if step == "send":
+      self.send_t = now
+
+  def finish(self) -> None:
+    try:
+      now = time.monotonic()
+      # gap: end of the previous published iteration to the start of this one (normally ~0.5 s),
+      # it contains every sm.update() wait since then, so a slow wait is caught as well
+      # interval: previous deviceState send to this one (normally 0.5 s, 0.75 s without a panda), so stalls split
+      # across the end of one iteration and the start of the next are caught too
+      total, gap, wait, interval = now - self.t0, self.t0 - self.prev_end, self.wait, self.send_t - self.prev_send_t
+      self.prev_end, self.wait, self.prev_send_t = now, 0., self.send_t
+      if total <= self.THRESHOLD and gap <= self.THRESHOLD and interval <= self.THRESHOLD:
+        return
+      if self.last_log is not None and now - self.last_log < self.LOG_INTERVAL:
+        self.suppressed += 1
+        return
+      self.last_log, suppressed, self.suppressed = now, self.suppressed, 0
+      cloudlog.event("hardwared slow loop", error=True, total_ms=round(total * 1e3), gap_ms=round(gap * 1e3), wait_ms=round(wait * 1e3),
+                     interval_ms=round(interval * 1e3), suppressed=suppressed, steps_ms={step: round(dt * 1e3) for step, dt in self.steps.items()})
+    except Exception:
+      pass
+
+
 def hardware_thread(end_event, hw_queue) -> None:
   system_stats = LinuxSystemStats() if sys.platform == "linux" else None
   pm = messaging.PubMaster(['deviceState'])
@@ -247,9 +295,15 @@ def hardware_thread(end_event, hw_queue) -> None:
   chestnut = Chestnut()
   chestnut_status = ChestnutStatus()
   branch = get_short_branch()
+  # build metadata can't change while running (updates are applied on reboot) and get_build_metadata() reads files, so only read it once
+  build_metadata = get_build_metadata()
+  is_unsupported_combo = COMMA_HARDWARE and HARDWARE.get_device_type() == "tici" and build_metadata.channel_type != "tici"
+  loop_timer = LoopTimer()
 
   while not end_event.is_set():
+    wait_start = time.monotonic()
     sm.update(PANDA_STATES_TIMEOUT)
+    loop_timer.start(wait_start)
 
     pandaStates = sm['pandaStates']
     peripheralState = sm['peripheralState']
@@ -278,6 +332,7 @@ def hardware_thread(end_event, hw_queue) -> None:
     ign_edge = (started_ts is not None) != all(onroad_conditions.values())
     if (sm.frame % round(SERVICE_LIST['pandaStates'].frequency * DT_HW) != 0) and not ign_edge:
       continue
+    loop_timer.mark("panda")
 
     msg = messaging.new_message('deviceState', valid=True)
     msg.deviceState = thermal_config.get_msg()
@@ -308,6 +363,7 @@ def hardware_thread(end_event, hw_queue) -> None:
     msg.deviceState.modemTempC = last_hw_state.modem_temps
 
     msg.deviceState.screenBrightnessPercent = HARDWARE.get_screen_brightness()
+    loop_timer.mark("stats")
 
     set_usb_state(msg.deviceState, last_hw_state.usb_state)
     chestnut.update(started_ts is None, last_hw_state.usb_state)
@@ -316,6 +372,7 @@ def hardware_thread(end_event, hw_queue) -> None:
     chestnut_status.update(started_ts is None, branch, last_hw_state.usb_state, chestnut.failed,
                            params.get_bool("ChestnutLoading"), params.get("ChestnutActive"),
                            chestnut_state if chestnut_valid else None, set_offroad_alert_if_changed)
+    loop_timer.mark("chestnut")
     # this subset is only used for offroad
     temp_sources = [
       msg.deviceState.memoryTempC,
@@ -343,6 +400,7 @@ def hardware_thread(end_event, hw_queue) -> None:
         thermal_status = list(THERMAL_BANDS.keys())[band_idx - 1]
       elif current_band.max_temp is not None and all_comp_temp > current_band.max_temp:
         thermal_status = list(THERMAL_BANDS.keys())[band_idx + 1]
+    loop_timer.mark("thermal")
 
     # **** starting logic ****
 
@@ -367,16 +425,15 @@ def hardware_thread(end_event, hw_queue) -> None:
     offroad_mode = params.get_bool("OffroadMode")
     startup_conditions["not_always_offroad"] = not offroad_mode
     onroad_conditions["not_always_offroad"] = not offroad_mode
+    loop_timer.mark("startup")
 
     # if an unsupported device and branch is detected, going onroad is blocked
     # only allow going onroad when:
     # - TIZI, or
     # - TICI and channel_type is "tici"
-    build_metadata = get_build_metadata()
-    is_unsupported_combo = COMMA_HARDWARE and HARDWARE.get_device_type() == "tici" and build_metadata.channel_type != "tici"
     startup_conditions["not_tici"] = not is_unsupported_combo
     onroad_conditions["not_tici"] = not is_unsupported_combo
-    set_offroad_alert("Offroad_TiciSupport", is_unsupported_combo, extra_text=build_metadata.channel)
+    set_offroad_alert_if_changed("Offroad_TiciSupport", is_unsupported_combo, extra_text=build_metadata.channel)
 
     # if the temperature enters the danger zone, go offroad to cool down
     onroad_conditions["device_temp_good"] = thermal_status < ThermalStatus.critical
@@ -386,6 +443,7 @@ def hardware_thread(end_event, hw_queue) -> None:
 
     if show_alert:
       msg.deviceState.fanSpeedPercentDesired = 100
+    loop_timer.mark("alerts")
 
     # Handle offroad/onroad transition
     should_start = all(onroad_conditions.values())
@@ -407,6 +465,7 @@ def hardware_thread(end_event, hw_queue) -> None:
           kmsg.write(f"<3>[hardware] engaged: {engaged}\n")
       except Exception:
         pass
+    loop_timer.mark("engage")
 
     should_pwrsave = not onroad_conditions["ignition"] and msg.deviceState.screenBrightnessPercent < 1e-3
     if should_pwrsave != pwrsave or (count == 0):
@@ -458,6 +517,7 @@ def hardware_thread(end_event, hw_queue) -> None:
 
     msg.deviceState.started = started_ts is not None and not offroad_mode
     msg.deviceState.startedMonoTime = int(1e9*(started_ts or 0))
+    loop_timer.mark("power")
 
     last_ping = params.get("LastAthenaPingTime")
     if last_ping is not None:
@@ -465,6 +525,7 @@ def hardware_thread(end_event, hw_queue) -> None:
 
     msg.deviceState.thermalStatus = thermal_status
     pm.send("deviceState", msg)
+    loop_timer.mark("send")
 
     statlog.gauge("free_space_percent", msg.deviceState.freeSpacePercent)
     statlog.gauge("gpu_usage_percent", msg.deviceState.gpuUsagePercent)
@@ -502,6 +563,7 @@ def hardware_thread(end_event, hw_queue) -> None:
           params.put("LastOffroadStatusPacket", dat, block=True)
         except Exception:
           cloudlog.exception("failed to save offroad status")
+    loop_timer.mark("status")
 
     params.put_bool("NetworkMetered", msg.deviceState.networkMetered)
 
@@ -518,6 +580,8 @@ def hardware_thread(end_event, hw_queue) -> None:
 
     count += 1
     should_start_prev = should_start
+    loop_timer.mark("uptime")
+    loop_timer.finish()
 
 
 def main():
