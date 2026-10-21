@@ -437,8 +437,11 @@ def hardware_thread(end_event, hw_queue) -> None:
 
     # if the temperature enters the danger zone, go offroad to cool down
     onroad_conditions["device_temp_good"] = thermal_status < ThermalStatus.critical
-    extra_text = f"{offroad_comp_temp:.1f}C"
     show_alert = (not onroad_conditions["device_temp_good"] or not startup_conditions["device_temp_engageable"]) and onroad_conditions["ignition"]
+    # every change of (show_alert, text) is a params write or remove under the params lock: pass the text only while the
+    # alert is shown, in 0.5 C steps (with a 0.1 C text it changed on about a third of the loops, even with the alert off).
+    # round(x, 0) keeps a float, so a NaN or inf temperature can't raise here
+    extra_text = f"{round(offroad_comp_temp * 2, 0) / 2:.1f}C" if show_alert else None
     set_offroad_alert_if_changed("Offroad_TemperatureTooHigh", show_alert, extra_text=extra_text)
 
     if show_alert:

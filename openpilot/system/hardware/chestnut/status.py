@@ -27,6 +27,7 @@ class ChestnutStatus:
     self.overheated = False
     self.usb_seen = False
     self.usb_failed = False
+    self.channel: str | None = None
 
   def update(self, offroad: bool, branch: str, usb_state: list[dict], firmware_failed: bool,
              model_loading: bool, model_active: bool | None, state, set_alert) -> None:
@@ -82,8 +83,11 @@ class ChestnutStatus:
     missing = self.usb_failed or (offroad and release and time.monotonic() - self.started > 10. and len(detected) != 1)
     slow_usb = offroad and len(devices) == 1 and devices[0]["speedMbps"] < 5000
     big_model_available = (MODELS_DIR / 'big_driving_supercombo.onnx').is_file() or chestnut_compiled()
-    current_channel = get_build_metadata().channel
-    chestnut_target = CHESTNUT_BRANCHES.get(current_channel)
+    if self.channel is None:
+      # build metadata can't change while running (updates are applied on reboot) and get_build_metadata() reads files,
+      # so only read it on the first update
+      self.channel = get_build_metadata().channel
+    chestnut_target = CHESTNUT_BRANCHES.get(self.channel)
     chestnut_needs_switch = len(devices) == 1 and not big_model_available and chestnut_target is not None
     set_alert("Offroad_ChestnutBranch", chestnut_needs_switch, chestnut_target if chestnut_needs_switch else None)
     set_alert("Offroad_ChestnutNotDetected", missing)
