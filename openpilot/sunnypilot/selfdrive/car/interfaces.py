@@ -10,6 +10,7 @@ from opendbc.car import structs
 from opendbc.car.interfaces import CarInterfaceBase
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import is_inster
 from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.helpers import get_nn_model_path
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import set_speed_limit_assist_availability
 
@@ -68,6 +69,12 @@ def _cleanup_unsupported_params(CP: structs.CarParams, CP_SP: structs.CarParamsS
     cloudlog.warning("LateralJerkTorqueController and NeuralNetworkLateralControl both enabled, disabling both")
     params.put_bool("LateralJerkTorqueController", False, block=True)
     params.put_bool("NeuralNetworkLateralControl", False, block=True)
+
+  # Hyundai Inster steering switches (torque controller v0): they replace the Lateral Jerk Torque Controller
+  if is_inster(CP) and params.get_bool("LateralJerkTorqueController") and \
+     (params.get_bool("InsterStictionFriction") or params.get_bool("InsterSpeedFeedforward")):
+    cloudlog.warning("Inster steering switch enabled, disabling LateralJerkTorqueController")
+    params.put_bool("LateralJerkTorqueController", False, block=True)
 
   if CP.steerControlType == structs.CarParams.SteerControlType.angle:
     cloudlog.warning("SteerControlType is angle, cleaning up params")

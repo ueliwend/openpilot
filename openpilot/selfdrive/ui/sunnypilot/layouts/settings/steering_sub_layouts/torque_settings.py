@@ -12,6 +12,7 @@ import pyray as rl
 
 from openpilot.common.basedir import BASEDIR
 from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import is_inster
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.sunnypilot.lib.utils import NoElideButtonAction
@@ -101,6 +102,21 @@ class TorqueSettingsLayout(Widget):
       use_float_scaling=True
     )
 
+    # Hyundai Inster only (torque controller v0 without NNLC; see sunnypilot/selfdrive/controls/lib/inster_lateral.py)
+    self._inster_friction_toggle = toggle_item_sp(
+      param="InsterStictionFriction",
+      title=lambda: tr("Inster: Stiction Friction (experimental)"),
+      description=lambda: tr("Hyundai Inster only. Replaces the friction part of the torque controller with a smooth term matched to " +
+                             "the Inster's steering friction, so the wheel starts moving sooner when steering into and out of curves. " +
+                             "Off by default."),
+    )
+    self._inster_ff_toggle = toggle_item_sp(
+      param="InsterSpeedFeedforward",
+      title=lambda: tr("Inster: Speed Feed-Forward Table (experimental)"),
+      description=lambda: tr("Hyundai Inster only. Uses a measured table of steering torque per speed and sideways acceleration for " +
+                             "the feed-forward instead of one linear factor. Off by default."),
+    )
+
     items = [
       self._jerk_aware_toggle,
       self._torque_control_versions,
@@ -110,13 +126,22 @@ class TorqueSettingsLayout(Widget):
       self._torque_prams_override_toggle,
       self._torque_lat_accel_factor,
       self._torque_friction,
+      self._inster_friction_toggle,
+      self._inster_ff_toggle,
     ]
     return items
 
   def _update_state(self):
     super()._update_state()
     nnlc_enabled = ui_state.params.get_bool("NeuralNetworkLateralControl")
-    self._jerk_aware_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
+    inster = is_inster(ui_state.CP)
+    inster_switch_on = inster and (self._inster_friction_toggle.action_item.get_state() or self._inster_ff_toggle.action_item.get_state())
+    if inster_switch_on and self._jerk_aware_toggle.action_item.get_state():
+      self._jerk_aware_toggle.action_item.set_state(False)  # the param itself is switched off by ui_state._enforce_constraints
+    self._jerk_aware_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled and not inster_switch_on)
+    for inster_toggle in (self._inster_friction_toggle, self._inster_ff_toggle):
+      inster_toggle.set_visible(inster)
+      inster_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
     if not ui_state.params.get_bool("LiveTorqueParamsToggle"):
       ui_state.params.remove("LiveTorqueParamsRelaxedToggle")
       self._relaxed_tune_toggle.action_item.set_state(False)

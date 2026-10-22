@@ -12,6 +12,7 @@ from opendbc.sunnypilot.car.interfaces import has_bsm
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.display import OnroadBrightness
 from openpilot.sunnypilot.models.helpers import ACTIVE_BUNDLE_KEYS, get_active_source
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import is_inster
 from openpilot.sunnypilot.sunnylink.sunnylink_state import SunnylinkState
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.sunnypilot.widgets.screen_saver import ScreenSaverSP
@@ -201,6 +202,11 @@ class UIStateSP:
       if self.params.get_bool("LateralJerkTorqueController") and self.params.get_bool("NeuralNetworkLateralControl"):
         self.params.put_bool("LateralJerkTorqueController", False, block=True)
         self.params.put_bool("NeuralNetworkLateralControl", False, block=True)
+
+      # Hyundai Inster steering switches (torque controller v0) replace the Lateral Jerk Torque Controller
+      if is_inster(CP) and self.params.get_bool("LateralJerkTorqueController") and \
+         (self.params.get_bool("InsterStictionFriction") or self.params.get_bool("InsterSpeedFeedforward")):
+        self.params.put_bool("LateralJerkTorqueController", False, block=True)
 
       # Angle steering: no torque-based lateral controls
       if CP.steerControlType == car.CarParams.SteerControlType.angle:

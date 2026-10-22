@@ -6,9 +6,13 @@ from openpilot.cereal import log
 from opendbc.car.lateral import get_friction
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.common.filter_simple import FirstOrderFilter
+from openpilot.common.params import Params
+from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.common.pid import PIDController
 
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import InsterStictionFriction, STEER_MAX_RAW, ff_lat_accel_equivalent, \
+                                                                       is_inster
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_ext import LatControlTorqueExt
 
 # At higher speeds (25+mph) we can assume:
@@ -50,6 +54,34 @@ class LatControlTorque(LatControl):
 
     self.extension = LatControlTorqueExt(self, CP, CP_SP, CI)
 
+    # Hyundai Inster steering candidates (experimental, off by default, see inster_lateral.py). The switches are read once and only
+    # for the Inster: every other car, and the Inster with both switches off, runs the unchanged code below.
+    self.inster_friction = False
+    self.inster_ff = False
+    if is_inster(CP):
+      self._init_inster(Params())
+
+  def _init_inster(self, params):
+    friction = params.get_bool("InsterStictionFriction")
+    feedforward = params.get_bool("InsterSpeedFeedforward")
+    if not (friction or feedforward):
+      return
+    if params.get_bool("NeuralNetworkLateralControl"):
+      cloudlog.warning("Inster steering switches are ignored: they apply to the v0 torque controller without NNLC")
+      return
+    self.inster_friction = friction
+    self.inster_ff = feedforward
+    # v0 keeps its own output: the Lateral Jerk Torque Controller extension must not replace it (its torque-params override stays)
+    if self.extension._jerk_aware_enabled:
+      cloudlog.warning("Inster steering switch enabled: the Lateral Jerk Torque Controller is not used")
+      self.extension._jerk_aware_enabled = False
+    if friction:
+      self.inster_stiction = InsterStictionFriction(self.dt)
+      # desired curvature of the last second, every step (the request made lat_delay ago is the plan for now)
+      self.inster_curvature_buffer = deque([0.] * self.lat_accel_request_buffer_len, maxlen=self.lat_accel_request_buffer_len)
+      self.inster_past_curvature = 0.0
+      self.inster_last_output_torque = 0.0
+
   def update_torque_parameters(self, latAccelFactor, latAccelOffset, friction):
     self.torque_params.latAccelFactor = latAccelFactor
     self.torque_params.latAccelOffset = latAccelOffset
@@ -65,11 +97,21 @@ class LatControlTorque(LatControl):
     if self.extension.update_override_torque_params(self.torque_params):
       self.update_limits()
 
+    if self.inster_friction:
+      # the curvature requested lat_delay ago (the plan for now); the history is kept every step, active or not
+      inster_delay_frames = int(np.clip(lat_delay / self.dt, 1, self.lat_accel_request_buffer_len))
+      self.inster_past_curvature = self.inster_curvature_buffer[-inster_delay_frames]
+      self.inster_curvature_buffer.append(desired_curvature)
+
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = VERSION
     if not active:
       output_torque = 0.0
       pid_log.active = False
+      if self.inster_friction:
+        # inactive: v0 outputs 0; the term restarts settled on the next active step
+        self.inster_stiction.reset()
+        self.inster_last_output_torque = 0.0
     else:
       measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
       roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY
@@ -96,8 +138,16 @@ class LatControlTorque(LatControl):
       ff = gravity_adjusted_future_lateral_accel
       # latAccelOffset corrects roll compensation bias from device roll misalignment relative to car roll
       ff -= self.torque_params.latAccelOffset
-      # TODO jerk is weighted by lat_delay for legacy reasons, but should be made independent of it
-      ff += get_friction(error, lateral_accel_deadzone, FRICTION_THRESHOLD, self.torque_params)
+      if self.inster_ff:
+        # Inster: feed-forward from the measured speed x lateral-acceleration table, in linear-equivalent lateral acceleration
+        ff = ff_lat_accel_equivalent(ff, CS.vEgo, self.torque_params.latAccelFactor)
+      if self.inster_friction:
+        # Inster: stiction friction term (raw command units) instead of get_friction
+        ff += self._inster_friction_raw(CS, VM, desired_curvature, self.inster_past_curvature, measured_curvature,
+                                        lat_delay) / STEER_MAX_RAW * self.torque_params.latAccelFactor
+      else:
+        # TODO jerk is weighted by lat_delay for legacy reasons, but should be made independent of it
+        ff += get_friction(error, lateral_accel_deadzone, FRICTION_THRESHOLD, self.torque_params)
 
       freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
       output_lataccel = self.pid.update(pid_log.error,
@@ -112,6 +162,8 @@ class LatControlTorque(LatControl):
       pid_log, output_torque = self.extension.update(CS, VM, self.pid, params, ff, pid_log, setpoint, measurement, calibrated_pose, roll_compensation,
                                                      future_desired_lateral_accel, measurement, lateral_accel_deadzone, gravity_adjusted_future_lateral_accel,
                                                      desired_curvature, measured_curvature, steer_limited_by_safety, output_torque)
+      if self.inster_friction:
+        self.inster_last_output_torque = output_torque
 
       pid_log.active = True
       pid_log.p = float(self.pid.p)
@@ -126,3 +178,13 @@ class LatControlTorque(LatControl):
 
     # TODO left is positive in this convention
     return -output_torque, 0.0, pid_log
+
+  def _inster_friction_raw(self, CS, VM, desired_curvature, past_curvature, measured_curvature, lat_delay):
+    # steering-wheel degrees per unit curvature at this speed (vehicle model without the roll term; the measured curvature keeps its
+    # roll compensation, as v0's measurement does). Curvatures and the term are + right, like v0's internal convention.
+    steer_deg_per_curvature = math.degrees(VM.get_steer_from_curvature(1.0, CS.vEgo, 0.0))
+    return self.inster_stiction.update(CS.vEgo,
+                                       steer_deg_per_curvature * desired_curvature,
+                                       steer_deg_per_curvature * past_curvature,
+                                       steer_deg_per_curvature * measured_curvature,
+                                       lat_delay, abs(CS.steeringRateDeg), self.inster_last_output_torque * STEER_MAX_RAW)
