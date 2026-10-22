@@ -10,7 +10,7 @@ from opendbc.car import structs
 from opendbc.car.interfaces import CarInterfaceBase
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
-from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import is_inster
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import any_inster_switch, is_inster
 from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.helpers import get_nn_model_path
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import set_speed_limit_assist_availability
 
@@ -71,8 +71,7 @@ def _cleanup_unsupported_params(CP: structs.CarParams, CP_SP: structs.CarParamsS
     params.put_bool("NeuralNetworkLateralControl", False, block=True)
 
   # Hyundai Inster steering switches (torque controller v0): they replace the Lateral Jerk Torque Controller
-  if is_inster(CP) and params.get_bool("LateralJerkTorqueController") and \
-     (params.get_bool("InsterStictionFriction") or params.get_bool("InsterSpeedFeedforward")):
+  if is_inster(CP) and params.get_bool("LateralJerkTorqueController") and any_inster_switch(params):
     cloudlog.warning("Inster steering switch enabled, disabling LateralJerkTorqueController")
     params.put_bool("LateralJerkTorqueController", False, block=True)
 
@@ -135,4 +134,11 @@ def initialize_params(params) -> list[dict[str, Any]]:
     "ToyotaStopAndGoHack",
   ])
 
-  return [{k: params.get(k, return_default=True)} for k in keys]
+  params_list = [{k: params.get(k, return_default=True)} for k in keys]
+
+  # hyundai inster: speed-dependent steering torque limit (experimental; opendbc sets HyundaiFlagsSP.INSTER_HIGH_TORQUE for the Inster
+  # only). Like the other Inster steering switches it is ignored while NNLC is enabled.
+  params_list.append({"InsterHighTorqueLimits": params.get_bool("InsterHighTorqueLimits") and
+                                                not params.get_bool("NeuralNetworkLateralControl")})
+
+  return params_list

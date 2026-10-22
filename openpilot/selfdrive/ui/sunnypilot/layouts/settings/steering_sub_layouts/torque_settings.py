@@ -116,6 +116,29 @@ class TorqueSettingsLayout(Widget):
       description=lambda: tr("Hyundai Inster only. Uses a measured table of steering torque per speed and sideways acceleration for " +
                              "the feed-forward instead of one linear factor. Off by default."),
     )
+    self._inster_exit_toggle = toggle_item_sp(
+      param="InsterExitTuning",
+      title=lambda: tr("Inster: Curve Exit Tuning (experimental)"),
+      description=lambda: tr("Hyundai Inster only. Works only together with Inster: Stiction Friction and Inster: Speed Feed-Forward " +
+                             "Table (greyed out otherwise). Lets the wheel release sooner and more smoothly at curve exits: a narrower " +
+                             "friction term, damping of the wheel while it unwinds, and a lower low-speed feed-forward in tight turns. " +
+                             "Turning it on also turns the Lateral Jerk Torque Controller off, even while it has no effect. Off by default."),
+    )
+    self._inster_low_speed_p_toggle = toggle_item_sp(
+      param="InsterLowSpeedP",
+      title=lambda: tr("Inster: Softer Low-Speed Correction (experimental)"),
+      description=lambda: tr("Hyundai Inster only. Lowers the torque controller's proportional correction to 75% below 20 km/h, " +
+                             "back to 100% at 30 km/h, against the lurch when leaving tight turns. Works with or without the other " +
+                             "Inster switches. Off by default."),
+    )
+    self._inster_high_torque_toggle = toggle_item_sp(
+      param="InsterHighTorqueLimits",
+      title=lambda: tr("Inster: Higher Steering Torque Limit (experimental)"),
+      description=lambda: tr("Hyundai Inster only. Allows more steering torque than the standard limit: up to 450 (instead of 384) " +
+                             "below 20 km/h, decreasing to 430 at 40 km/h and above, and plans up to 3.3 m/s^2 sideways acceleration " +
+                             "instead of 3.0. Above the usual safety limits; the steering unit's response above 384 is untested. " +
+                             "Off by default."),
+    )
 
     items = [
       self._jerk_aware_toggle,
@@ -128,6 +151,9 @@ class TorqueSettingsLayout(Widget):
       self._torque_friction,
       self._inster_friction_toggle,
       self._inster_ff_toggle,
+      self._inster_exit_toggle,
+      self._inster_low_speed_p_toggle,
+      self._inster_high_torque_toggle,
     ]
     return items
 
@@ -135,13 +161,18 @@ class TorqueSettingsLayout(Widget):
     super()._update_state()
     nnlc_enabled = ui_state.params.get_bool("NeuralNetworkLateralControl")
     inster = is_inster(ui_state.CP)
-    inster_switch_on = inster and (self._inster_friction_toggle.action_item.get_state() or self._inster_ff_toggle.action_item.get_state())
+    inster_toggles = (self._inster_friction_toggle, self._inster_ff_toggle, self._inster_exit_toggle, self._inster_low_speed_p_toggle,
+                      self._inster_high_torque_toggle)
+    inster_switch_on = inster and any(t.action_item.get_state() for t in inster_toggles)
     if inster_switch_on and self._jerk_aware_toggle.action_item.get_state():
       self._jerk_aware_toggle.action_item.set_state(False)  # the param itself is switched off by ui_state._enforce_constraints
     self._jerk_aware_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled and not inster_switch_on)
-    for inster_toggle in (self._inster_friction_toggle, self._inster_ff_toggle):
+    for inster_toggle in inster_toggles:
       inster_toggle.set_visible(inster)
       inster_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
+    # the exit tuning acts only with both step-2 switches on (the controller ignores it otherwise)
+    exit_tuning_usable = self._inster_friction_toggle.action_item.get_state() and self._inster_ff_toggle.action_item.get_state()
+    self._inster_exit_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled and exit_tuning_usable)
     if not ui_state.params.get_bool("LiveTorqueParamsToggle"):
       ui_state.params.remove("LiveTorqueParamsRelaxedToggle")
       self._relaxed_tune_toggle.action_item.set_state(False)
