@@ -1,6 +1,7 @@
 import numpy as np
 from abc import abstractmethod, ABC
 from openpilot.selfdrive.locationd.helpers import Pose
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import lateral_steer_max
 
 
 class LatControl(ABC):
@@ -11,7 +12,8 @@ class LatControl(ABC):
     self.sat_check_min_speed = 10.
 
     # we define the steer torque scale as [-1.0...1.0]
-    self.steer_max = 1.0
+    # sunnypilot: the Hyundai Inster's cap is 409 raw with 1.0 = 384 raw, so its limit is 409 / 384 (inster_lateral.py)
+    self.steer_max = lateral_steer_max(CP)
 
   @abstractmethod
   def update(self, active: bool, CS, VM, params, steer_limited_by_safety: bool, desired_curvature: float, calibrated_pose: Pose | None,

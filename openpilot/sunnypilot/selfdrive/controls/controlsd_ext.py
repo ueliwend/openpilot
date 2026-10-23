@@ -54,11 +54,6 @@ class ControlsExt(ModelStateBase):
       if self.CP.lateralTuning.which() == 'torque':
         self.lat_delay = get_lat_delay(self.params, sm["lateralDelay"].lateralDelay)
 
-      # Hyundai Inster: the torque cap may be changed while driving (only with InsterHighTorqueLimits active in v0)
-      lac = getattr(self, "LaC", None)
-      if getattr(lac, "inster_high_torque", False) is True:
-        lac.set_inster_torque_cap(self.params.get("InsterTorqueCap", return_default=True))
-
       self._param_update_time = time.monotonic()
 
   def get_lat_active(self, sm: messaging.SubMaster) -> bool:

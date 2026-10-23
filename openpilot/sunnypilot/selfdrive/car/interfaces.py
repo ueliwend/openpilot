@@ -134,11 +134,4 @@ def initialize_params(params) -> list[dict[str, Any]]:
     "ToyotaStopAndGoHack",
   ])
 
-  params_list = [{k: params.get(k, return_default=True)} for k in keys]
-
-  # hyundai inster: speed-dependent steering torque limit (experimental; opendbc sets HyundaiFlagsSP.INSTER_HIGH_TORQUE for the Inster
-  # only). Like the other Inster steering switches it is ignored while NNLC is enabled.
-  params_list.append({"InsterHighTorqueLimits": params.get_bool("InsterHighTorqueLimits") and
-                                                not params.get_bool("NeuralNetworkLateralControl")})
-
-  return params_list
+  return [{k: params.get(k, return_default=True)} for k in keys]

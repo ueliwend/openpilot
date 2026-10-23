@@ -116,41 +116,6 @@ class TorqueSettingsLayout(Widget):
       description=lambda: tr("Hyundai Inster only. Uses a measured table of steering torque per speed and sideways acceleration for " +
                              "the feed-forward instead of one linear factor. Off by default."),
     )
-    self._inster_exit_toggle = toggle_item_sp(
-      param="InsterExitTuning",
-      title=lambda: tr("Inster: Curve Exit Tuning (experimental)"),
-      description=lambda: tr("Hyundai Inster only. Works only together with Inster: Stiction Friction and Inster: Speed Feed-Forward " +
-                             "Table (greyed out otherwise). Lets the wheel release sooner and more smoothly at curve exits: a narrower " +
-                             "friction term, damping of the wheel while it unwinds, and a lower low-speed feed-forward in tight turns. " +
-                             "Turning it on also turns the Lateral Jerk Torque Controller off, even while it has no effect. Off by default."),
-    )
-    self._inster_low_speed_p_toggle = toggle_item_sp(
-      param="InsterLowSpeedP",
-      title=lambda: tr("Inster: Softer Low-Speed Correction (experimental)"),
-      description=lambda: tr("Hyundai Inster only. Lowers the torque controller's proportional correction to 75% below 20 km/h, " +
-                             "back to 100% at 30 km/h, against the lurch when leaving tight turns. Works with or without the other " +
-                             "Inster switches. Off by default."),
-    )
-    self._inster_high_torque_toggle = toggle_item_sp(
-      param="InsterHighTorqueLimits",
-      title=lambda: tr("Inster: Higher Steering Torque Limit (experimental)"),
-      description=lambda: tr("Hyundai Inster only. Allows more steering torque than the standard limit of 384, up to the value set in " +
-                             "Inster: Steering Torque Cap below (at most 450 below 20 km/h and 430 from 40 km/h), and plans up to " +
-                             "3.3 m/s^2 sideways acceleration instead of 3.0. Above the usual safety limits; the steering unit faults " +
-                             "above its own limit. Off by default."),
-    )
-    self._inster_torque_cap = option_item_sp(
-      title=lambda: tr("Inster: Steering Torque Cap (experimental)"),
-      param="InsterTorqueCap",
-      description=lambda: tr("Hyundai Inster only, with Inster: Higher Steering Torque Limit on (greyed out otherwise). The highest " +
-                             "steering command sent, 384 to 415 (384 = the standard limit). Meant to find the steering unit's limit: " +
-                             "above it the steering unit shows a temporary fault (Steering Assist Temporarily Unavailable / TAKE " +
-                             "CONTROL IMMEDIATELY). Can be changed while driving; takes effect within 3 seconds. Default 384."),
-      min_value=384,
-      max_value=415,
-      value_change_step=1,
-      label_callback=(lambda x: f"{x} ({x / 3.84:.0f} %)"),
-    )
 
     items = [
       self._jerk_aware_toggle,
@@ -163,10 +128,6 @@ class TorqueSettingsLayout(Widget):
       self._torque_friction,
       self._inster_friction_toggle,
       self._inster_ff_toggle,
-      self._inster_exit_toggle,
-      self._inster_low_speed_p_toggle,
-      self._inster_high_torque_toggle,
-      self._inster_torque_cap,
     ]
     return items
 
@@ -174,21 +135,13 @@ class TorqueSettingsLayout(Widget):
     super()._update_state()
     nnlc_enabled = ui_state.params.get_bool("NeuralNetworkLateralControl")
     inster = is_inster(ui_state.CP)
-    inster_toggles = (self._inster_friction_toggle, self._inster_ff_toggle, self._inster_exit_toggle, self._inster_low_speed_p_toggle,
-                      self._inster_high_torque_toggle)
-    inster_switch_on = inster and any(t.action_item.get_state() for t in inster_toggles)
+    inster_switch_on = inster and (self._inster_friction_toggle.action_item.get_state() or self._inster_ff_toggle.action_item.get_state())
     if inster_switch_on and self._jerk_aware_toggle.action_item.get_state():
       self._jerk_aware_toggle.action_item.set_state(False)  # the param itself is switched off by ui_state._enforce_constraints
     self._jerk_aware_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled and not inster_switch_on)
-    for inster_toggle in inster_toggles:
+    for inster_toggle in (self._inster_friction_toggle, self._inster_ff_toggle):
       inster_toggle.set_visible(inster)
       inster_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
-    # the exit tuning acts only with both step-2 switches on (the controller ignores it otherwise)
-    exit_tuning_usable = self._inster_friction_toggle.action_item.get_state() and self._inster_ff_toggle.action_item.get_state()
-    self._inster_exit_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled and exit_tuning_usable)
-    # the torque cap: only with the higher limit on; changeable onroad too (controlsd reads it every 3 s)
-    self._inster_torque_cap.set_visible(inster)
-    self._inster_torque_cap.action_item.set_enabled(not nnlc_enabled and self._inster_high_torque_toggle.action_item.get_state())
     if not ui_state.params.get_bool("LiveTorqueParamsToggle"):
       ui_state.params.remove("LiveTorqueParamsRelaxedToggle")
       self._relaxed_tune_toggle.action_item.set_state(False)

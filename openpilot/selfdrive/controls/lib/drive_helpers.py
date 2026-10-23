@@ -26,7 +26,7 @@ def smooth_value(val, prev_val, tau, dt=DT_MDL):
 
 def clip_curvature(v_ego, prev_curvature, new_curvature, roll, max_lat_accel_no_roll=MAX_LATERAL_ACCEL_NO_ROLL) -> tuple[float, bool]:
   # This function respects ISO lateral jerk and acceleration limits + a max curvature
-  # (max_lat_accel_no_roll: MAX_LATERAL_ACCEL_NO_ROLL; sunnypilot: 3.3 for the Hyundai Inster with InsterHighTorqueLimits, experimental)
+  # (max_lat_accel_no_roll: MAX_LATERAL_ACCEL_NO_ROLL; sunnypilot: the Hyundai Inster's own value, inster_lateral.py)
   v_ego = max(v_ego, MIN_SPEED)
   max_curvature_rate = MAX_LATERAL_JERK / (v_ego ** 2)  # inexact calculation, check https://github.com/commaai/openpilot/pull/24755
   new_curvature = np.clip(new_curvature,

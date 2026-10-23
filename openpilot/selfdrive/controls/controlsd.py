@@ -71,9 +71,8 @@ class Controls(ControlsExt):
 
     self.LaC = ControlsExt.initialize_lateral_control(self, self.LaC, self.CI, DT_CTRL)
 
-    # highest planned lateral acceleration without roll: 3.0 (ISO 11270); 3.3 only for the Hyundai Inster when the running lateral
-    # controller is torque controller v0 with InsterHighTorqueLimits active
-    self.max_lat_accel_no_roll = max_lateral_accel_no_roll(self.LaC, MAX_LATERAL_ACCEL_NO_ROLL)
+    # highest planned lateral acceleration without roll: 3.0 (ISO 11270); the Hyundai Inster's own value (inster_lateral.py)
+    self.max_lat_accel_no_roll = max_lateral_accel_no_roll(self.CP, MAX_LATERAL_ACCEL_NO_ROLL)
 
   def update(self):
     self.sm.update(15)

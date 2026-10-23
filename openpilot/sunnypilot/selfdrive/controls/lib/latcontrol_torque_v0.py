@@ -11,10 +11,8 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.common.pid import PIDController
 
-from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import FF_TABLE, FF_TABLE_EXIT, InsterStictionFriction, STEER_MAX_RAW, \
-                                                                       WHEEL_RATE_FRAMES, ff_lat_accel_equivalent, high_torque_steer_max, \
-                                                                       inster_torque_cap, is_inster, is_inster_high_torque, \
-                                                                       low_speed_kp_scale
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import InsterStictionFriction, STEER_MAX_RAW, ff_lat_accel_equivalent, \
+                                                                       is_inster
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_ext import LatControlTorqueExt
 
 # At higher speeds (25+mph) we can assume:
@@ -40,14 +38,6 @@ FRICTION_THRESHOLD = 0.3
 VERSION = 0
 
 
-class InsterLowSpeedPID(PIDController):
-  """Hyundai Inster, switch InsterLowSpeedP: the PID with its P gain x low_speed_kp_scale(speed) (x 0.75 below 20 km/h, x 1 from
-  30 km/h); I, D, limits and anti-windup unchanged"""
-  @property
-  def k_p(self):
-    return np.interp(self.speed, self._k_p[0], self._k_p[1]) * low_speed_kp_scale(self.speed)
-
-
 class LatControlTorque(LatControl):
   def __init__(self, CP, CP_SP, CI, dt):
     super().__init__(CP, CP_SP, CI, dt)
@@ -65,62 +55,32 @@ class LatControlTorque(LatControl):
     self.extension = LatControlTorqueExt(self, CP, CP_SP, CI)
 
     # Hyundai Inster steering candidates (experimental, off by default, see inster_lateral.py). The switches are read once and only
-    # for the Inster: every other car, and the Inster with all switches off, runs the unchanged code below.
+    # for the Inster: every other car, and the Inster with both switches off, runs the unchanged code below.
     self.inster_friction = False
     self.inster_ff = False
-    self.inster_exit = False
-    self.inster_low_speed_p = False
-    self.inster_high_torque = False
     if is_inster(CP):
-      self._init_inster(Params(), CP, CP_SP)
+      self._init_inster(Params())
 
-  def _init_inster(self, params, CP, CP_SP):
+  def _init_inster(self, params):
     friction = params.get_bool("InsterStictionFriction")
     feedforward = params.get_bool("InsterSpeedFeedforward")
-    exit_tuning = params.get_bool("InsterExitTuning")
-    low_speed_p = params.get_bool("InsterLowSpeedP")
-    # InsterHighTorqueLimits reaches the car side as a CarParamsSP flag at car start (not set while NNLC is enabled); v0 follows the flag
-    high_torque = is_inster_high_torque(CP, CP_SP)
-    if not (friction or feedforward or exit_tuning or low_speed_p or high_torque):
+    if not (friction or feedforward):
       return
     if params.get_bool("NeuralNetworkLateralControl"):
       cloudlog.warning("Inster steering switches are ignored: they apply to the v0 torque controller without NNLC")
       return
     self.inster_friction = friction
     self.inster_ff = feedforward
-    # the exit tuning acts only together with both step-2 switches
-    self.inster_exit = exit_tuning and friction and feedforward
-    if exit_tuning and not self.inster_exit:
-      cloudlog.warning("InsterExitTuning is ignored: it needs InsterStictionFriction and InsterSpeedFeedforward")
-    self.inster_low_speed_p = low_speed_p
-    self.inster_high_torque = high_torque
-    if high_torque:
-      # torque cap (raw, 384-415) on top of the speed table; changeable while driving (set_inster_torque_cap, from controlsd)
-      self.inster_torque_cap = inster_torque_cap(params.get("InsterTorqueCap", return_default=True))
     # v0 keeps its own output: the Lateral Jerk Torque Controller extension must not replace it (its torque-params override stays)
     if self.extension._jerk_aware_enabled:
       cloudlog.warning("Inster steering switch enabled: the Lateral Jerk Torque Controller is not used")
       self.extension._jerk_aware_enabled = False
     if friction:
-      self.inster_stiction = InsterStictionFriction(self.dt, exit_tuning=self.inster_exit)
+      self.inster_stiction = InsterStictionFriction(self.dt)
       # desired curvature of the last second, every step (the request made lat_delay ago is the plan for now)
       self.inster_curvature_buffer = deque([0.] * self.lat_accel_request_buffer_len, maxlen=self.lat_accel_request_buffer_len)
       self.inster_past_curvature = 0.0
       self.inster_last_output_torque = 0.0
-    if self.inster_exit:
-      # steering angles of the last WHEEL_RATE_FRAMES steps and now, every step (signed wheel rate for the release damping)
-      self.inster_angle_history: deque[float] = deque(maxlen=WHEEL_RATE_FRAMES + 1)
-      self.inster_wheel_rate_scale = 1.0 / (WHEEL_RATE_FRAMES * self.dt)
-    self.inster_ff_table = FF_TABLE_EXIT if self.inster_exit else FF_TABLE
-    if low_speed_p:
-      self.pid = InsterLowSpeedPID([INTERP_SPEEDS, KP_INTERP], KI, KD, rate=1/self.dt)
-      self.update_limits()
-
-  def set_inster_torque_cap(self, value) -> None:
-    """InsterTorqueCap changed (controlsd's params refresh): applies from the next update; a lower cap limits the output at once
-    (the car side then winds the command down at its ramp), a higher one is reached through the car side's ramp."""
-    if self.inster_high_torque:
-      self.inster_torque_cap = inster_torque_cap(value)
 
   def update_torque_parameters(self, latAccelFactor, latAccelOffset, friction):
     self.torque_params.latAccelFactor = latAccelFactor
@@ -137,23 +97,11 @@ class LatControlTorque(LatControl):
     if self.extension.update_override_torque_params(self.torque_params):
       self.update_limits()
 
-    if self.inster_high_torque:
-      # Inster: speed-dependent output limit, the car side's limit at the same speed, at most the torque cap (1.0 = 384 raw)
-      steer_max = high_torque_steer_max(CS.vEgoRaw, self.inster_torque_cap)
-      if steer_max != self.steer_max:
-        self.steer_max = steer_max
-        self.update_limits()
-
     if self.inster_friction:
       # the curvature requested lat_delay ago (the plan for now); the history is kept every step, active or not
       inster_delay_frames = int(np.clip(lat_delay / self.dt, 1, self.lat_accel_request_buffer_len))
       self.inster_past_curvature = self.inster_curvature_buffer[-inster_delay_frames]
       self.inster_curvature_buffer.append(desired_curvature)
-
-    if self.inster_exit:
-      if not self.inster_angle_history:
-        self.inster_angle_history.extend([CS.steeringAngleDeg] * WHEEL_RATE_FRAMES)
-      self.inster_angle_history.append(CS.steeringAngleDeg)
 
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = VERSION
@@ -192,7 +140,7 @@ class LatControlTorque(LatControl):
       ff -= self.torque_params.latAccelOffset
       if self.inster_ff:
         # Inster: feed-forward from the measured speed x lateral-acceleration table, in linear-equivalent lateral acceleration
-        ff = ff_lat_accel_equivalent(ff, CS.vEgo, self.torque_params.latAccelFactor, self.inster_ff_table)
+        ff = ff_lat_accel_equivalent(ff, CS.vEgo, self.torque_params.latAccelFactor)
       if self.inster_friction:
         # Inster: stiction friction term (raw command units) instead of get_friction
         ff += self._inster_friction_raw(CS, VM, desired_curvature, self.inster_past_curvature, measured_curvature,
@@ -235,14 +183,6 @@ class LatControlTorque(LatControl):
     # steering-wheel degrees per unit curvature at this speed (vehicle model without the roll term; the measured curvature keeps its
     # roll compensation, as v0's measurement does). Curvatures and the term are + right, like v0's internal convention.
     steer_deg_per_curvature = math.degrees(VM.get_steer_from_curvature(1.0, CS.vEgo, 0.0))
-    if self.inster_exit:
-      # signed wheel rate (deg/s, + right; the angle is + left) over the last WHEEL_RATE_FRAMES steps
-      wheel_rate = -((CS.steeringAngleDeg - self.inster_angle_history[0]) * self.inster_wheel_rate_scale)
-      return self.inster_stiction.update(CS.vEgo,
-                                         steer_deg_per_curvature * desired_curvature,
-                                         steer_deg_per_curvature * past_curvature,
-                                         steer_deg_per_curvature * measured_curvature,
-                                         lat_delay, abs(CS.steeringRateDeg), self.inster_last_output_torque * STEER_MAX_RAW, wheel_rate)
     return self.inster_stiction.update(CS.vEgo,
                                        steer_deg_per_curvature * desired_curvature,
                                        steer_deg_per_curvature * past_curvature,
