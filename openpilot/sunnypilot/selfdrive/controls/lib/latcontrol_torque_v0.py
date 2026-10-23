@@ -13,7 +13,8 @@ from openpilot.common.pid import PIDController
 
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import FF_TABLE, FF_TABLE_EXIT, InsterStictionFriction, STEER_MAX_RAW, \
                                                                        WHEEL_RATE_FRAMES, ff_lat_accel_equivalent, high_torque_steer_max, \
-                                                                       is_inster, is_inster_high_torque, low_speed_kp_scale
+                                                                       inster_torque_cap, is_inster, is_inster_high_torque, \
+                                                                       low_speed_kp_scale
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_ext import LatControlTorqueExt
 
 # At higher speeds (25+mph) we can assume:
@@ -93,6 +94,9 @@ class LatControlTorque(LatControl):
       cloudlog.warning("InsterExitTuning is ignored: it needs InsterStictionFriction and InsterSpeedFeedforward")
     self.inster_low_speed_p = low_speed_p
     self.inster_high_torque = high_torque
+    if high_torque:
+      # torque cap (raw, 384-415) on top of the speed table; changeable while driving (set_inster_torque_cap, from controlsd)
+      self.inster_torque_cap = inster_torque_cap(params.get("InsterTorqueCap", return_default=True))
     # v0 keeps its own output: the Lateral Jerk Torque Controller extension must not replace it (its torque-params override stays)
     if self.extension._jerk_aware_enabled:
       cloudlog.warning("Inster steering switch enabled: the Lateral Jerk Torque Controller is not used")
@@ -112,6 +116,12 @@ class LatControlTorque(LatControl):
       self.pid = InsterLowSpeedPID([INTERP_SPEEDS, KP_INTERP], KI, KD, rate=1/self.dt)
       self.update_limits()
 
+  def set_inster_torque_cap(self, value) -> None:
+    """InsterTorqueCap changed (controlsd's params refresh): applies from the next update; a lower cap limits the output at once
+    (the car side then winds the command down at its ramp), a higher one is reached through the car side's ramp."""
+    if self.inster_high_torque:
+      self.inster_torque_cap = inster_torque_cap(value)
+
   def update_torque_parameters(self, latAccelFactor, latAccelOffset, friction):
     self.torque_params.latAccelFactor = latAccelFactor
     self.torque_params.latAccelOffset = latAccelOffset
@@ -128,8 +138,8 @@ class LatControlTorque(LatControl):
       self.update_limits()
 
     if self.inster_high_torque:
-      # Inster: speed-dependent output limit, the car side's limit at the same speed (1.0 = 384 raw)
-      steer_max = high_torque_steer_max(CS.vEgoRaw)
+      # Inster: speed-dependent output limit, the car side's limit at the same speed, at most the torque cap (1.0 = 384 raw)
+      steer_max = high_torque_steer_max(CS.vEgoRaw, self.inster_torque_cap)
       if steer_max != self.steer_max:
         self.steer_max = steer_max
         self.update_limits()

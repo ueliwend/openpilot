@@ -29,7 +29,8 @@ from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import A_NODES, 
                                                                        INSTER_SWITCHES, SCALE_CLIP, STEER_MAX_RAW, V_NODES, \
                                                                        InsterStictionFriction, ff_lat_accel_equivalent, ff_torque, \
                                                                        high_torque_steer_max, is_inster_high_torque, \
-                                                                       low_speed_kp_scale, max_lateral_accel_no_roll, table_torque
+                                                                       low_speed_kp_scale, max_lateral_accel_no_roll, table_torque, \
+                                                                       TORQUE_CAP_DEFAULT, TORQUE_CAP_MAX, TORQUE_CAP_MIN, inster_torque_cap
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import InsterLowSpeedPID, LatControlTorque as LatControlTorqueV0
 
 INSTER_KEYS = ("InsterStictionFriction", "InsterSpeedFeedforward")   # the step-2 switches
@@ -162,10 +163,11 @@ class TestInsterStictionFriction(OpenpilotTestCase):
     assert fr.update(15.0, 6.0, 4.0, 3.5, 0.2, 5.0, 80.0) == first
 
 
-def _make_v0(car_name, on=(), after_setup=()):
+def _make_v0(car_name, on=(), after_setup=(), cap=None):
   params = Params()
   for key in ALL_INSTER_KEYS + ("LateralJerkTorqueController", "NeuralNetworkLateralControl"):
     params.put_bool(key, key in on, block=True)
+  params.put("InsterTorqueCap", 384 if cap is None else cap, block=True)
   CarInterface = interfaces[car_name]
   CP = CarInterface.get_non_essential_params(car_name)
   CP_SP = CarInterface.get_non_essential_params_sp(CP, car_name)
@@ -459,8 +461,9 @@ class TestInsterHighTorque(OpenpilotTestCase):
 
   def test_output_follows_the_speed_table(self):
     for on in (("InsterHighTorqueLimits",), ALL_INSTER_KEYS):
-      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
-      assert c.inster_high_torque
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, cap=415)
+      assert c.inster_high_torque and c.inster_torque_cap == 415
+      c.inster_torque_cap = 450                   # test only, beyond the cap's range: the speed table still applies underneath
       out = _run(c, VM)
       limits = [inster_steer_max(o[8]) / 384.0 for o in out]
       assert all(abs(o[0]) <= lim + 1e-9 for o, lim in zip(out, limits, strict=True))
@@ -482,4 +485,82 @@ class TestInsterHighTorque(OpenpilotTestCase):
     c33, lim33 = clip_curvature(20.0, 0.0085, 0.0086, 0.0, 3.3)
     assert lim30 and abs(c30 - 3.0 / 400) < 1e-12
     assert lim33 and abs(c33 - 3.3 / 400) < 1e-12
+
+
+class TestInsterTorqueCap(OpenpilotTestCase):
+  def test_parse_and_clamp(self):
+    for value, cap in ((None, 384), ("abc", 384), (float("nan"), 384), (300, 384), (384, 384), (395, 395), ("405", 405), (400.4, 400),
+                       (415, 415), (416, 415), (1000, 415)):
+      assert inster_torque_cap(value) == cap, value
+    assert (TORQUE_CAP_MIN, TORQUE_CAP_MAX, TORQUE_CAP_DEFAULT) == (384, 415, 384)
+    assert min(inster_steer_max(v / 10) for v in range(500)) >= TORQUE_CAP_MAX + 15   # the car side / panda table is above any cap
+
+  def test_min_with_the_table(self):
+    for v in (0.0, 5.0, 8.0, 10.0, 12.0, 30.0):
+      assert high_torque_steer_max(v) == inster_steer_max(v) / 384.0
+      for cap in (384, 400, 415):
+        assert high_torque_steer_max(v, cap) == min(inster_steer_max(v), cap) / 384.0 == cap / 384.0
+      assert high_torque_steer_max(v, 445) == min(inster_steer_max(v), 445) / 384.0
+
+  def test_default_cap_never_above_384(self):
+    # switch on with the cap at its default 384: the request never exceeds 384 raw (also through the car-side rounding)
+    for on in (("InsterHighTorqueLimits",), ALL_INSTER_KEYS):
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
+      assert c.inster_high_torque and c.inster_torque_cap == 384
+      out = _run(c, VM)
+      assert max(int(round(abs(o[0]) * 384)) for o in out) == 384
+      assert all(abs(o[0]) <= 1.0 + 1e-12 for o in out)
+      assert c.steer_max == 1.0
+
+  def test_cap_limits_output_and_saturation(self):
+    for cap in (395, 415):
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=("InsterHighTorqueLimits",), cap=cap)
+      out = _run(c, VM)
+      assert max(int(round(abs(o[0]) * 384)) for o in out) == cap       # reaches the cap, never more
+      assert c.steer_max == cap / 384.0
+      lim = c.pid.pos_limit / c.torque_params.latAccelFactor
+      assert abs(lim - cap / 384.0) < 1e-6                               # PID limits follow the cap
+      # saturation (steerSaturated) needs |output| at the cap, not at 1.0
+      sat = [o for o in out if o[6]]
+      assert sat and all(abs(abs(o[4]) - cap / 384.0) < 0.05 for o in sat[:1])
+
+  def test_live_change(self):
+    c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=("InsterHighTorqueLimits",), cap=415)
+    out1 = _run(c, VM, 600)
+    assert max(int(round(abs(o[0]) * 384)) for o in out1) == 415
+    c.set_inster_torque_cap(390)                                          # lower: applies at the next update
+    out2 = _run(c, VM, 600)
+    assert max(int(round(abs(o[0]) * 384)) for o in out2) == 390 and c.steer_max == 390 / 384.0
+    c.set_inster_torque_cap(999)                                          # clamped
+    assert c.inster_torque_cap == 415
+    off, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, cap=415)
+    off.set_inster_torque_cap(400)                                        # ignored with the switch off
+    assert not hasattr(off, "inster_torque_cap")
+
+  def test_switch_off_ignores_the_cap(self):
+    a, VM_a = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, cap=384)
+    b, VM_b = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, cap=415)
+    assert _run(a, VM_a) == _run(b, VM_b)
+    k, VM_k = _make_v0(HYUNDAI.HYUNDAI_KONA_EV, on=("InsterHighTorqueLimits",), cap=415)
+    assert not k.inster_high_torque and max(abs(o[0]) for o in _run(k, VM_k)) <= 1.0
+
+  def test_controlsd_params_refresh(self):
+    # controlsd's existing params refresh (ControlsExt.get_params_sp, every PARAMS_UPDATE_PERIOD) passes the cap to v0
+    from types import SimpleNamespace
+    from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
+    params = Params()
+    c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=("InsterHighTorqueLimits",), cap=384)
+    CP = interfaces[HYUNDAI.HYUNDAI_INSTER].get_non_essential_params(HYUNDAI.HYUNDAI_INSTER).as_reader()
+    ext = SimpleNamespace(CP=CP, params=params, LaC=c, _param_update_time=0.0, lat_delay=0.2,
+                          blinker_pause_lateral=SimpleNamespace(get_params=lambda: None))
+    sm = {"lateralDelay": SimpleNamespace(lateralDelay=0.2)}
+    params.put("InsterTorqueCap", 401, block=True)
+    ControlsExt.get_params_sp(ext, sm)
+    assert c.inster_torque_cap == 401
+    params.put("InsterTorqueCap", 384, block=True)
+    ControlsExt.get_params_sp(ext, sm)                                    # within the refresh period: not read again
+    assert c.inster_torque_cap == 401
+    ext._param_update_time = 0.0
+    ControlsExt.get_params_sp(ext, sm)
+    assert c.inster_torque_cap == 384
 

@@ -21,8 +21,9 @@ and a small stateful filter class.
   * Low-speed P (switch InsterLowSpeedP, step 3, simulator lever "r6c_kplo"): v0's proportional gain x 0.75 below 20 km/h, blending
     to x 1 at 30 km/h (low_speed_kp_scale). Works with plain v0 and with the switches above.
   * Speed-dependent torque limit (switch InsterHighTorqueLimits, step 3): passed to the car side as HyundaiFlagsSP.INSTER_HIGH_TORQUE
-    (opendbc); v0 may then output up to inster_steer_max(v) / 384 (> 1.0, 1.0 stays 384 raw) and openpilot plans lateral
-    accelerations up to 3.3 m/s^2 instead of 3.0 (high_torque_steer_max, max_lateral_accel_no_roll).
+    (opendbc); v0 may then output up to min(inster_steer_max(v), InsterTorqueCap) / 384 (> 1.0, 1.0 stays 384 raw) and openpilot
+    plans lateral accelerations up to 3.3 m/s^2 instead of 3.0 (high_torque_steer_max, max_lateral_accel_no_roll). InsterTorqueCap
+    (384-415 raw, default 384) can be changed while driving; controlsd passes it to v0 every 3 s (PARAMS_UPDATE_PERIOD).
 
 Units and signs: commands in raw LKAS11 units (full scale STEER_MAX_RAW = 384) or as a fraction of full torque; v0's internal sign
 convention (+ = right turn), the convention of v0's setpoint, measurement and output before its final negation.
@@ -61,9 +62,29 @@ def is_inster_high_torque(CP, CP_SP) -> bool:
   return is_inster(CP) and CP_SP is not None and bool(CP_SP.flags & HyundaiFlagsSP.INSTER_HIGH_TORQUE)
 
 
-def high_torque_steer_max(v_ego_raw: float) -> float:
-  """v0's output limit (fraction of STEER_MAX_RAW, >= 1) with the switch on: the car side's limit at the same speed (vEgoRaw)."""
-  return inster_steer_max(v_ego_raw) / STEER_MAX_RAW
+# Torque cap for finding the steering unit's limit (param InsterTorqueCap, raw, used only with InsterHighTorqueLimits): route 00000072
+# (23 Oct 2026) showed temporary EPS faults (MDPS12 CF_Mdps_ToiFlt) 0.11-0.27 s after the command went above 384 (417-429 raw).
+TORQUE_CAP_MIN = 384               # = STEER_MAX_RAW: with the cap at 384 the command never exceeds 384
+TORQUE_CAP_MAX = 415               # below the car side's / panda's table everywhere (>= 430 raw)
+TORQUE_CAP_DEFAULT = 384
+
+
+def inster_torque_cap(value) -> int:
+  """InsterTorqueCap (raw) clamped to TORQUE_CAP_MIN..TORQUE_CAP_MAX; missing or invalid -> TORQUE_CAP_DEFAULT."""
+  try:
+    cap = int(round(float(value)))
+  except (TypeError, ValueError, OverflowError):
+    return TORQUE_CAP_DEFAULT
+  return max(TORQUE_CAP_MIN, min(TORQUE_CAP_MAX, cap))
+
+
+def high_torque_steer_max(v_ego_raw: float, cap: int | None = None) -> float:
+  """v0's output limit (fraction of STEER_MAX_RAW, >= 1) with the switch on: the car side's limit at the same speed (vEgoRaw), and
+  at most the torque cap (raw) when one is given."""
+  limit = inster_steer_max(v_ego_raw)
+  if cap is not None and cap < limit:
+    limit = cap
+  return limit / STEER_MAX_RAW
 
 
 def max_lateral_accel_no_roll(lat_control, default: float) -> float:
