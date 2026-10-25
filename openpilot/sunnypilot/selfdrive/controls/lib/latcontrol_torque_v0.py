@@ -11,8 +11,8 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.common.pid import PIDController
 
-from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import InsterStictionFriction, STEER_MAX_RAW, ff_lat_accel_equivalent, \
-                                                                       is_inster
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_LOG_VERSION, InsterAnglePI, InsterStictionFriction, \
+                                                                       STEER_MAX_RAW, angle_error, ff_lat_accel_equivalent, is_inster
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_ext import LatControlTorqueExt
 
 # At higher speeds (25+mph) we can assume:
@@ -55,22 +55,25 @@ class LatControlTorque(LatControl):
     self.extension = LatControlTorqueExt(self, CP, CP_SP, CI)
 
     # Hyundai Inster steering candidates (experimental, off by default, see inster_lateral.py). The switches are read once and only
-    # for the Inster: every other car, and the Inster with both switches off, runs the unchanged code below.
+    # for the Inster: every other car, and the Inster with all switches off, runs the unchanged code below.
     self.inster_friction = False
     self.inster_ff = False
+    self.inster_angle_pi = False
     if is_inster(CP):
       self._init_inster(Params())
 
   def _init_inster(self, params):
     friction = params.get_bool("InsterStictionFriction")
     feedforward = params.get_bool("InsterSpeedFeedforward")
-    if not (friction or feedforward):
+    angle_pi = params.get_bool("InsterAngleErrorPI")
+    if not (friction or feedforward or angle_pi):
       return
     if params.get_bool("NeuralNetworkLateralControl"):
       cloudlog.warning("Inster steering switches are ignored: they apply to the v0 torque controller without NNLC")
       return
     self.inster_friction = friction
     self.inster_ff = feedforward
+    self.inster_angle_pi = angle_pi
     # v0 keeps its own output: the Lateral Jerk Torque Controller extension must not replace it (its torque-params override stays)
     if self.extension._jerk_aware_enabled:
       cloudlog.warning("Inster steering switch enabled: the Lateral Jerk Torque Controller is not used")
@@ -81,6 +84,13 @@ class LatControlTorque(LatControl):
       self.inster_curvature_buffer = deque([0.] * self.lat_accel_request_buffer_len, maxlen=self.lat_accel_request_buffer_len)
       self.inster_past_curvature = 0.0
       self.inster_last_output_torque = 0.0
+    if angle_pi:
+      # P and I of "F" on the steering-wheel angle error replace v0's PID (same limits, feed-forward and output conversion)
+      if not (friction and feedforward):
+        cloudlog.warning("InsterAngleErrorPI was tuned with InsterStictionFriction and InsterSpeedFeedforward both on")
+      self.pid = InsterAnglePI(rate=1 / self.dt)
+      self.update_limits()
+      self.extension._pid = self.pid
 
   def update_torque_parameters(self, latAccelFactor, latAccelOffset, friction):
     self.torque_params.latAccelFactor = latAccelFactor
@@ -104,7 +114,7 @@ class LatControlTorque(LatControl):
       self.inster_curvature_buffer.append(desired_curvature)
 
     pid_log = log.ControlsState.LateralTorqueState.new_message()
-    pid_log.version = VERSION
+    pid_log.version = ANGLE_PI_LOG_VERSION if self.inster_angle_pi else VERSION
     if not active:
       output_torque = 0.0
       pid_log.active = False
@@ -112,6 +122,9 @@ class LatControlTorque(LatControl):
         # inactive: v0 outputs 0; the term restarts settled on the next active step
         self.inster_stiction.reset()
         self.inster_last_output_torque = 0.0
+      if self.inster_angle_pi:
+        # inactive: F's integrator restarts from 0 (it may have been wound at low speed); v0 keeps its own
+        self.pid.reset()
     else:
       measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
       roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY
@@ -149,12 +162,21 @@ class LatControlTorque(LatControl):
         # TODO jerk is weighted by lat_delay for legacy reasons, but should be made independent of it
         ff += get_friction(error, lateral_accel_deadzone, FRICTION_THRESHOLD, self.torque_params)
 
-      freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
-      output_lataccel = self.pid.update(pid_log.error,
-                                       -measurement_rate,
-                                        feedforward=ff,
-                                        speed=CS.vEgo,
-                                        freeze_integrator=freeze_integrator)
+      if self.inster_angle_pi:
+        # Inster "F": P and I on the steering-wheel angle error (rad); integrator from standstill, frozen only while pressed or
+        # limited by safety. pid_log.error stays v0's lateral-acceleration error; p and i stay in lateral-acceleration units.
+        output_lataccel = self.pid.update(angle_error(VM, CS.vEgo, desired_curvature, measured_curvature),
+                                          -measurement_rate,
+                                          feedforward=ff,
+                                          speed=CS.vEgo,
+                                          freeze_integrator=steer_limited_by_safety or CS.steeringPressed)
+      else:
+        freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
+        output_lataccel = self.pid.update(pid_log.error,
+                                         -measurement_rate,
+                                          feedforward=ff,
+                                          speed=CS.vEgo,
+                                          freeze_integrator=freeze_integrator)
       output_torque = self.torque_from_lateral_accel(output_lataccel, self.torque_params)
 
       # Lateral acceleration torque controller extension updates

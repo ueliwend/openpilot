@@ -15,6 +15,9 @@ and a small stateful filter class.
   * Stiction friction term (switch InsterStictionFriction): InsterStictionFriction replaces v0's get_friction(). It pushes the wheel
     in the direction the plan wants it to move, smoothly (no dead zone, no hysteresis), with an amplitude matched to the Inster's
     measured steering friction, and lets go of the held torque early when the plan starts to unwind.
+  * Steering-angle PI "F" (switch InsterAngleErrorPI): InsterAnglePI replaces only v0's P and I. They act on the steering-wheel
+    angle error (rad) with gains that are quadratic in speed, and the integrator runs from standstill. Feed-forward, limits and output
+    conversion stay v0's. Tuned and checked in the closed-loop simulator only with both switches above on.
 
   * Torque cap (no switch): the Inster's steering command is capped at 409 raw (opendbc values.INSTER_STEER_MAX, the highest the
     owner's steering unit took without a fault, 23 Oct 2026) with 1.0 = 384 raw (INSTER_STEER_FULL_SCALE): every lateral
@@ -29,14 +32,15 @@ Nothing here is validated on the car.
 import math
 
 from opendbc.car.hyundai.values import CAR, INSTER_STEER_FULL_SCALE, INSTER_STEER_MAX
+from openpilot.common.pid import PIDController
 
 # Full-scale command the table and the friction term are expressed in (actuators.torque 1.0; opendbc INSTER_STEER_FULL_SCALE).
 # If it changes, F0 and the raw amplitudes below need a review: test_inster_lateral.py checks that both agree.
 STEER_MAX_RAW = 384.0
 
-# The Inster's switches (params, off by default, changeable only offroad, ignored while NNLC is enabled). With either on, the Lateral
-# Jerk Torque Controller is switched off.
-INSTER_SWITCHES = ("InsterStictionFriction", "InsterSpeedFeedforward")
+# The Inster's switches (params, off by default, changeable only offroad, ignored while NNLC is enabled). With any of them on, the
+# Lateral Jerk Torque Controller is switched off.
+INSTER_SWITCHES = ("InsterStictionFriction", "InsterSpeedFeedforward", "InsterAngleErrorPI")
 
 # Steering torque cap as a fraction of full scale: 409 / 384 = 1.065 (opendbc values.py: INSTER_STEER_MAX / INSTER_STEER_FULL_SCALE)
 INSTER_STEER_MAX_FRACTION = INSTER_STEER_MAX / INSTER_STEER_FULL_SCALE
@@ -214,3 +218,59 @@ class InsterStictionFriction:
     g = self.om / FADE_RATE
     g = 1.0 / (1.0 + g * g)
     return amplitude * s * ((1.0 - FADE_BETA) + FADE_BETA * g)
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# Steering-angle PI "F" (switch InsterAngleErrorPI; the owner's 6-parameter controller, set "recommended_F" of the 23 Oct 2026 search in
+# the closed-loop steering simulator, SIM only: 9 drives x 8 plant variants x 2 seeds, on top of v0 with both switches above at 409).
+# It replaces only v0's P and I:
+#   e  = delta_plan - delta_meas   steering-wheel angle error, rad, + right (v0-internal sign)
+#        delta_plan = wheel angle the plan's curvature needs (inverse vehicle model: steer ratio, slip factor, roll),
+#        delta_meas = steeringAngleDeg - learned angleOffsetDeg.
+#        The vehicle model is linear in the angle, so e = R(v) x (desired curvature - measured curvature) with
+#        R(v) = VM.get_steer_from_curvature(1.0, v, 0.0) (rad per 1/m) and v0's roll-compensated measured curvature (angle_error()).
+#   p  = kp(v) e,   i += ki(v) e dt   (v = vEgo in m/s; p and i in v0's lateral-acceleration units, m/s^2)
+#   kp(v) = 4.3447 + 0.40366 v - 0.0072954 v^2   (m/s^2 per rad)       5.9 / 8.81 / 9.80 at 15 / 55 / 115 km/h
+#   ki(v) = 0.93525 + 0.27948 v - 0.0057456 v^2  (m/s^2 per rad s)     2.0 / 3.86 / 4.00 at 15 / 55 / 115 km/h
+# Both clipped at >= 0 (they reach 0 only above 186 km/h). No speed hold above 130 km/h (owner's choice): kp 7.9 / ki 2.0 at 160 km/h.
+# The integrator runs from standstill; it freezes only while steeringPressed or steer-limited by safety (v0's flag, which also covers
+# the 3 / 5 raw ramp), and it is reset whenever lateral control is inactive (v0 keeps its own integrator, but F's can be wound at low
+# speed, which v0's cannot: without the reset it would come back as a command towards the old curve on re-engagement).
+# Anti-windup and output clip are common/pid.py's (InsterAnglePI is a PIDController with these gains).
+# Logs (controlsState.lateralControlState.torqueState) with F on: version = ANGLE_PI_LOG_VERSION (v0 logs 0, the upstream controller
+# 1); error stays v0's lateral-acceleration error (setpoint - measurement, m/s^2), p / i / f are in m/s^2 as in v0. F's own error is
+# e = p / kp(vEgo) (rad, + right; angle_pi_gain(ANGLE_PI_KP, vEgo) > 0 at every speed the car drives), or recomputed from carState
+# steeringAngleDeg, liveParameters angleOffsetDeg / roll / steerRatio / stiffnessFactor and controlsState desiredCurvature with
+# angle_error().
+ANGLE_PI_KP = (4.3447, 0.40366, -0.0072954)
+ANGLE_PI_KI = (0.93525, 0.27948, -0.0057456)
+ANGLE_PI_LOG_VERSION = 100
+
+
+def angle_pi_gain(coeffs: tuple[float, float, float], v_ego: float) -> float:
+  """quadratic speed gain c0 + c1 v + c2 v^2, clipped at >= 0"""
+  g = coeffs[0] + coeffs[1] * v_ego + coeffs[2] * v_ego * v_ego
+  return g if g > 0.0 else 0.0
+
+
+def angle_error(VM, v_ego: float, desired_curvature: float, measured_curvature: float) -> float:
+  """steering-wheel angle error (rad, + right as v0's curvatures): the plan's wheel angle minus the measured one (minus the learned
+  offset). R(v) x (desired - measured curvature); exact for the linear vehicle model when measured_curvature is v0's roll-compensated
+  -VM.calc_curvature(radians(steeringAngleDeg - angleOffsetDeg), v, roll)."""
+  return VM.get_steer_from_curvature(1.0, v_ego, 0.0) * (desired_curvature - measured_curvature)
+
+
+class InsterAnglePI(PIDController):
+  """common/pid.py with the speed gains of "F" (kp / ki above; kd 0). update(e, ...) takes the wheel-angle error in rad; p, i, f and
+  the limits are in v0's lateral-acceleration units."""
+
+  def __init__(self, rate: float):
+    super().__init__(0.0, 0.0, 0.0, rate=rate)
+
+  @property
+  def k_p(self):
+    return angle_pi_gain(ANGLE_PI_KP, self.speed)
+
+  @property
+  def k_i(self):
+    return angle_pi_gain(ANGLE_PI_KI, self.speed)

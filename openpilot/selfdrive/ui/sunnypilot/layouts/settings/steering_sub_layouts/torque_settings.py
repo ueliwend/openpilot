@@ -116,6 +116,14 @@ class TorqueSettingsLayout(Widget):
       description=lambda: tr("Hyundai Inster only. Uses a measured table of steering torque per speed and sideways acceleration for " +
                              "the feed-forward instead of one linear factor. Off by default."),
     )
+    self._inster_angle_pi_toggle = toggle_item_sp(
+      param="InsterAngleErrorPI",
+      title=lambda: tr("Inster: Steering-Angle PI \"F\" (experimental)"),
+      description=lambda: tr("Hyundai Inster only. Replaces the torque controller's P and I with ones that act on the steering-wheel " +
+                             "angle error, with speed-dependent gains and a stronger integrator that also works at low speed. " +
+                             "Tuned in simulation with both Inster switches above on. Turning it on switches the Lateral Jerk " +
+                             "Torque Controller off. Off by default."),
+    )
 
     items = [
       self._jerk_aware_toggle,
@@ -128,6 +136,7 @@ class TorqueSettingsLayout(Widget):
       self._torque_friction,
       self._inster_friction_toggle,
       self._inster_ff_toggle,
+      self._inster_angle_pi_toggle,
     ]
     return items
 
@@ -135,11 +144,12 @@ class TorqueSettingsLayout(Widget):
     super()._update_state()
     nnlc_enabled = ui_state.params.get_bool("NeuralNetworkLateralControl")
     inster = is_inster(ui_state.CP)
-    inster_switch_on = inster and (self._inster_friction_toggle.action_item.get_state() or self._inster_ff_toggle.action_item.get_state())
+    inster_toggles = (self._inster_friction_toggle, self._inster_ff_toggle, self._inster_angle_pi_toggle)
+    inster_switch_on = inster and any(t.action_item.get_state() for t in inster_toggles)
     if inster_switch_on and self._jerk_aware_toggle.action_item.get_state():
       self._jerk_aware_toggle.action_item.set_state(False)  # the param itself is switched off by ui_state._enforce_constraints
     self._jerk_aware_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled and not inster_switch_on)
-    for inster_toggle in (self._inster_friction_toggle, self._inster_ff_toggle):
+    for inster_toggle in inster_toggles:
       inster_toggle.set_visible(inster)
       inster_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
     if not ui_state.params.get_bool("LiveTorqueParamsToggle"):

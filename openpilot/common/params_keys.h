@@ -294,6 +294,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // Torque lateral control custom params
     {"CustomTorqueParams", {PERSISTENT | BACKUP , BOOL}},
     {"EnforceTorqueControl", {PERSISTENT | BACKUP, BOOL}},
+    {"InsterAngleErrorPI", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"InsterSpeedFeedforward", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"InsterStictionFriction", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"LateralJerkTorqueController", {PERSISTENT | BACKUP, BOOL, "0"}},

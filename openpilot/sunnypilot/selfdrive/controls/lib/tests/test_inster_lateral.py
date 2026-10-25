@@ -17,17 +17,21 @@ from opendbc.car.hyundai.values import CAR as HYUNDAI, INSTER_STEER_FULL_SCALE, 
 from opendbc.car.toyota.values import CAR as TOYOTA
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.common.params import Params
+from openpilot.common.pid import PIDController
 from openpilot.common.realtime import DT_CTRL
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.car.helpers import convert_to_capnp
 from openpilot.sunnypilot.selfdrive.car import interfaces as sunnypilot_interfaces
 from openpilot.sunnypilot.selfdrive.controls.lib import inster_lateral, latcontrol_torque_v0
-from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import A_NODES, CMD_RAW, F0, SCALE_CLIP, STEER_MAX_RAW, V_NODES, \
-                                                                       InsterStictionFriction, ff_lat_accel_equivalent, ff_torque, \
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import A_NODES, ANGLE_PI_KI, ANGLE_PI_KP, ANGLE_PI_LOG_VERSION, CMD_RAW, F0, \
+                                                                       SCALE_CLIP, STEER_MAX_RAW, V_NODES, InsterAnglePI, InsterStictionFriction, \
+                                                                       angle_error, angle_pi_gain, ff_lat_accel_equivalent, ff_torque, \
                                                                        table_torque
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import LatControlTorque as LatControlTorqueV0
 
-INSTER_KEYS = ("InsterStictionFriction", "InsterSpeedFeedforward")
+STEP2_KEYS = ("InsterStictionFriction", "InsterSpeedFeedforward")
+ANGLE_PI_KEY = "InsterAngleErrorPI"
+INSTER_KEYS = STEP2_KEYS + (ANGLE_PI_KEY,)
 SPEEDS = [0.0, 2.0, 5.0, 6.1] + list(np.linspace(6.11, 30.83, 60)) + [31.0, 35.0, 45.0]
 ACCELS = list(np.linspace(0.0, 4.0, 161))
 
@@ -209,32 +213,38 @@ def _run(controller, VM, n=1200, extension_model=None):
 class TestV0InsterSwitches(OpenpilotTestCase):
   def test_switches_off_never_reach_the_inster_code(self):
     controller, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER)
-    assert not controller.inster_friction and not controller.inster_ff
+    assert not controller.inster_friction and not controller.inster_ff and not controller.inster_angle_pi
     assert not hasattr(controller, "inster_stiction")
-    entered = AssertionError("Inster code path entered with both switches off")
+    assert type(controller.pid) is PIDController
+    entered = AssertionError("Inster code path entered with all switches off")
     with mock.patch.object(latcontrol_torque_v0, "ff_lat_accel_equivalent", side_effect=entered), \
          mock.patch.object(LatControlTorqueV0, "_inster_friction_raw", side_effect=entered), \
-         mock.patch.object(InsterStictionFriction, "update", side_effect=entered):
+         mock.patch.object(InsterStictionFriction, "update", side_effect=entered), \
+         mock.patch.object(latcontrol_torque_v0, "angle_error", side_effect=entered), \
+         mock.patch.object(InsterAnglePI, "update", side_effect=entered):
       _run(controller, VM, 300)
 
   def test_other_car_ignores_switches(self):
     off, VM_off = _make_v0(HYUNDAI.HYUNDAI_KONA_EV)
     on, VM_on = _make_v0(HYUNDAI.HYUNDAI_KONA_EV, on=INSTER_KEYS)
-    assert not on.inster_friction and not on.inster_ff
+    assert not on.inster_friction and not on.inster_ff and not on.inster_angle_pi
+    assert type(on.pid) is PIDController
     assert _run(off, VM_off) == _run(on, VM_on)
 
   def test_nnlc_on_ignores_switches(self):
     off, VM_off = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=("NeuralNetworkLateralControl",))
     on, VM_on = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + ("NeuralNetworkLateralControl",))
-    assert not on.inster_friction and not on.inster_ff
+    assert not on.inster_friction and not on.inster_ff and not on.inster_angle_pi
+    assert type(on.pid) is PIDController
     assert _run(off, VM_off) == _run(on, VM_on)
 
   def test_switches_change_the_output(self):
     base = _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER))
-    for on in (("InsterStictionFriction",), ("InsterSpeedFeedforward",), INSTER_KEYS):
+    for on in (("InsterStictionFriction",), ("InsterSpeedFeedforward",), STEP2_KEYS, (ANGLE_PI_KEY,), INSTER_KEYS):
       controller, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
       assert controller.inster_friction == ("InsterStictionFriction" in on)
       assert controller.inster_ff == ("InsterSpeedFeedforward" in on)
+      assert controller.inster_angle_pi == (ANGLE_PI_KEY in on)
       out = _run(controller, VM)
       assert out != base
       assert all(abs(o[0]) <= 409 / 384 + 1e-12 for o in out)   # the Inster cap (409 raw, 1.0 = 384)
@@ -249,6 +259,8 @@ class TestV0InsterSwitches(OpenpilotTestCase):
     # car setup: an Inster switch switches the Lateral Jerk Torque Controller off (other cars keep it)
     params = Params()
     _make_v0(HYUNDAI.HYUNDAI_INSTER, on=("InsterSpeedFeedforward", "LateralJerkTorqueController"))
+    assert not params.get_bool("LateralJerkTorqueController")
+    _make_v0(HYUNDAI.HYUNDAI_INSTER, on=(ANGLE_PI_KEY, "LateralJerkTorqueController"))
     assert not params.get_bool("LateralJerkTorqueController")
     _make_v0(HYUNDAI.HYUNDAI_KONA_EV, on=("InsterSpeedFeedforward", "LateralJerkTorqueController"))
     assert params.get_bool("LateralJerkTorqueController")
@@ -291,7 +303,7 @@ class TestInsterSteerCap(OpenpilotTestCase):
       assert max(raw) == 409                                            # the sequence does drive it to the cap
 
   def test_v0_cap_and_saturation(self):
-    for on in ((), ("InsterStictionFriction",), ("InsterSpeedFeedforward",), INSTER_KEYS):
+    for on in ((), ("InsterStictionFriction",), ("InsterSpeedFeedforward",), STEP2_KEYS, (ANGLE_PI_KEY,), INSTER_KEYS):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
       assert c.steer_max == CAP
       out = _run(c, VM)
@@ -388,11 +400,308 @@ class TestInsterSteerCap(OpenpilotTestCase):
       assert inster_lateral.max_lateral_accel_no_roll(CP, MAX_LATERAL_ACCEL_NO_ROLL) == expected
 
   def test_removed_switches(self):
-    # the step-3 params are gone: unknown to Params (a stale file on a device is never read), only the two step-2 switches remain
+    # the step-3 params are gone: unknown to Params (a stale file on a device is never read); the two step-2 switches and F remain
     params = Params()
     keys = {k.decode() if isinstance(k, bytes) else k for k in params.all_keys()}
     for key in ("InsterExitTuning", "InsterLowSpeedP", "InsterHighTorqueLimits", "InsterTorqueCap"):
       assert key not in keys
     assert inster_lateral.INSTER_SWITCHES == INSTER_KEYS
-    assert {"InsterStictionFriction", "InsterSpeedFeedforward"} <= keys
+    assert set(INSTER_KEYS) <= keys
 
+
+# SIX_FINAL['recommended_F'] of the simulator kit (simkit/sim/candidates_6p.py): coefficients and the anchor values at 15 / 55 / 115 km/h
+F_KP = (4.3447, 0.40366, -0.0072954)
+F_KI = (0.93525, 0.27948, -0.0057456)
+F_KP_ANCHOR = (5.9, 8.809, 9.795)
+F_KI_ANCHOR = (2.0, 3.864, 4.0)
+
+
+def _cs(v, angle=0.0, pressed=False, rate=0.0):
+  CS = car.CarState.new_message()
+  CS.vEgo = v
+  CS.steeringAngleDeg = angle
+  CS.steeringRateDeg = rate
+  CS.steeringPressed = pressed
+  return CS
+
+
+def _vp(roll=0.0, offset=0.0):
+  params = log.VehicleParameters.new_message()
+  params.roll = roll
+  params.angleOffsetDeg = offset
+  return params
+
+
+class TestInsterAnglePI(OpenpilotTestCase):
+  """switch InsterAngleErrorPI: v0's P and I replaced by "F" on the steering-wheel angle error"""
+
+  def test_gains(self):
+    assert ANGLE_PI_KP == F_KP and ANGLE_PI_KI == F_KI
+    for kmh, kp, ki in zip((15.0, 55.0, 115.0), F_KP_ANCHOR, F_KI_ANCHOR, strict=True):
+      assert abs(angle_pi_gain(ANGLE_PI_KP, kmh / 3.6) - kp) < 1e-3, kmh
+      assert abs(angle_pi_gain(ANGLE_PI_KI, kmh / 3.6) - ki) < 1e-3, kmh
+    # no hold above 130 km/h (owner): kp 7.9 / ki 2.0 at 160 km/h; positive over the whole speed range of the car
+    assert abs(angle_pi_gain(ANGLE_PI_KP, 160 / 3.6) - 7.87) < 0.01 and abs(angle_pi_gain(ANGLE_PI_KI, 160 / 3.6) - 2.01) < 0.01
+    for v in np.linspace(0.0, 50.0, 501):
+      assert angle_pi_gain(ANGLE_PI_KP, v) > 0.0 and angle_pi_gain(ANGLE_PI_KI, v) > 0.0
+    # clipped at >= 0 beyond the roots (ki 186 km/h, kp 232 km/h)
+    assert angle_pi_gain(ANGLE_PI_KI, 55.0) == 0.0 and angle_pi_gain(ANGLE_PI_KP, 55.0) > 0.0
+    assert angle_pi_gain(ANGLE_PI_KP, 70.0) == 0.0
+    pi = InsterAnglePI(rate=1 / DT_CTRL)
+    for v in (0.0, 4.2, 15.3, 31.9):
+      pi.speed = v
+      assert pi.k_p == angle_pi_gain(F_KP, v) and pi.k_i == angle_pi_gain(F_KI, v) and pi.k_d == 0.0
+
+  def test_angle_error_is_wheel_angle_error(self):
+    # e = delta_plan - delta_meas (rad, + right): delta_plan from the inverse vehicle model incl. steer ratio, slip factor and roll,
+    # delta_meas = steering angle - learned offset; equal to R(v) x (desired - v0's measured curvature)
+    CP = interfaces[HYUNDAI.HYUNDAI_INSTER].get_non_essential_params(HYUNDAI.HYUNDAI_INSTER)
+    VM = VehicleModel(CP)
+    rng = random.Random(11)
+    worst = 0.0
+    for _ in range(5000):
+      VM.update_params(rng.uniform(0.6, 1.4), rng.uniform(11.0, 17.0))
+      v = rng.choice([0.0, rng.uniform(0.0, 3.0), rng.uniform(0.0, 45.0)])
+      roll = rng.uniform(-0.1, 0.1)
+      offset = rng.uniform(-3.0, 3.0)
+      angle = rng.uniform(-400.0, 400.0)
+      desired_curvature = rng.uniform(-0.2, 0.2)
+      measured_curvature = -VM.calc_curvature(math.radians(angle - offset), v, roll)      # as v0
+      delta_plan = -VM.get_steer_from_curvature(-desired_curvature, v, roll)              # + right
+      delta_meas = -math.radians(angle - offset)                                          # + right
+      expected = delta_plan - delta_meas
+      e = angle_error(VM, v, desired_curvature, measured_curvature)
+      worst = max(worst, abs(e - expected) / max(1.0, abs(expected)))
+    assert worst < 1e-12, worst
+    # sign: wheel 10 deg left of a straight plan -> the error asks for right (+)
+    VM.update_params(1.0, 14.0)
+    mc = -VM.calc_curvature(math.radians(10.0), 20.0, 0.0)
+    assert abs(angle_error(VM, 20.0, 0.0, mc) - math.radians(10.0)) < 1e-12
+
+  def _check_rule(self, c, CS, VM, params, steer_limited, desired_curvature, i_prev):
+    """the F rule for the step just run: p = kp e, i += ki e dt unless frozen, anti-windup and clip as common/pid.py"""
+    measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
+    e = angle_error(VM, CS.vEgo, desired_curvature, measured_curvature)
+    kp, ki = angle_pi_gain(F_KP, CS.vEgo), angle_pi_gain(F_KI, CS.vEgo)
+    pid = c.pid
+    assert pid.p == kp * e
+    lim = pid.pos_limit
+    if steer_limited or CS.steeringPressed:
+      assert pid.i == i_prev
+    else:
+      i_new = i_prev + ki * DT_CTRL * e
+      test = pid.p + i_new + pid.f
+      hi = i_prev if test > lim else lim
+      lo = i_prev if test < -lim else -lim
+      assert pid.i == min(max(i_new, lo), hi)
+    assert pid.d == 0.0
+    out = pid.p + pid.i + pid.f
+    assert pid.control == min(max(out, -lim), lim)
+    return e
+
+  def test_rule_in_v0(self):
+    for on in ((ANGLE_PI_KEY,), INSTER_KEYS):
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
+      assert c.inster_angle_pi and isinstance(c.pid, InsterAnglePI) and c.extension._pid is c.pid
+      assert abs(c.pid.pos_limit / c.torque_params.latAccelFactor - CAP) < 1e-9
+      rng = random.Random(5)
+      angle = 0.0
+      frozen = 0
+      for k in range(3000):
+        t = k * DT_CTRL
+        v = max(0.0, 12.0 + 13.0 * math.sin(0.11 * t))
+        dc = 0.02 * math.sin(0.7 * t) + 0.01 * math.sin(2.9 * t)
+        target = math.degrees(VM.get_steer_from_curvature(-dc, v, 0.0))
+        rate = (target - angle) * 3.0 + rng.gauss(0, 5.0)
+        angle += rate * DT_CTRL
+        CS = _cs(v, angle, pressed=(k % 700) < 25, rate=abs(rate))
+        params = _vp(0.02 * math.sin(0.05 * t), 0.3)
+        if k % 100 == 0:
+          c.update_torque_parameters(2.8 + 0.3 * math.sin(0.02 * t), 0.04, 0.09)
+        sl = (k % 41) == 0
+        i_prev = c.pid.i
+        tq, _, lac_log = c.update(True, CS, VM, params, sl, dc, None, False, 0.2)
+        self._check_rule(c, CS, VM, params, sl, dc, i_prev)
+        frozen += sl or CS.steeringPressed
+        assert abs(tq) <= CAP + 1e-12
+        assert tq == -c.pid.control / c.torque_params.latAccelFactor
+        # logs: p / i in lateral-acceleration units, error stays v0's lateral-acceleration error
+        assert lac_log.p == np.float32(c.pid.p) and lac_log.i == np.float32(c.pid.i)
+        measured_curvature = -VM.calc_curvature(math.radians(angle - 0.3), v, params.roll)
+        assert abs(lac_log.error - (dc - measured_curvature) * v ** 2) < 1e-3 * max(1.0, abs(lac_log.error))
+      assert frozen > 50
+
+  def test_integrator_from_standstill(self):
+    c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS)
+    params = _vp()
+    for v in (0.0, 1.0, 4.9):
+      c.pid.reset()
+      i_values = []
+      for _ in range(50):
+        c.update(True, _cs(v, angle=-5.0), VM, params, False, 0.0, None, False, 0.2)   # wheel 5 deg right of a straight plan
+        i_values.append(c.pid.i)
+      v = _cs(v).vEgo                                                                         # as the controller sees it (float32)
+      e = angle_error(VM, v, 0.0, -VM.calc_curvature(math.radians(-5.0), v, 0.0))
+      assert e < 0.0 and abs(e - math.radians(-5.0)) < 1e-12                                 # the plan is left of the wheel: e < 0
+      # integrates from the first step at every speed (v0 freezes below 5 m/s)
+      assert abs(i_values[0] - angle_pi_gain(F_KI, v) * DT_CTRL * e) < 1e-15
+      assert abs(i_values[-1] - 50 * angle_pi_gain(F_KI, v) * DT_CTRL * e) < 1e-12
+    # v0 (switch off) keeps its freeze below 5 m/s
+    off, VM_off = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=STEP2_KEYS)
+    for _ in range(50):
+      off.update(True, _cs(1.0, angle=-5.0), VM_off, params, False, 0.0, None, False, 0.2)
+    assert off.pid.i == 0.0
+
+  def test_freeze(self):
+    c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS)
+    params = _vp()
+    for _ in range(20):
+      c.update(True, _cs(10.0, angle=-5.0), VM, params, False, 0.0, None, False, 0.2)
+    i0 = c.pid.i
+    assert i0 < 0.0
+    for _ in range(30):
+      c.update(True, _cs(10.0, angle=-5.0, pressed=True), VM, params, False, 0.0, None, False, 0.2)
+      assert c.pid.i == i0                                                                   # steeringPressed
+      c.update(True, _cs(10.0, angle=-5.0), VM, params, True, 0.0, None, False, 0.2)
+      assert c.pid.i == i0                                                                   # steer_limited_by_safety (cap / ramp)
+    c.update(True, _cs(10.0, angle=-5.0), VM, params, False, 0.0, None, False, 0.2)
+    assert c.pid.i < i0
+    # inactive: no output, and F's integrator is reset (v0 keeps its own, see test_stale_integrator_after_inactive)
+    assert c.pid.i != 0.0
+    tq, _, lac_log = c.update(False, _cs(10.0, angle=-5.0), VM, params, False, 0.0, None, False, 0.2)
+    assert tq == 0.0 and not lac_log.active and c.pid.i == 0.0 and c.pid.p == 0.0
+
+  def test_stale_integrator_after_inactive(self):
+    # review scenario (agents/f_review rv_check.py "stale"): 8 s active at 2 m/s in a slow turn (plan 0.02 1/m) with the wheel 8 deg
+    # behind the plan winds F's integrator (v0 is frozen below 5 m/s); 10 s inactive (driver took over); re-engaged at 25 m/s on a
+    # straight with the wheel on the plan. Without the reset F's first command was 170.6 raw towards the old curve; now ~0 as v0.
+    first = {}
+    for name, on in (("v0_step2", STEP2_KEYS), ("F", INSTER_KEYS)):
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
+      for _ in range(800):
+        plan = math.degrees(VM.get_steer_from_curvature(-0.02, 2.0, 0.0))
+        c.update(True, _cs(2.0, plan - 8.0), VM, _vp(), False, 0.02, None, False, 0.2)
+      i_wound = c.pid.i
+      for _ in range(1000):
+        c.update(False, _cs(10.0, 0.0), VM, _vp(), False, 0.0, None, False, 0.2)
+      tq, _, lac_log = c.update(True, _cs(25.0, 0.0), VM, _vp(), False, 0.0, None, False, 0.2)
+      first[name] = (i_wound, c.pid.i, tq * STEER_MAX_RAW, lac_log.version)
+    assert first["v0_step2"][0] == 0.0 and first["v0_step2"][3] == 0
+    assert first["F"][0] < -1.5                                     # F did wind at 2 m/s (-1.64 m/s^2)
+    assert abs(first["F"][1]) < 1e-3                                # reset: only the first step's I at the re-engagement
+    assert abs(first["F"][2]) < 0.5 and abs(first["F"][2] - first["v0_step2"][2]) < 0.5   # ~0 raw, as v0 (was 170.6 raw)
+    assert first["F"][3] == ANGLE_PI_LOG_VERSION
+
+  def test_log_version(self):
+    # F drives are identifiable in the logs: torqueState.version 100 with F on, 0 for v0 otherwise (upstream torque controller: 1)
+    assert ANGLE_PI_LOG_VERSION not in (latcontrol_torque_v0.VERSION, 1)
+    for on, expected in ((INSTER_KEYS, ANGLE_PI_LOG_VERSION), ((ANGLE_PI_KEY,), ANGLE_PI_LOG_VERSION), (STEP2_KEYS, 0), ((), 0),
+                         (INSTER_KEYS + ("NeuralNetworkLateralControl",), 0)):
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
+      for active in (True, False):
+        _, _, lac_log = c.update(active, _cs(10.0, 1.0), VM, _vp(), False, 0.0, None, False, 0.2)
+        assert lac_log.version == expected, (on, active)
+    c, VM = _make_v0(HYUNDAI.HYUNDAI_KONA_EV, on=INSTER_KEYS)
+    assert c.update(True, _cs(10.0, 1.0), VM, _vp(), False, 0.0, None, False, 0.2)[2].version == 0
+
+  def test_anti_windup_and_limits(self):
+    c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS)
+    params = _vp()
+    lim = c.pid.pos_limit
+    # far off the plan: the output sits at the cap (409 raw)
+    for _ in range(300):
+      tq, _, _ = c.update(True, _cs(8.0, angle=-200.0), VM, params, False, 0.0, None, False, 0.2)
+      assert abs(c.pid.i) <= lim + 1e-12 and abs(tq) <= CAP + 1e-12
+    assert abs(tq - CAP) < 1e-12
+    # P alone below the limit (wheel 0.3 rad left of a straight plan: e = +0.3, asks for right), P + I would pass it after ~2 s: I stops where the output
+    # reaches the limit (common/pid.py) instead of winding up for the 10 s
+    c.pid.reset()
+    for _ in range(1000):
+      tq, _, _ = c.update(True, _cs(8.0, angle=math.degrees(0.3)), VM, params, False, 0.0, None, False, 0.2)
+      assert abs(tq) <= CAP + 1e-12
+    p, i, f = c.pid.p, c.pid.i, c.pid.f
+    assert 0.0 < p < lim and abs(tq + CAP) < 1e-9
+    assert abs(p + i + f - lim) < 0.05                                                       # held at the limit, no wind-up
+    # small error the other way: the output leaves the limit on the first step
+    tq, _, _ = c.update(True, _cs(8.0, angle=-math.degrees(0.05)), VM, params, False, 0.0, None, False, 0.2)
+    assert -CAP + 0.1 < tq
+
+  def test_alone_replaces_only_p_and_i(self):
+    # F with both step-2 switches off: v0's linear feed-forward and get_friction (on v0's lateral-acceleration error) stay
+    c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=(ANGLE_PI_KEY,))
+    assert not c.inster_friction and not c.inster_ff and c.inster_angle_pi
+    base, VM_base = _make_v0(HYUNDAI.HYUNDAI_INSTER)
+    with mock.patch.object(latcontrol_torque_v0, "get_friction", wraps=latcontrol_torque_v0.get_friction) as gf:
+      a = _run(c, VM)
+      assert gf.call_count > 0
+    b = _run(base, VM_base)
+    assert [o[3] for o in a] == [o[3] for o in b]          # f: the same feed-forward
+    assert [o[5] for o in a] == [o[5] for o in b]          # error: v0's lateral-acceleration error
+    assert [o[0] for o in a] != [o[0] for o in b]
+
+  def test_off_keeps_step2_output(self):
+    # F off: the step-2 combination runs exactly as before (also with the F param present but off)
+    a = _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER, on=STEP2_KEYS))
+    c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=STEP2_KEYS)
+    assert type(c.pid) is PIDController and not c.inster_angle_pi
+    assert a == _run(c, VM)
+    assert a != _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS))
+
+  def test_error_is_steering_wheel_angle_through_update(self):
+    # F's error is the STEERING-WHEEL ANGLE error (rad), not v0's curvature x v^2 error. Through the real update(): with a fresh
+    # integrator, p = kp(v) e and i = ki(v) e dt, where e is built here directly from the carState / liveParameters values:
+    #   delta_plan = VM.get_steer_from_curvature(-desired_curvature, v, roll)   (openpilot's +left angle frame; as latcontrol_pid /
+    #                latcontrol_angle turn desired_curvature into a wheel angle, incl. steer ratio, slip factor and roll)
+    #   delta_meas = radians(steeringAngleDeg - angleOffsetDeg)                (+left)
+    #   e = -(delta_plan - delta_meas)   (+right, v0's internal frame) = -radians(latcontrol_pid's error) / 1 deg
+    c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS)
+    VM.update_params(0.93, 14.6)
+    n = n_integrating = 0
+    for kmh in (0.0, 10.0, 30.0, 60.0, 100.0, 130.0, 160.0):
+      for desired_curvature in (0.004, -0.004, 0.0):          # both turn directions and straight
+        for wheel_vs_plan in (2.0, -2.0, 0.5, -0.5):          # wheel left / right of the plan (deg)
+          for roll, offset in ((0.05, 2.5), (-0.04, -1.5)):
+            CS0 = _cs(kmh / 3.6)
+            vp = _vp(roll, offset)
+            v, roll32, off32 = CS0.vEgo, vp.roll, vp.angleOffsetDeg   # the float32 values the controller reads
+            plan_deg = math.degrees(VM.get_steer_from_curvature(-desired_curvature, v, roll32)) + off32
+            CS = _cs(kmh / 3.6, angle=plan_deg + wheel_vs_plan)
+            delta_plan = VM.get_steer_from_curvature(-desired_curvature, v, roll32)
+            delta_meas = math.radians(CS.steeringAngleDeg - off32)
+            e = -(delta_plan - delta_meas)
+            pid_error_deg = math.degrees(delta_plan) + off32 - CS.steeringAngleDeg   # latcontrol_pid's error (deg, +left)
+            assert abs(e + math.radians(pid_error_deg)) < 1e-12
+            assert (e > 0.0) == (wheel_vs_plan > 0.0)        # wheel left of the plan -> e > 0 -> steer right (v0-internal +)
+            assert abs(e - math.radians(CS.steeringAngleDeg - plan_deg)) < 1e-6
+            c.pid.reset()
+            c.update(True, CS, VM, vp, False, desired_curvature, None, False, 0.2)
+            kp, ki = angle_pi_gain(F_KP, v), angle_pi_gain(F_KI, v)
+            assert abs(c.pid.p - kp * e) <= 1e-12 * max(1.0, abs(kp * e)), (kmh, desired_curvature, wheel_vs_plan, roll)
+            i_new = ki * DT_CTRL * e                                  # first step from i = 0, then common/pid.py's anti-windup
+            test, lim = c.pid.p + i_new + c.pid.f, c.pid.pos_limit
+            expected_i = min(max(i_new, 0.0 if test < -lim else -lim), 0.0 if test > lim else lim)
+            assert abs(c.pid.i - expected_i) <= 1e-14, (kmh, desired_curvature, wheel_vs_plan, roll)
+            n += 1
+            n_integrating += expected_i == i_new
+    assert n == 7 * 3 * 4 * 2 and n_integrating > 0.8 * n
+
+  def test_gain_units_at_100_kmh(self):
+    # at 100 km/h a 1 deg wheel-angle error gives p = kp(27.8 m/s) x radians(1) m/s^2 and an I step of ki x radians(1) x dt, NOT
+    # kp x v0's lateral-acceleration error; the gains use the speed of the current step (PIDController.update sets self.speed first)
+    c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS)
+    VM.update_params(1.0, 14.0)
+    params = _vp()
+    c.update(True, _cs(30 / 3.6, angle=1.0), VM, params, False, 0.0, None, False, 0.2)        # a step at another speed first
+    c.pid.reset()
+    CS = _cs(100 / 3.6, angle=1.0)                                                           # wheel 1 deg left of a straight plan
+    _, _, lac_log = c.update(True, CS, VM, params, False, 0.0, None, False, 0.2)
+    v = CS.vEgo
+    kp, ki = angle_pi_gain(F_KP, v), angle_pi_gain(F_KI, v)
+    assert abs(kp - 9.93) < 0.01 and abs(ki - 4.27) < 0.01                                  # report_6p table at 100 km/h
+    assert abs(c.pid.p - kp * math.radians(1.0)) < 1e-12                                     # 0.173 m/s^2
+    assert abs(c.pid.i - ki * math.radians(1.0) * DT_CTRL) < 1e-15
+    # v0's lateral-acceleration error for the same 1 deg is (curvature error) x v^2: a different quantity
+    lat_error = (0.0 + VM.calc_curvature(math.radians(1.0), v, 0.0)) * v ** 2
+    assert abs(lac_log.error - lat_error) < 1e-5 and lat_error > 0.0
+    assert abs(c.pid.p - kp * lat_error) > 0.5 * c.pid.p                                    # not kp x the lateral-acceleration error
+    assert abs(c.pid.p / lac_log.error - kp * VM.get_steer_from_curvature(1.0, v, 0.0) / v ** 2) < 1e-5
