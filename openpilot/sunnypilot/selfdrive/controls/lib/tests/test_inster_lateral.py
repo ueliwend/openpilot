@@ -102,6 +102,21 @@ class TestInsterTable(OpenpilotTestCase):
         assert ff_torque(a, v, 0.0) == table_torque(a * SCALE_CLIP[1], v)
         assert ff_torque(a, v, 10.0) == table_torque(a * SCALE_CLIP[0], v)         # factor far above F0: at most -15 %
 
+  def test_smooth_in_lateral_accel(self):
+    # the rule the table is built and refit by (t2_table409): below the cap, neighbouring slopes in a differ by at most x2.5 up and
+    # x0.4 down (0.01 tolerance: the cells are rounded to 0.1 raw)
+    for row in CMD_RAW:
+      s = [(row[i + 1] - row[i]) / (A_NODES[i + 1] - A_NODES[i]) for i in range(len(row) - 1)]
+      for i in range(len(s) - 1):
+        if row[i + 2] < INSTER_STEER_MAX and s[i] > 0.0:
+          assert 0.4 - 0.01 <= s[i + 1] / s[i] <= 2.5 + 0.01, (row, i)
+
+  def test_logged_learner_range_inside_scale_clip(self):
+    # learned factor logged on the table drives 22-26 Oct 2026 (torqued, per minute): filtered 2.679 .. 3.064 (what controlsd passes),
+    # raw 2.551 .. 3.123; the clip must not cut any of them, so the table follows the learner one to one in that range
+    for f in (2.551, 2.679, 3.064, 3.123):
+      assert SCALE_CLIP[0] < F0 / f < SCALE_CLIP[1]
+
   def test_lat_accel_equivalent(self):
     for v in (5.0, 20.0):
       for a in (-2.0, -0.3, 0.4, 1.7):

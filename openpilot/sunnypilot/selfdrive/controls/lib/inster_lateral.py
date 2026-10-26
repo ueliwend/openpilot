@@ -77,11 +77,15 @@ A_NODES = (0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 3.5)       # m/s
 V_NODES = tuple(x / 3.6 for x in (22.0, 32.0, 48.0, 76.0, 111.0))          # m/s
 CMD_RAW = (                                                                # rows: V_NODES, columns: A_NODES
   (0.0, 23.0, 57.1, 142.4, 250.6, 303.8, 352.2, 409.0, 409.0, 409.0, 409.0),   # 22 km/h  (measured to 1.25 m/s^2)
-  (0.0, 23.0, 48.0, 108.6, 146.2, 190.6, 242.5, 314.7, 387.2, 409.0, 409.0),   # 32 km/h  (measured to 2.5)
-  (0.0, 21.1, 48.0, 95.4, 116.1, 141.7, 168.6, 267.9, 328.0, 396.8, 409.0),    # 48 km/h  (measured to 3.0)
+  (0.0, 23.0, 48.0, 108.6, 136.8, 190.6, 242.5, 314.7, 387.2, 409.0, 409.0),   # 32 km/h  (measured to 2.5)
+  (0.0, 21.1, 48.0, 95.4, 121.8, 150.6, 183.0, 267.9, 328.0, 396.8, 409.0),    # 48 km/h  (measured to 3.0)
   (0.0, 19.8, 39.0, 67.9, 97.9, 130.3, 168.6, 267.9, 328.0, 396.8, 409.0),     # 76 km/h  (measured to 1.5)
   (0.0, 19.8, 38.8, 57.7, 85.2, 115.8, 154.0, 251.0, 318.6, 389.9, 409.0),     # 111 km/h (measured to 1.0)
 )
+# 26 Oct 2026, twenty-drive refit after route 000000a1: 32 km/h @ 1.0 m/s^2 146.2 -> 136.8; 48 km/h @ 1.0 / 1.25 / 1.5 m/s^2
+# 116.1 / 141.7 / 168.6 -> 121.8 / 150.6 / 183.0. Change 1.3-1.8 sigma by the refit's block bootstrap, about 1 sigma by leave-one-drive-out;
+# the 48 km/h move comes from that route alone (the refit without it equals the table). F0 and the clip unchanged: the filtered learned
+# factor that controlsd passes ranged 2.68-3.06 since 22 Oct (scale F0 / factor 0.914-1.045), inside the clip.
 # 23 Oct 2026: the 13 cells that were pinned at the old cap of 384 now run up to the new cap of 409 (torque-map extension of the owner's
 # route 0000007f at the 409 cap; agents/r7f_tmap/ff_table_409.json); every cell <= INSTER_STEER_MAX (tested). In raw units of the
 # full scale 384, so the 409 cells are 409 / 384 = 1.065 of full torque.
