@@ -244,7 +244,7 @@ class InsterStictionFriction:
 # angle_error().
 ANGLE_PI_KP = (4.3447, 0.40366, -0.0072954)
 ANGLE_PI_KI = (0.93525, 0.27948, -0.0057456)
-ANGLE_PI_LOG_VERSION = 100
+ANGLE_PI_LOG_VERSION = 101    # 100 until 26 Oct 2026; 101 = F with controlsd's crawl plan (crawl_plan_curvature)
 
 
 def angle_pi_gain(coeffs: tuple[float, float, float], v_ego: float) -> float:
@@ -274,3 +274,63 @@ class InsterAnglePI(PIDController):
   @property
   def k_i(self):
     return angle_pi_gain(ANGLE_PI_KI, self.speed)
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# Plan at crawl speed (with "F" only; controlsd, crawl_plan_curvature). Below ~1 m/s the model's desired curvature collapses towards
+# straight although the turn goes on (LOG, owner's drives 0000007[26f]/8[78]/9[7b], 26 Oct 2026):
+#   * modeld converts the planned heading to curvature with v floored at 1 m/s (drive_helpers.curv_from_psis, CODE): the plan shrinks
+#     by v / 1 m/s below 1 m/s (logged action.desiredCurvature reproduced from the logged plan to 1e-10);
+#   * the plan's own heading change also straightens on the approach to a stop: without the floor it still gives only 0.2-0.6 of the
+#     curvature the car was in at 1 m/s, while the model's current yaw rate / v still matches it (model lookahead unreliable there).
+# At standstill lateral is inactive and the plan is the measured curvature (stock). In between, "F" pulled the wheel towards straight.
+# Rule: a road's curvature changes with distance travelled, not with time. Below CRAWL_PLAN_SPEED the plan moves from the previous plan
+# towards the model's by at most c x vEgo x dt (c in 1/m per metre travelled):
+#   * towards straight (|curvature| down, up to zero): c = CRAWL_STRAIGHTEN_PER_M + |previous plan| / CRAWL_STRAIGHTEN_LENGTH
+#     (a constant rate plus a proportional relaxation over CRAWL_STRAIGHTEN_LENGTH metres, which bounds a hold of a tight curve);
+#   * away from straight (further into the turn, from zero, or past zero to the other side): c = CRAWL_TURN_IN_PER_M;
+#   both open linearly from CRAWL_PLAN_RELEASE_SPEED to at least CRAWL_PER_M_RELEASE at CRAWL_PLAN_SPEED; from CRAWL_PLAN_SPEED up the
+#   plan is the model's (a gap left by a hard acceleration through 1.4 m/s is closed by clip_curvature's jerk limit, 0.0255 1/m per step).
+# Worst cases (100 Hz with clip_curvature, extra heading / lateral offset vs following the model): creep at 0.5 m/s out of a curve
+# whose plan goes straight at once: 0.1 1/m (204 deg wheel) 4.0 deg / 0.08 m, 0.2 1/m (full lock) 11.4 deg / 0.35 m; S-bend at creep:
+# no plan step above 7 deg steering wheel per 10 ms; turn-in from a residual opposite curvature of -0.01 / -0.03 1/m: crosses zero
+# after 0.24 / 0.65 m of travel.
+# Stateless here: the state is controlsd's previous desired curvature, which is the measured curvature whenever lateral is inactive
+# (standstill, disengaged); while the driver steers (steeringPressed) controlsd passes the measured curvature instead of the previous
+# plan, so the plan starts from the driver's wheel and F does not pull against it.
+CRAWL_PLAN_SPEED = 1.4                 # m/s (5 km/h): unchanged from here up
+CRAWL_PLAN_RELEASE_SPEED = 1.0         # m/s: the limits start to open here (the floor of curv_from_psis)
+CRAWL_STRAIGHTEN_PER_M = 0.04          # 1/m per metre: constant part of the rate towards straight
+CRAWL_STRAIGHTEN_LENGTH = 2.0          # m: proportional part, |previous plan| / this (0.2 1/m -> 0.1 1/m per metre more)
+CRAWL_TURN_IN_PER_M = 0.4              # 1/m per metre away from straight (0 -> 0.1 1/m in 0.25 m)
+CRAWL_PER_M_RELEASE = 1.0              # 1/m per metre: both rates are at least this at CRAWL_PLAN_SPEED (0.014 1/m per 10 ms step)
+
+
+def _crawl_rate(c: float, v_ego: float) -> float:
+  if v_ego <= CRAWL_PLAN_RELEASE_SPEED:
+    return c
+  w = (v_ego - CRAWL_PLAN_RELEASE_SPEED) / (CRAWL_PLAN_SPEED - CRAWL_PLAN_RELEASE_SPEED)
+  return c + w * (max(c, CRAWL_PER_M_RELEASE) - c)
+
+
+def crawl_plan_curvature(v_ego: float, prev_curvature: float, new_curvature: float, dt: float) -> float:
+  """the plan's desired curvature at crawl speed (rule above): new_curvature from CRAWL_PLAN_SPEED up; below, prev_curvature moved
+  towards new_curvature by the distance travelled in this step (v_ego * dt), first towards straight, then away from it"""
+  if v_ego >= CRAWL_PLAN_SPEED:
+    return new_curvature
+  ds = max(v_ego, 0.0) * dt
+  k = prev_curvature
+  if k != 0.0 and (new_curvature - k) * k < 0.0:
+    # towards straight: to the model's plan if it is on this side, else to zero
+    target = new_curvature if new_curvature * k > 0.0 else 0.0
+    c = _crawl_rate(CRAWL_STRAIGHTEN_PER_M + abs(k) / CRAWL_STRAIGHTEN_LENGTH, v_ego)
+    if abs(target - k) > c * ds:
+      return k - math.copysign(c * ds, k)
+    ds -= abs(target - k) / c
+    k = target
+    if k == new_curvature:
+      return k
+  # away from straight (further into the turn, from zero, or past zero) with the distance left in this step
+  step = _crawl_rate(CRAWL_TURN_IN_PER_M, v_ego) * ds
+  delta = new_curvature - k
+  return k + (delta if abs(delta) <= step else math.copysign(step, delta))

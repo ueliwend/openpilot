@@ -27,6 +27,10 @@ from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import A_NODES, 
                                                                        SCALE_CLIP, STEER_MAX_RAW, V_NODES, InsterAnglePI, InsterStictionFriction, \
                                                                        angle_error, angle_pi_gain, ff_lat_accel_equivalent, ff_torque, \
                                                                        table_torque
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import CRAWL_PER_M_RELEASE, CRAWL_PLAN_RELEASE_SPEED, CRAWL_PLAN_SPEED, \
+                                                                       CRAWL_STRAIGHTEN_LENGTH, CRAWL_STRAIGHTEN_PER_M, CRAWL_TURN_IN_PER_M, \
+                                                                       crawl_plan_curvature
+from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import LatControlTorque as LatControlTorqueV0
 
 STEP2_KEYS = ("InsterStictionFriction", "InsterSpeedFeedforward")
@@ -593,7 +597,7 @@ class TestInsterAnglePI(OpenpilotTestCase):
     assert first["F"][3] == ANGLE_PI_LOG_VERSION
 
   def test_log_version(self):
-    # F drives are identifiable in the logs: torqueState.version 100 with F on, 0 for v0 otherwise (upstream torque controller: 1)
+    # F drives are identifiable in the logs: torqueState.version 101 with F on (100 before the crawl plan), 0 for v0 otherwise (upstream: 1)
     assert ANGLE_PI_LOG_VERSION not in (latcontrol_torque_v0.VERSION, 1)
     for on, expected in ((INSTER_KEYS, ANGLE_PI_LOG_VERSION), ((ANGLE_PI_KEY,), ANGLE_PI_LOG_VERSION), (STEP2_KEYS, 0), ((), 0),
                          (INSTER_KEYS + ("NeuralNetworkLateralControl",), 0)):
@@ -705,3 +709,166 @@ class TestInsterAnglePI(OpenpilotTestCase):
     assert abs(lac_log.error - lat_error) < 1e-5 and lat_error > 0.0
     assert abs(c.pid.p - kp * lat_error) > 0.5 * c.pid.p                                    # not kp x the lateral-acceleration error
     assert abs(c.pid.p / lac_log.error - kp * VM.get_steer_from_curvature(1.0, v, 0.0) / v ** 2) < 1e-5
+
+
+def _rate(c, v):
+  """the rule's rate (1/m per metre) at speed v: c up to the release speed, opening linearly to max(c, release rate) at 1.4 m/s"""
+  if v <= 1.0:
+    return c
+  return c + (v - 1.0) / 0.4 * (max(c, 1.0) - c)
+
+
+def _crawl_sim(vs, model, k0, rule=True):
+  """100 Hz as controlsd (rule, then clip_curvature with the Inster's ceiling); returns (s, desired, model) per step, the largest
+  10 ms step of the desired curvature and the extra heading (rad) / lateral offset (m) vs following the model until the plan rejoins it"""
+  des, s, h, y, mx, done, out = k0, 0.0, 0.0, 0.0, 0.0, False, []
+  for v in vs:
+    m = model(s)
+    new = crawl_plan_curvature(v, des, m, DT_CTRL) if rule else m
+    nd, _ = clip_curvature(v, des, new, 0.0, 3.3)
+    mx = max(mx, abs(nd - des))
+    des = nd
+    s += v * DT_CTRL
+    if not done:
+      h += (des - m) * v * DT_CTRL
+      y += h * v * DT_CTRL
+      done = abs(des - m) < 1e-12
+    out.append((s, des, m))
+  return out, mx, h, y
+
+
+class TestInsterCrawlPlan(OpenpilotTestCase):
+  """controlsd with "F" on: below 1.4 m/s the plan moves by at most a rate per metre travelled"""
+
+  def test_constants(self):
+    assert (CRAWL_PLAN_SPEED, CRAWL_PLAN_RELEASE_SPEED) == (1.4, 1.0)
+    assert (CRAWL_STRAIGHTEN_PER_M, CRAWL_STRAIGHTEN_LENGTH, CRAWL_TURN_IN_PER_M, CRAWL_PER_M_RELEASE) == (0.04, 2.0, 0.4, 1.0)
+    assert ANGLE_PI_LOG_VERSION == 101                      # F drives with the crawl plan are identifiable in the logs
+
+  def test_unchanged_from_crawl_speed_up(self):
+    rng = random.Random(1)
+    for _ in range(20000):
+      v = rng.choice([1.4, rng.uniform(1.4, 50.0)])
+      prev, new = rng.uniform(-0.2, 0.2), rng.uniform(-0.2, 0.2)
+      assert crawl_plan_curvature(v, prev, new, DT_CTRL) == new
+
+  def test_rule(self):
+    # independent restatement: towards straight at (0.04 + |prev| / 2) per metre up to zero, then away from straight at 0.4 per metre
+    rng = random.Random(3)
+    for _ in range(50000):
+      v = rng.choice([0.0, 1.0, rng.uniform(0.0, 1.4)])
+      prev = rng.choice([0.0, rng.uniform(-0.2, 0.2), rng.uniform(-0.003, 0.003)])
+      new = rng.choice([prev, -prev, rng.uniform(-0.2, 0.2), prev + rng.uniform(-1e-3, 1e-3)])
+      out = crawl_plan_curvature(v, prev, new, DT_CTRL)
+      ds = v * DT_CTRL
+      k = prev
+      if k != 0.0 and (new - k) * k < 0.0:
+        target = new if new * k > 0.0 else 0.0
+        c = _rate(0.04 + abs(k) / 2.0, v)
+        if abs(target - k) > c * ds:
+          expected = k - math.copysign(c * ds, k)
+        else:
+          ds -= abs(target - k) / c
+          k = target
+          expected = k if k == new else None
+      else:
+        expected = None
+      if expected is None:
+        step = _rate(0.4, v) * ds
+        expected = k + max(-step, min(step, new - k))
+      assert abs(out - expected) < 1e-15, (v, prev, new, out, expected)
+      assert min(prev, new) - 1e-15 <= out <= max(prev, new) + 1e-15     # between the previous plan and the model's
+      # never more than the rates allow in this step (no jump at zero or near straight)
+      assert abs(out - prev) <= max(_rate(0.4, v), _rate(0.04 + abs(prev) / 2.0, v)) * v * DT_CTRL + 1e-15
+    assert crawl_plan_curvature(0.0, 0.05, 0.0, DT_CTRL) == 0.05           # standstill: no travel, no change
+    assert crawl_plan_curvature(0.5, 0.05, 0.05, DT_CTRL) == 0.05
+
+  def test_release_continuous(self):
+    # continuous in speed at the release speed; just below 1.4 m/s both rates are 1.0 1/m per metre (0.014 1/m per step)
+    for prev, new in ((0.05, 0.0), (0.0, 0.05), (0.02, -0.05), (0.2, 0.0)):
+      a, b = crawl_plan_curvature(1.0 - 1e-9, prev, new, DT_CTRL), crawl_plan_curvature(1.0 + 1e-9, prev, new, DT_CTRL)
+      assert abs(a - b) < 1e-9, (prev, new)
+    assert abs(crawl_plan_curvature(1.4 - 1e-9, 0.0, 0.1, DT_CTRL) - 0.014) < 1e-9
+    assert abs(crawl_plan_curvature(1.4 - 1e-9, 0.05, 0.0, DT_CTRL) - (0.05 - 0.014)) < 1e-9
+
+  def test_collapsed_plan_at_a_stop_in_a_turn(self):
+    # LOG-like stop (owner's r97 stop at 1209 s): 0.068 1/m at 1.07 m/s; the model plan shrinks with v (floor) and straightens as the
+    # car stops; afterwards it comes back and the turn tightens
+    k_turn, prev, v = 0.068, 0.068, 1.4
+    while v > 0.3:                                      # approach: 1.4 -> 0.3 m/s at 0.6 m/s^2
+      prev = crawl_plan_curvature(v, prev, k_turn * min(v, 1.0) ** 1.5, DT_CTRL)
+      v -= 0.6 * DT_CTRL
+    # 1.6 m of travel below 1.4 m/s with the model plan going to 0.011: the proportional relaxation (worst-case bound) keeps 0.0226
+    collapsed = k_turn * 0.3 ** 1.5
+    assert 0.022 < prev < 0.023 and prev > 2 * collapsed, prev
+    prev, v = prev, 0.31                                # drive-off from the held wheel (controlsd: measured curvature while inactive)
+    for _ in range(300):
+      model = 0.12 * min(v, 1.0)
+      out = crawl_plan_curvature(v, prev, model, DT_CTRL)
+      if v >= 1.4:
+        assert out == model
+      prev = out
+      v += 0.8 * DT_CTRL
+    assert prev == 0.12
+
+  def test_worst_cases(self):
+    # (1) creep out of a curve whose model plan goes straight at once: bounded extra heading / offset (proportional relaxation)
+    for v in (0.5, 0.9):
+      for k0, h_max, y_max in ((0.1, 4.1, 0.09), (0.2, 11.5, 0.36)):
+        out, _, h, y = _crawl_sim([v] * 8000, lambda s: 0.0, k0)
+        assert out[-1][1] == 0.0 and math.degrees(h) < h_max and y < y_max, (v, k0, math.degrees(h), y)
+    # (2) S-bend at creep, +k -> -k over 2 m: no jump through zero (largest 10 ms step <= the turn-in rate x distance)
+    for v in (0.5, 0.9):
+      for k in (0.03, 0.05, 0.1):
+        out, mx, h, y = _crawl_sim([v] * 4000, lambda s, k=k: k - 2 * k * min(1.0, s / 2.0), k)
+        assert mx <= 0.4 * v * DT_CTRL + 1e-12 and abs(out[-1][1] + k) < 1e-12, (v, k, mx)
+        assert y < 0.04
+    # (3) stop before a turn with a small opposite residual: crosses zero soon after drive-off
+    for kr, s_max in ((-0.003, 0.1), (-0.01, 0.25), (-0.03, 0.66)):
+      vs = [min(0.3 + 0.5 * DT_CTRL * i, 3.0) for i in range(600)]
+      out, _, _, _ = _crawl_sim(vs, lambda s: 0.08, kr)
+      s_cross = next(s for s, d, _ in out if d > 0.0)
+      assert s_cross < s_max, (kr, s_cross)
+    # (4) stop straight, then a turn-in of 0 -> 0.08 1/m over 0.5 m: no delay vs the model's plan
+    vs = [min(0.3 + 0.5 * DT_CTRL * i, 3.0) for i in range(600)]
+    rule, _, _, _ = _crawl_sim(vs, lambda s: min(0.08, 0.16 * s), 0.0)
+    plain, _, _, _ = _crawl_sim(vs, lambda s: min(0.08, 0.16 * s), 0.0, rule=False)
+    assert all(abs(a[1] - b[1]) < 1e-12 for a, b in zip(rule, plain, strict=True))
+
+  def test_controlsd_applies_the_rule_only_with_f(self):
+    # controlsd's plan statement, executed from its source: model plan (or maneuver / measured) as before unless inster_crawl_plan;
+    # with it, crawl_plan_curvature from the previous plan, or from the measured curvature while the driver steers
+    import ast
+    import importlib.util
+    import textwrap
+    import types
+    spec = importlib.util.find_spec("openpilot.selfdrive.controls.controlsd")
+    assert spec is not None and spec.origin is not None
+    src = open(spec.origin).read()
+    assert "self.inster_crawl_plan = bool(getattr(self.LaC, 'inster_angle_pi', False))" in src
+    fn = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and n.name == "state_control")
+    node = next(n for n in fn.body if isinstance(n, ast.If) and "lateralManeuverPlan" in ast.get_source_segment(src, n.test))
+    code = compile(textwrap.dedent(" " * node.col_offset + ast.get_source_segment(src, node)), "controlsd", "exec")
+    rng = random.Random(4)
+    for _ in range(4000):
+      flag, lat, pressed, man = (rng.random() < 0.5 for _ in range(4))
+      v = rng.choice([0.0, 0.3, rng.uniform(0.0, 1.5), rng.uniform(0.0, 40.0)])
+      prev, model, meas, mplan = (rng.uniform(-0.2, 0.2) for _ in range(4))
+
+      class SM(dict):
+        valid = {"lateralManeuverPlan": man}
+      ctl = types.SimpleNamespace(sm=SM(lateralManeuverPlan=types.SimpleNamespace(desiredCurvature=mplan)), curvature=meas,
+                                  desired_curvature=prev, inster_crawl_plan=flag)
+      env = {"self": ctl, "CC": types.SimpleNamespace(latActive=lat), "CS": types.SimpleNamespace(vEgo=v, steeringPressed=pressed),
+             "model_v2": types.SimpleNamespace(action=types.SimpleNamespace(desiredCurvature=model)),
+             "crawl_plan_curvature": crawl_plan_curvature, "DT_CTRL": DT_CTRL}
+      exec(code, env)
+      if man:
+        expected = mplan if lat else meas
+      elif not lat:
+        expected = meas
+      elif flag:
+        expected = crawl_plan_curvature(v, meas if pressed else prev, model, DT_CTRL)
+      else:
+        expected = model
+      assert env["new_desired_curvature"] == expected

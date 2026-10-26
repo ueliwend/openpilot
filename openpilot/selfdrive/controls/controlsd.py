@@ -23,7 +23,7 @@ from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 
 from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
-from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import max_lateral_accel_no_roll
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import crawl_plan_curvature, max_lateral_accel_no_roll
 
 State = log.SelfdriveState.OpenpilotState
 LaneChangeState = log.LaneChangeState
@@ -73,6 +73,8 @@ class Controls(ControlsExt):
 
     # highest planned lateral acceleration without roll: 3.0 (ISO 11270); the Hyundai Inster's own value (inster_lateral.py)
     self.max_lat_accel_no_roll = max_lateral_accel_no_roll(self.CP, MAX_LATERAL_ACCEL_NO_ROLL)
+    # Hyundai Inster with "F" (InsterAngleErrorPI) only: below 1.4 m/s the plan moves per metre travelled, not per second (inster_lateral.py)
+    self.inster_crawl_plan = bool(getattr(self.LaC, 'inster_angle_pi', False))
 
   def update(self):
     self.sm.update(15)
@@ -147,6 +149,10 @@ class Controls(ControlsExt):
       new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
     else:
       new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
+      if self.inster_crawl_plan and CC.latActive:
+        # while the driver steers, the plan's straightening starts from the wheel the driver holds
+        prev_curvature = self.curvature if CS.steeringPressed else self.desired_curvature
+        new_desired_curvature = crawl_plan_curvature(CS.vEgo, prev_curvature, new_desired_curvature, DT_CTRL)
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll,
                                                                self.max_lat_accel_no_roll)
     lat_delay = self.sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS
