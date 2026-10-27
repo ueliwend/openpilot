@@ -12,11 +12,11 @@ import pyray as rl
 
 from openpilot.common.basedir import BASEDIR
 from openpilot.selfdrive.ui.ui_state import ui_state
-from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import is_inster
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_GAINS_PARAM, angle_pi_gain_set, is_inster
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.sunnypilot.lib.utils import NoElideButtonAction
-from openpilot.system.ui.sunnypilot.widgets.list_view import ListItemSP, toggle_item_sp, option_item_sp
+from openpilot.system.ui.sunnypilot.widgets.list_view import ListItemSP, multiple_button_item_sp, toggle_item_sp, option_item_sp
 from openpilot.system.ui.sunnypilot.widgets.tree_dialog import TreeOptionDialog, TreeFolder, TreeNode
 from openpilot.system.ui.widgets import Widget, DialogResult
 from openpilot.system.ui.widgets.network import NavButton
@@ -124,13 +124,20 @@ class TorqueSettingsLayout(Widget):
                              "Tuned in simulation with both Inster switches above on. Turning it on switches the Lateral Jerk " +
                              "Torque Controller off. Off by default."),
     )
-    self._inster_angle_pi_g6_toggle = toggle_item_sp(
-      param="InsterAngleErrorPIG6",
-      title=lambda: tr("Inster: Angle-PI Gains G6 (experimental)"),
-      description=lambda: tr("Hyundai Inster only, with the steering-angle PI above on. Uses gain set G6 instead of G2: less P, more " +
-                             "I. In simulation calmer on straights and drifts wide less, but runs curves a little further inside and " +
-                             "releases curve exits slightly later. Not validated on the car. Off by default."),
+    self._inster_angle_pi_gains = multiple_button_item_sp(
+      param=ANGLE_PI_GAINS_PARAM,
+      title=lambda: tr("Inster: Angle-PI Gain Set (experimental)"),
+      description=lambda: tr("Hyundai Inster only, with the steering-angle PI above on. G2: the default. G6: less P, more I; calmer " +
+                             "on straights and drifts wide less, but runs curves a little further inside and releases curve exits " +
+                             "slightly later. P6: PID; smaller, smoother corrections, less exit overshoot and closer to the line " +
+                             "in mid-speed curves; wider in slow tight turns, a little further inside on the motorway, and slightly " +
+                             "later exit release. Simulation only, not validated on the car."),
+      buttons=["G2", "G6", "P6"],
+      inline=False,
+      button_width=250,
     )
+    # the gain set in force (also before the G6 bool's migration ran)
+    self._inster_angle_pi_gains.action_item.set_selected_button(angle_pi_gain_set(ui_state.params))
 
     items = [
       self._jerk_aware_toggle,
@@ -144,7 +151,7 @@ class TorqueSettingsLayout(Widget):
       self._inster_friction_toggle,
       self._inster_ff_toggle,
       self._inster_angle_pi_toggle,
-      self._inster_angle_pi_g6_toggle,
+      self._inster_angle_pi_gains,
     ]
     return items
 
@@ -160,9 +167,9 @@ class TorqueSettingsLayout(Widget):
     for inster_toggle in inster_toggles:
       inster_toggle.set_visible(inster)
       inster_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
-    # G6 gain set: a sub-switch of the steering-angle PI, shown only while that is on (same change rules)
-    self._inster_angle_pi_g6_toggle.set_visible(inster and self._inster_angle_pi_toggle.action_item.get_state())
-    self._inster_angle_pi_g6_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
+    # gain set G2 / G6 / P6: a selector of the steering-angle PI, shown only while that is on (same change rules)
+    self._inster_angle_pi_gains.set_visible(inster and self._inster_angle_pi_toggle.action_item.get_state())
+    self._inster_angle_pi_gains.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
     if not ui_state.params.get_bool("LiveTorqueParamsToggle"):
       ui_state.params.remove("LiveTorqueParamsRelaxedToggle")
       self._relaxed_tune_toggle.action_item.set_state(False)

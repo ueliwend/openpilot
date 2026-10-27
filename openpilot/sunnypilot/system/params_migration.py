@@ -103,6 +103,19 @@ def _migrate_model_bundle_slots(_params):
     cloudlog.exception(f"Error migrating model bundle slots: {e}")
 
 
+def _migrate_inster_angle_pi_gains(_params):
+  # Hyundai Inster: the bool InsterAngleErrorPIG6 (G6 on / off) became the gain-set selector InsterAngleErrorPIGains (0 = G2, 1 = G6,
+  # 2 = P6). G6 on -> 1 unless the selector is already set; the bool is removed either way, so it cannot override a later choice.
+  try:
+    if _params.get_bool("InsterAngleErrorPIG6"):
+      if _params.get("InsterAngleErrorPIGains") is None:
+        _params.put("InsterAngleErrorPIGains", 1, block=True)
+        cloudlog.info("params_migration: InsterAngleErrorPIG6 -> InsterAngleErrorPIGains = 1 (G6)")
+      _params.remove("InsterAngleErrorPIG6")
+  except Exception as e:
+    cloudlog.exception(f"Error migrating InsterAngleErrorPIG6: {e}")
+
+
 def run_migration(_params):
   # migrate OnroadScreenOffBrightness
   if _params.get("OnroadScreenOffBrightnessMigrated") != ONROAD_BRIGHTNESS_MIGRATION_VERSION:
@@ -142,3 +155,6 @@ def run_migration(_params):
 
   # seed the chestnut model slot from the pre-split single slot
   _migrate_model_bundle_slots(_params)
+
+  # Hyundai Inster: G6 bool -> angle-PI gain-set selector
+  _migrate_inster_angle_pi_gains(_params)

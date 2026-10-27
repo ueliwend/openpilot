@@ -7,7 +7,7 @@ See the LICENSE.md file in the root directory for more details.
 
 from openpilot.common.params import Params
 from openpilot.common.test import OpenpilotTestCase
-from openpilot.sunnypilot.system.params_migration import _migrate_model_bundle_slots
+from openpilot.sunnypilot.system.params_migration import _migrate_inster_angle_pi_gains, _migrate_model_bundle_slots, run_migration
 
 
 class TestModelBundleSlotMigration(OpenpilotTestCase):
@@ -34,3 +34,37 @@ class TestModelBundleSlotMigration(OpenpilotTestCase):
     params = Params()
     _migrate_model_bundle_slots(params)
     assert params.get("ModelManager_ActiveBundleChestnut") is None
+
+
+class TestInsterAnglePIGainsMigration(OpenpilotTestCase):
+  """Hyundai Inster: the bool InsterAngleErrorPIG6 became the selector InsterAngleErrorPIGains (0 = G2, 1 = G6, 2 = P6)"""
+
+  def test_g6_on_becomes_selector_1(self):
+    params = Params()
+    params.put_bool("InsterAngleErrorPIG6", True, block=True)
+    _migrate_inster_angle_pi_gains(params)
+    assert params.get("InsterAngleErrorPIGains") == 1
+    assert params.get("InsterAngleErrorPIG6") is None
+    _migrate_inster_angle_pi_gains(params)                      # idempotent
+    assert params.get("InsterAngleErrorPIGains") == 1
+
+  def test_g6_off_or_unset_leaves_selector_unset(self):
+    params = Params()
+    _migrate_inster_angle_pi_gains(params)
+    assert params.get("InsterAngleErrorPIGains") is None
+    params.put_bool("InsterAngleErrorPIG6", False, block=True)
+    _migrate_inster_angle_pi_gains(params)
+    assert params.get("InsterAngleErrorPIGains") is None and params.get_bool("InsterAngleErrorPIG6") is False
+
+  def test_selector_already_set_wins(self):
+    params = Params()
+    params.put("InsterAngleErrorPIGains", 2, block=True)
+    params.put_bool("InsterAngleErrorPIG6", True, block=True)
+    _migrate_inster_angle_pi_gains(params)
+    assert params.get("InsterAngleErrorPIGains") == 2 and params.get("InsterAngleErrorPIG6") is None
+
+  def test_runs_from_run_migration(self):
+    params = Params()
+    params.put_bool("InsterAngleErrorPIG6", True, block=True)
+    run_migration(params)
+    assert params.get("InsterAngleErrorPIGains") == 1 and params.get("InsterAngleErrorPIG6") is None
