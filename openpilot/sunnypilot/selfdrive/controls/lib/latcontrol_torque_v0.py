@@ -11,8 +11,10 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.common.pid import PIDController
 
-from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_LOG_VERSION, InsterAnglePI, InsterStictionFriction, \
-                                                                       STEER_MAX_RAW, angle_error, ff_lat_accel_equivalent, is_inster
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_G6_KI, ANGLE_PI_G6_KP, ANGLE_PI_G6_LOG_VERSION, \
+                                                                       ANGLE_PI_G6_SWITCH, ANGLE_PI_LOG_VERSION, InsterAnglePI, \
+                                                                       InsterStictionFriction, STEER_MAX_RAW, angle_error, \
+                                                                       ff_lat_accel_equivalent, is_inster
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_ext import LatControlTorqueExt
 
 # At higher speeds (25+mph) we can assume:
@@ -59,6 +61,8 @@ class LatControlTorque(LatControl):
     self.inster_friction = False
     self.inster_ff = False
     self.inster_angle_pi = False
+    self.inster_angle_pi_g6 = False
+    self.inster_angle_pi_version = ANGLE_PI_LOG_VERSION
     if is_inster(CP):
       self._init_inster(Params())
 
@@ -88,7 +92,13 @@ class LatControlTorque(LatControl):
       # P and I of "F" on the steering-wheel angle error replace v0's PID (same limits, feed-forward and output conversion)
       if not (friction and feedforward):
         cloudlog.warning("InsterAngleErrorPI was tuned with InsterStictionFriction and InsterSpeedFeedforward both on")
-      self.pid = InsterAnglePI(rate=1 / self.dt)
+      # gain set: G2 (version 102), or G6 (version 103) with the sub-switch InsterAngleErrorPIG6
+      if params.get_bool(ANGLE_PI_G6_SWITCH):
+        self.inster_angle_pi_g6 = True
+        self.inster_angle_pi_version = ANGLE_PI_G6_LOG_VERSION
+        self.pid = InsterAnglePI(rate=1 / self.dt, kp=ANGLE_PI_G6_KP, ki=ANGLE_PI_G6_KI)
+      else:
+        self.pid = InsterAnglePI(rate=1 / self.dt)
       self.update_limits()
       self.extension._pid = self.pid
 
@@ -114,7 +124,7 @@ class LatControlTorque(LatControl):
       self.inster_curvature_buffer.append(desired_curvature)
 
     pid_log = log.ControlsState.LateralTorqueState.new_message()
-    pid_log.version = ANGLE_PI_LOG_VERSION if self.inster_angle_pi else VERSION
+    pid_log.version = self.inster_angle_pi_version if self.inster_angle_pi else VERSION
     if not active:
       output_torque = 0.0
       pid_log.active = False

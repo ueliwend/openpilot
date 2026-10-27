@@ -23,6 +23,8 @@ from openpilot.common.test import OpenpilotTestCase
 from openpilot.selfdrive.car.helpers import convert_to_capnp
 from openpilot.sunnypilot.selfdrive.car import interfaces as sunnypilot_interfaces
 from openpilot.sunnypilot.selfdrive.controls.lib import inster_lateral, latcontrol_torque_v0
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_G6_KI, ANGLE_PI_G6_KP, ANGLE_PI_G6_LOG_VERSION, \
+                                                                       ANGLE_PI_G6_SWITCH
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import A_NODES, ANGLE_PI_KI, ANGLE_PI_KP, ANGLE_PI_LOG_VERSION, CMD_RAW, F0, \
                                                                        SCALE_CLIP, STEER_MAX_RAW, V_NODES, InsterAnglePI, InsterStictionFriction, \
                                                                        angle_error, angle_pi_gain, ff_lat_accel_equivalent, ff_torque, \
@@ -182,7 +184,7 @@ class TestInsterStictionFriction(OpenpilotTestCase):
 
 def _make_v0(car_name, on=(), after_setup=()):
   params = Params()
-  for key in INSTER_KEYS + ("LateralJerkTorqueController", "NeuralNetworkLateralControl"):
+  for key in INSTER_KEYS + (G6_KEY, "LateralJerkTorqueController", "NeuralNetworkLateralControl"):
     params.put_bool(key, key in on, block=True)
   CarInterface = interfaces[car_name]
   CP = CarInterface.get_non_essential_params(car_name)
@@ -341,7 +343,7 @@ class TestInsterSteerCap(OpenpilotTestCase):
     from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque as LatControlTorqueV1
     for car_name, cap in ((HYUNDAI.HYUNDAI_INSTER, CAP), (HYUNDAI.HYUNDAI_KONA_EV, 1.0)):
       params = Params()
-      for key in INSTER_KEYS + ("LateralJerkTorqueController", "NeuralNetworkLateralControl"):
+      for key in INSTER_KEYS + (G6_KEY, "LateralJerkTorqueController", "NeuralNetworkLateralControl"):
         params.put_bool(key, False, block=True)
       CarInterface = interfaces[car_name]
       CP = CarInterface.get_non_essential_params(car_name)
@@ -426,6 +428,7 @@ class TestInsterSteerCap(OpenpilotTestCase):
       assert key not in keys
     assert inster_lateral.INSTER_SWITCHES == INSTER_KEYS
     assert set(INSTER_KEYS) <= keys
+    assert G6_KEY in keys and G6_KEY not in inster_lateral.INSTER_SWITCHES          # G6: a sub-switch of InsterAngleErrorPI
 
 
 # G2 (27 Oct 2026; replaces F's gains): the Nelder-Mead result's coefficients at full precision, the 6-significant-digit values the
@@ -740,6 +743,99 @@ class TestInsterAnglePI(OpenpilotTestCase):
     assert abs(lac_log.error - lat_error) < 1e-5 and lat_error > 0.0
     assert abs(c.pid.p - kp * lat_error) > 0.5 * c.pid.p                                    # not kp x the lateral-acceleration error
     assert abs(c.pid.p / lac_log.error - kp * VM.get_steer_from_curvature(1.0, v, 0.0) / v ** 2) < 1e-5
+
+
+# G6 (27 Oct 2026; alongside G2, sub-switch InsterAngleErrorPIG6): the Nelder-Mead result's coefficients at full precision, the
+# 6-significant-digit values the car code uses, and the anchor values at 0 / 10 / 55 / 115 / 160 km/h
+G6_KEY = "InsterAngleErrorPIG6"
+G6_KP_SEARCH = (3.4164007100591722, 0.4107633656804734, -0.007152631668639052)
+G6_KI_SEARCH = (0.93525, 0.4462301643956044, -0.009480687570989011)
+G6_KP = (3.4164, 0.410763, -0.00715263)
+G6_KI = (0.93525, 0.44623, -0.00948069)
+G6_KP_ANCHOR = (3.4164, 4.50222, 8.02245, 9.23911, 7.54388)
+G6_KI_ANCHOR = (0.93525, 2.10162, 5.53976, 5.51527, 2.04041)
+
+
+class TestInsterAnglePIG6(OpenpilotTestCase):
+  """sub-switch InsterAngleErrorPIG6: with InsterAngleErrorPI on, "F" runs the gain set G6 instead of G2 (torqueState.version 103)"""
+
+  def test_gains(self):
+    assert ANGLE_PI_G6_KP == G6_KP and ANGLE_PI_G6_KI == G6_KI and ANGLE_PI_G6_SWITCH == G6_KEY
+    assert G6_KP == tuple(float(f"{c:.6g}") for c in G6_KP_SEARCH) and G6_KI == tuple(float(f"{c:.6g}") for c in G6_KI_SEARCH)
+    for kmh, kp, ki in zip(G2_ANCHOR_KMH, G6_KP_ANCHOR, G6_KI_ANCHOR, strict=True):
+      assert abs(angle_pi_gain(ANGLE_PI_G6_KP, kmh / 3.6) - kp) < 1e-5, kmh
+      assert abs(angle_pi_gain(ANGLE_PI_G6_KI, kmh / 3.6) - ki) < 1e-5, kmh
+    # rounding to 6 significant digits: within 1e-5 (relative) of the search's gains up to 160 km/h
+    for v in np.linspace(0.0, 160 / 3.6, 1601):
+      assert abs(angle_pi_gain(ANGLE_PI_G6_KP, v) / angle_pi_gain(G6_KP_SEARCH, v) - 1.0) < 1e-5, v
+      assert abs(angle_pi_gain(ANGLE_PI_G6_KI, v) / angle_pi_gain(G6_KI_SEARCH, v) - 1.0) < 1e-5, v
+    # never negative from 0 to 200 km/h: kp > 0 throughout (root 233 km/h), ki > 0 below its root (176.7 km/h), clipped at 0 above
+    for v in np.linspace(0.0, 200 / 3.6, 2001):
+      assert angle_pi_gain(ANGLE_PI_G6_KP, v) > 0.0 and angle_pi_gain(ANGLE_PI_G6_KI, v) >= 0.0
+      if v < 176 / 3.6:
+        assert angle_pi_gain(ANGLE_PI_G6_KI, v) > 0.0
+    assert angle_pi_gain(ANGLE_PI_G6_KI, 177 / 3.6) == 0.0
+    # less P, more I than G2 from 10 to 130 km/h
+    for v in np.linspace(10 / 3.6, 130 / 3.6, 121):
+      assert angle_pi_gain(ANGLE_PI_G6_KP, v) < angle_pi_gain(ANGLE_PI_KP, v)
+      assert angle_pi_gain(ANGLE_PI_G6_KI, v) > angle_pi_gain(ANGLE_PI_KI, v)
+    pi = InsterAnglePI(rate=1 / DT_CTRL, kp=ANGLE_PI_G6_KP, ki=ANGLE_PI_G6_KI)
+    g2 = InsterAnglePI(rate=1 / DT_CTRL)
+    for v in (0.0, 4.2, 15.3, 31.9):
+      pi.speed = g2.speed = v
+      assert pi.k_p == angle_pi_gain(G6_KP, v) and pi.k_i == angle_pi_gain(G6_KI, v) and pi.k_d == 0.0
+      assert g2.k_p == angle_pi_gain(G2_KP, v) and g2.k_i == angle_pi_gain(G2_KI, v)
+
+  def test_switch(self):
+    for on in ((ANGLE_PI_KEY, G6_KEY), INSTER_KEYS + (G6_KEY,)):
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
+      assert c.inster_angle_pi and c.inster_angle_pi_g6 and isinstance(c.pid, InsterAnglePI) and c.extension._pid is c.pid
+      assert (c.pid.kp_coeffs, c.pid.ki_coeffs) == (G6_KP, G6_KI)
+    for on in ((ANGLE_PI_KEY,), INSTER_KEYS):
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
+      assert c.inster_angle_pi and not c.inster_angle_pi_g6 and (c.pid.kp_coeffs, c.pid.ki_coeffs) == (G2_KP, G2_KI)
+    # G6 alone, with NNLC, or on another car: no effect (the run equals the one without the G6 param)
+    for car_name, on in ((HYUNDAI.HYUNDAI_INSTER, ()), (HYUNDAI.HYUNDAI_INSTER, STEP2_KEYS),
+                         (HYUNDAI.HYUNDAI_INSTER, INSTER_KEYS + ("NeuralNetworkLateralControl",)), (HYUNDAI.HYUNDAI_KONA_EV, INSTER_KEYS)):
+      c, VM = _make_v0(car_name, on=on + (G6_KEY,))
+      assert not c.inster_angle_pi_g6 and type(c.pid) is PIDController
+      assert _run(c, VM) == _run(*_make_v0(car_name, on=on)), (car_name, on)
+    # G6 changes the output vs G2
+    assert _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (G6_KEY,))) != _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS))
+    # not an Inster switch of its own: alone it leaves the Lateral Jerk Torque Controller on
+    _make_v0(HYUNDAI.HYUNDAI_INSTER, on=(G6_KEY, "LateralJerkTorqueController"))
+    assert Params().get_bool("LateralJerkTorqueController")
+
+  def test_log_version(self):
+    # G6 drives are identifiable in the logs: torqueState.version 103 with G6, 102 with G2, 0 for v0 (upstream: 1)
+    assert (ANGLE_PI_G6_LOG_VERSION, ANGLE_PI_LOG_VERSION) == (103, 102)
+    for on, expected in ((INSTER_KEYS + (G6_KEY,), 103), ((ANGLE_PI_KEY, G6_KEY), 103), (INSTER_KEYS, 102), ((ANGLE_PI_KEY,), 102),
+                         (STEP2_KEYS + (G6_KEY,), 0), ((G6_KEY,), 0), (INSTER_KEYS + (G6_KEY, "NeuralNetworkLateralControl"), 0)):
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
+      for active in (True, False):
+        _, _, lac_log = c.update(active, _cs(10.0, 1.0), VM, _vp(), False, 0.0, None, False, 0.2)
+        assert lac_log.version == expected, (on, active)
+
+  def test_rule_through_update(self):
+    # through the real update(), from a fresh integrator: p = kp_G6(v) e and i = ki_G6(v) e dt (then common/pid.py's anti-windup)
+    c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (G6_KEY,))
+    VM.update_params(1.0, 14.0)
+    n_integrating = 0
+    for kmh in (0.0, 10.0, 30.0, 60.0, 100.0, 130.0, 160.0):
+      for wheel in (2.0, -2.0, 0.5):
+        CS = _cs(kmh / 3.6, angle=wheel)
+        v = CS.vEgo
+        e = angle_error(VM, v, 0.0, -VM.calc_curvature(math.radians(wheel), v, 0.0))
+        c.pid.reset()
+        c.update(True, CS, VM, _vp(), False, 0.0, None, False, 0.2)
+        kp, ki = angle_pi_gain(G6_KP, v), angle_pi_gain(G6_KI, v)
+        assert abs(c.pid.p - kp * e) <= 1e-12 * max(1.0, abs(kp * e)), kmh
+        i_new = ki * DT_CTRL * e
+        test, lim = c.pid.p + i_new + c.pid.f, c.pid.pos_limit
+        expected_i = min(max(i_new, 0.0 if test < -lim else -lim), 0.0 if test > lim else lim)
+        assert abs(c.pid.i - expected_i) <= 1e-14, kmh
+        n_integrating += expected_i == i_new
+    assert n_integrating > 15
 
 
 def _rate(c, v):

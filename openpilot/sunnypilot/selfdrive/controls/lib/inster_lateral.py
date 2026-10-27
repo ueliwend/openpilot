@@ -18,6 +18,7 @@ and a small stateful filter class.
   * Steering-angle PI "F" (switch InsterAngleErrorPI): InsterAnglePI replaces only v0's P and I. They act on the steering-wheel
     angle error (rad) with gains that are quadratic in speed, and the integrator runs from standstill. Feed-forward, limits and output
     conversion stay v0's. Tuned and checked in the closed-loop simulator only with both switches above on.
+    Gain set G2 by default; G6 with the sub-switch InsterAngleErrorPIG6 (effective only with InsterAngleErrorPI on).
 
   * Torque cap (no switch): the Inster's steering command is capped at 409 raw (opendbc values.INSTER_STEER_MAX, the highest the
     owner's steering unit took without a fault, 23 Oct 2026) with 1.0 = 384 raw (INSTER_STEER_FULL_SCALE): every lateral
@@ -41,6 +42,8 @@ STEER_MAX_RAW = 384.0
 # The Inster's switches (params, off by default, changeable only offroad, ignored while NNLC is enabled). With any of them on, the
 # Lateral Jerk Torque Controller is switched off.
 INSTER_SWITCHES = ("InsterStictionFriction", "InsterSpeedFeedforward", "InsterAngleErrorPI")
+# Sub-switch of InsterAngleErrorPI (same rules; alone it changes nothing, so it is not one of INSTER_SWITCHES): gain set G6 instead of G2
+ANGLE_PI_G6_SWITCH = "InsterAngleErrorPIG6"
 
 # Steering torque cap as a fraction of full scale: 409 / 384 = 1.065 (opendbc values.py: INSTER_STEER_MAX / INSTER_STEER_FULL_SCALE)
 INSTER_STEER_MAX_FRACTION = INSTER_STEER_MAX / INSTER_STEER_FULL_SCALE
@@ -242,17 +245,25 @@ class InsterStictionFriction:
 # the 3 / 5 raw ramp), and it is reset whenever lateral control is inactive (v0 keeps its own integrator, but F's can be wound at low
 # speed, which v0's cannot: without the reset it would come back as a command towards the old curve on re-engagement).
 # Anti-windup and output clip are common/pid.py's (InsterAnglePI is a PIDController with these gains).
-# Logs (controlsState.lateralControlState.torqueState) with F on: version = ANGLE_PI_LOG_VERSION (v0 logs 0, the upstream controller
-# 1); error stays v0's lateral-acceleration error (setpoint - measurement, m/s^2), p / i / f are in m/s^2 as in v0. F's own error is
-# e = p / kp(vEgo) (rad, + right; angle_pi_gain(ANGLE_PI_KP, vEgo) > 0 at every speed the car drives), or recomputed from carState
-# steeringAngleDeg, liveParameters angleOffsetDeg / roll / steerRatio / stiffnessFactor and controlsState desiredCurvature with
-# angle_error().
+# Logs (controlsState.lateralControlState.torqueState) with F on: version = ANGLE_PI_LOG_VERSION (G2) or ANGLE_PI_G6_LOG_VERSION (G6)
+# (v0 logs 0, the upstream controller 1); error stays v0's lateral-acceleration error (setpoint - measurement, m/s^2), p / i / f are
+# in m/s^2 as in v0. F's own error is e = p / kp(vEgo) (rad, + right; kp of the gain set in force, G2 for version 102, G6 for 103,
+# > 0 at every speed the car drives), or recomputed from carState steeringAngleDeg, liveParameters angleOffsetDeg / roll / steerRatio /
+# stiffnessFactor and controlsState desiredCurvature with angle_error().
 # Gains G2 (27 Oct 2026, SIM only; replace F's kp 4.3447 + 0.40366 v - 0.0072954 v^2, ki 0.93525 + 0.27948 v - 0.0057456 v^2):
 # Nelder-Mead group 2, objective v5, acceptance v4 passed (project doc claude/inster-steering-simulator.md, Nelder-Mead section). The
 # search's coefficients rounded to 6 significant digits (gains within 6e-6 relative up to 160 km/h).
 ANGLE_PI_KP = (3.17477, 0.606402, -0.0119531)
 ANGLE_PI_KI = (0.93525, 0.329782, -0.00677043)
 ANGLE_PI_LOG_VERSION = 102    # 100 until 26 Oct 2026; 101 = F with controlsd's crawl plan (crawl_plan_curvature); 102 = G2 gains
+# Gains G6 (27 Oct 2026, SIM only; with InsterAngleErrorPIG6 on, alongside G2): Nelder-Mead group 2, objective v6 (owner 27 Oct: no
+# 'getting worse' penalties), project doc claude/inster-steering-simulator.md. Less P and more I than G2 at 10-130 km/h. The search's
+# coefficients rounded to 6 significant digits (gains within 6e-6 relative up to 160 km/h). Clipped at >= 0 as G2: ki reaches 0
+# above 176.7 km/h, kp only above 233 km/h. kp 3.42 / 4.50 / 8.02 / 9.24 / 7.54, ki 0.94 / 2.10 / 5.54 / 5.52 / 2.04 at
+# 0 / 10 / 55 / 115 / 160 km/h.
+ANGLE_PI_G6_KP = (3.4164, 0.410763, -0.00715263)
+ANGLE_PI_G6_KI = (0.93525, 0.44623, -0.00948069)
+ANGLE_PI_G6_LOG_VERSION = 103
 
 
 def angle_pi_gain(coeffs: tuple[float, float, float], v_ego: float) -> float:
@@ -269,19 +280,21 @@ def angle_error(VM, v_ego: float, desired_curvature: float, measured_curvature: 
 
 
 class InsterAnglePI(PIDController):
-  """common/pid.py with the speed gains of "F" (G2: kp / ki above; kd 0). update(e, ...) takes the wheel-angle error in rad; p, i, f and
-  the limits are in v0's lateral-acceleration units."""
+  """common/pid.py with the speed gains of "F" (G2 by default, or G6: kp / ki above; kd 0). update(e, ...) takes the wheel-angle error
+  in rad; p, i, f and the limits are in v0's lateral-acceleration units."""
 
-  def __init__(self, rate: float):
+  def __init__(self, rate: float, kp: tuple[float, float, float] = ANGLE_PI_KP, ki: tuple[float, float, float] = ANGLE_PI_KI):
     super().__init__(0.0, 0.0, 0.0, rate=rate)
+    self.kp_coeffs = kp
+    self.ki_coeffs = ki
 
   @property
   def k_p(self):
-    return angle_pi_gain(ANGLE_PI_KP, self.speed)
+    return angle_pi_gain(self.kp_coeffs, self.speed)
 
   @property
   def k_i(self):
-    return angle_pi_gain(ANGLE_PI_KI, self.speed)
+    return angle_pi_gain(self.ki_coeffs, self.speed)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------

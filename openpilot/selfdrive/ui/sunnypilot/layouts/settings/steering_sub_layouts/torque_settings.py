@@ -124,6 +124,13 @@ class TorqueSettingsLayout(Widget):
                              "Tuned in simulation with both Inster switches above on. Turning it on switches the Lateral Jerk " +
                              "Torque Controller off. Off by default."),
     )
+    self._inster_angle_pi_g6_toggle = toggle_item_sp(
+      param="InsterAngleErrorPIG6",
+      title=lambda: tr("Inster: Angle-PI Gains G6 (experimental)"),
+      description=lambda: tr("Hyundai Inster only, with the steering-angle PI above on. Uses gain set G6 instead of G2: less P, more " +
+                             "I. In simulation calmer on straights and drifts wide less, but runs curves a little further inside and " +
+                             "releases curve exits slightly later. Not validated on the car. Off by default."),
+    )
 
     items = [
       self._jerk_aware_toggle,
@@ -137,6 +144,7 @@ class TorqueSettingsLayout(Widget):
       self._inster_friction_toggle,
       self._inster_ff_toggle,
       self._inster_angle_pi_toggle,
+      self._inster_angle_pi_g6_toggle,
     ]
     return items
 
@@ -152,6 +160,9 @@ class TorqueSettingsLayout(Widget):
     for inster_toggle in inster_toggles:
       inster_toggle.set_visible(inster)
       inster_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
+    # G6 gain set: a sub-switch of the steering-angle PI, shown only while that is on (same change rules)
+    self._inster_angle_pi_g6_toggle.set_visible(inster and self._inster_angle_pi_toggle.action_item.get_state())
+    self._inster_angle_pi_g6_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
     if not ui_state.params.get_bool("LiveTorqueParamsToggle"):
       ui_state.params.remove("LiveTorqueParamsRelaxedToggle")
       self._relaxed_tune_toggle.action_item.set_state(False)
