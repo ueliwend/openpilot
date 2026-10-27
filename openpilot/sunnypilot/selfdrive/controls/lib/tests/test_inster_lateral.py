@@ -428,11 +428,17 @@ class TestInsterSteerCap(OpenpilotTestCase):
     assert set(INSTER_KEYS) <= keys
 
 
-# SIX_FINAL['recommended_F'] of the simulator kit (simkit/sim/candidates_6p.py): coefficients and the anchor values at 15 / 55 / 115 km/h
-F_KP = (4.3447, 0.40366, -0.0072954)
+# G2 (27 Oct 2026; replaces F's gains): the Nelder-Mead result's coefficients at full precision, the 6-significant-digit values the
+# car code uses, and the anchor values at 0 / 10 / 55 / 115 / 160 km/h
+G2_KP_SEARCH = (3.17476749408284, 0.6064020771465092, -0.011953117949879298)
+G2_KI_SEARCH = (0.93525, 0.32978182120404387, -0.006770430057410106)
+G2_KP = (3.17477, 0.606402, -0.0119531)
+G2_KI = (0.93525, 0.329782, -0.00677043)
+G2_ANCHOR_KMH = (0.0, 10.0, 55.0, 115.0, 160.0)
+G2_KP_ANCHOR = (3.17477, 4.76699, 9.64927, 10.34843, 6.51491)
+G2_KI_ANCHOR = (0.93525, 1.79907, 4.3933, 4.56108, 2.21854)
+F_KP = (4.3447, 0.40366, -0.0072954)          # F's gains until 26 Oct 2026 (torqueState.version 100 / 101)
 F_KI = (0.93525, 0.27948, -0.0057456)
-F_KP_ANCHOR = (5.9, 8.809, 9.795)
-F_KI_ANCHOR = (2.0, 3.864, 4.0)
 
 
 def _cs(v, angle=0.0, pressed=False, rate=0.0):
@@ -455,21 +461,29 @@ class TestInsterAnglePI(OpenpilotTestCase):
   """switch InsterAngleErrorPI: v0's P and I replaced by "F" on the steering-wheel angle error"""
 
   def test_gains(self):
-    assert ANGLE_PI_KP == F_KP and ANGLE_PI_KI == F_KI
-    for kmh, kp, ki in zip((15.0, 55.0, 115.0), F_KP_ANCHOR, F_KI_ANCHOR, strict=True):
-      assert abs(angle_pi_gain(ANGLE_PI_KP, kmh / 3.6) - kp) < 1e-3, kmh
-      assert abs(angle_pi_gain(ANGLE_PI_KI, kmh / 3.6) - ki) < 1e-3, kmh
-    # no hold above 130 km/h (owner): kp 7.9 / ki 2.0 at 160 km/h; positive over the whole speed range of the car
-    assert abs(angle_pi_gain(ANGLE_PI_KP, 160 / 3.6) - 7.87) < 0.01 and abs(angle_pi_gain(ANGLE_PI_KI, 160 / 3.6) - 2.01) < 0.01
-    for v in np.linspace(0.0, 50.0, 501):
-      assert angle_pi_gain(ANGLE_PI_KP, v) > 0.0 and angle_pi_gain(ANGLE_PI_KI, v) > 0.0
-    # clipped at >= 0 beyond the roots (ki 186 km/h, kp 232 km/h)
+    assert ANGLE_PI_KP == G2_KP and ANGLE_PI_KI == G2_KI
+    assert G2_KP == tuple(float(f"{c:.6g}") for c in G2_KP_SEARCH) and G2_KI == tuple(float(f"{c:.6g}") for c in G2_KI_SEARCH)
+    assert (ANGLE_PI_KP, ANGLE_PI_KI) != (F_KP, F_KI)
+    # the G2 table: kp 4.77 / 9.65 / 10.35 / 6.51, ki 1.80 / 4.39 / 4.56 / 2.22 at 10 / 55 / 115 / 160 km/h (no hold above 130 km/h)
+    for kmh, kp, ki in zip(G2_ANCHOR_KMH, G2_KP_ANCHOR, G2_KI_ANCHOR, strict=True):
+      assert abs(angle_pi_gain(ANGLE_PI_KP, kmh / 3.6) - kp) < 1e-5, kmh
+      assert abs(angle_pi_gain(ANGLE_PI_KI, kmh / 3.6) - ki) < 1e-5, kmh
+    # rounding to 6 significant digits: the gains stay within 1e-5 (relative) of the search's up to 160 km/h
+    for v in np.linspace(0.0, 160 / 3.6, 1601):
+      assert abs(angle_pi_gain(ANGLE_PI_KP, v) / angle_pi_gain(G2_KP_SEARCH, v) - 1.0) < 1e-5, v
+      assert abs(angle_pi_gain(ANGLE_PI_KI, v) / angle_pi_gain(G2_KI_SEARCH, v) - 1.0) < 1e-5, v
+    # never negative from 0 to 200 km/h; positive below the roots (ki 185.0 km/h, kp 199.9 km/h), clipped at 0 beyond them
+    for v in np.linspace(0.0, 200 / 3.6, 2001):
+      assert angle_pi_gain(ANGLE_PI_KP, v) >= 0.0 and angle_pi_gain(ANGLE_PI_KI, v) >= 0.0
+      if v < 185 / 3.6:
+        assert angle_pi_gain(ANGLE_PI_KP, v) > 0.0 and angle_pi_gain(ANGLE_PI_KI, v) > 0.0
+    assert angle_pi_gain(ANGLE_PI_KP, 199.8 / 3.6) > 0.0 and angle_pi_gain(ANGLE_PI_KP, 200 / 3.6) == 0.0
     assert angle_pi_gain(ANGLE_PI_KI, 55.0) == 0.0 and angle_pi_gain(ANGLE_PI_KP, 55.0) > 0.0
     assert angle_pi_gain(ANGLE_PI_KP, 70.0) == 0.0
     pi = InsterAnglePI(rate=1 / DT_CTRL)
     for v in (0.0, 4.2, 15.3, 31.9):
       pi.speed = v
-      assert pi.k_p == angle_pi_gain(F_KP, v) and pi.k_i == angle_pi_gain(F_KI, v) and pi.k_d == 0.0
+      assert pi.k_p == angle_pi_gain(G2_KP, v) and pi.k_i == angle_pi_gain(G2_KI, v) and pi.k_d == 0.0
 
   def test_angle_error_is_wheel_angle_error(self):
     # e = delta_plan - delta_meas (rad, + right): delta_plan from the inverse vehicle model incl. steer ratio, slip factor and roll,
@@ -501,7 +515,7 @@ class TestInsterAnglePI(OpenpilotTestCase):
     """the F rule for the step just run: p = kp e, i += ki e dt unless frozen, anti-windup and clip as common/pid.py"""
     measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
     e = angle_error(VM, CS.vEgo, desired_curvature, measured_curvature)
-    kp, ki = angle_pi_gain(F_KP, CS.vEgo), angle_pi_gain(F_KI, CS.vEgo)
+    kp, ki = angle_pi_gain(G2_KP, CS.vEgo), angle_pi_gain(G2_KI, CS.vEgo)
     pid = c.pid
     assert pid.p == kp * e
     lim = pid.pos_limit
@@ -563,8 +577,8 @@ class TestInsterAnglePI(OpenpilotTestCase):
       e = angle_error(VM, v, 0.0, -VM.calc_curvature(math.radians(-5.0), v, 0.0))
       assert e < 0.0 and abs(e - math.radians(-5.0)) < 1e-12                                 # the plan is left of the wheel: e < 0
       # integrates from the first step at every speed (v0 freezes below 5 m/s)
-      assert abs(i_values[0] - angle_pi_gain(F_KI, v) * DT_CTRL * e) < 1e-15
-      assert abs(i_values[-1] - 50 * angle_pi_gain(F_KI, v) * DT_CTRL * e) < 1e-12
+      assert abs(i_values[0] - angle_pi_gain(G2_KI, v) * DT_CTRL * e) < 1e-15
+      assert abs(i_values[-1] - 50 * angle_pi_gain(G2_KI, v) * DT_CTRL * e) < 1e-12
     # v0 (switch off) keeps its freeze below 5 m/s
     off, VM_off = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=STEP2_KEYS)
     for _ in range(50):
@@ -606,13 +620,15 @@ class TestInsterAnglePI(OpenpilotTestCase):
       tq, _, lac_log = c.update(True, _cs(25.0, 0.0), VM, _vp(), False, 0.0, None, False, 0.2)
       first[name] = (i_wound, c.pid.i, tq * STEER_MAX_RAW, lac_log.version)
     assert first["v0_step2"][0] == 0.0 and first["v0_step2"][3] == 0
-    assert first["F"][0] < -1.5                                     # F did wind at 2 m/s (-1.64 m/s^2)
+    assert first["F"][0] < -1.5                                     # F did wind at 2 m/s (-1.75 m/s^2 with G2, -1.64 with F's gains)
     assert abs(first["F"][1]) < 1e-3                                # reset: only the first step's I at the re-engagement
     assert abs(first["F"][2]) < 0.5 and abs(first["F"][2] - first["v0_step2"][2]) < 0.5   # ~0 raw, as v0 (was 170.6 raw)
     assert first["F"][3] == ANGLE_PI_LOG_VERSION
 
   def test_log_version(self):
-    # F drives are identifiable in the logs: torqueState.version 101 with F on (100 before the crawl plan), 0 for v0 otherwise (upstream: 1)
+    # F drives are identifiable in the logs: torqueState.version 102 with F on (G2 gains; 101 with F's gains and the crawl plan, 100
+    # before it), 0 for v0 otherwise (upstream: 1)
+    assert ANGLE_PI_LOG_VERSION == 102
     assert ANGLE_PI_LOG_VERSION not in (latcontrol_torque_v0.VERSION, 1)
     for on, expected in ((INSTER_KEYS, ANGLE_PI_LOG_VERSION), ((ANGLE_PI_KEY,), ANGLE_PI_LOG_VERSION), (STEP2_KEYS, 0), ((), 0),
                          (INSTER_KEYS + ("NeuralNetworkLateralControl",), 0)):
@@ -694,7 +710,7 @@ class TestInsterAnglePI(OpenpilotTestCase):
             assert abs(e - math.radians(CS.steeringAngleDeg - plan_deg)) < 1e-6
             c.pid.reset()
             c.update(True, CS, VM, vp, False, desired_curvature, None, False, 0.2)
-            kp, ki = angle_pi_gain(F_KP, v), angle_pi_gain(F_KI, v)
+            kp, ki = angle_pi_gain(G2_KP, v), angle_pi_gain(G2_KI, v)
             assert abs(c.pid.p - kp * e) <= 1e-12 * max(1.0, abs(kp * e)), (kmh, desired_curvature, wheel_vs_plan, roll)
             i_new = ki * DT_CTRL * e                                  # first step from i = 0, then common/pid.py's anti-windup
             test, lim = c.pid.p + i_new + c.pid.f, c.pid.pos_limit
@@ -715,8 +731,8 @@ class TestInsterAnglePI(OpenpilotTestCase):
     CS = _cs(100 / 3.6, angle=1.0)                                                           # wheel 1 deg left of a straight plan
     _, _, lac_log = c.update(True, CS, VM, params, False, 0.0, None, False, 0.2)
     v = CS.vEgo
-    kp, ki = angle_pi_gain(F_KP, v), angle_pi_gain(F_KI, v)
-    assert abs(kp - 9.93) < 0.01 and abs(ki - 4.27) < 0.01                                  # report_6p table at 100 km/h
+    kp, ki = angle_pi_gain(G2_KP, v), angle_pi_gain(G2_KI, v)
+    assert abs(kp - 10.80) < 0.01 and abs(ki - 4.87) < 0.01                                 # G2 at 100 km/h
     assert abs(c.pid.p - kp * math.radians(1.0)) < 1e-12                                     # 0.173 m/s^2
     assert abs(c.pid.i - ki * math.radians(1.0) * DT_CTRL) < 1e-15
     # v0's lateral-acceleration error for the same 1 deg is (curvature error) x v^2: a different quantity
@@ -758,7 +774,7 @@ class TestInsterCrawlPlan(OpenpilotTestCase):
   def test_constants(self):
     assert (CRAWL_PLAN_SPEED, CRAWL_PLAN_RELEASE_SPEED) == (1.4, 1.0)
     assert (CRAWL_STRAIGHTEN_PER_M, CRAWL_STRAIGHTEN_LENGTH, CRAWL_TURN_IN_PER_M, CRAWL_PER_M_RELEASE) == (0.04, 2.0, 0.4, 1.0)
-    assert ANGLE_PI_LOG_VERSION == 101                      # F drives with the crawl plan are identifiable in the logs
+    assert ANGLE_PI_LOG_VERSION == 102                      # F drives with the crawl plan (G2 gains) are identifiable in the logs
 
   def test_unchanged_from_crawl_speed_up(self):
     rng = random.Random(1)

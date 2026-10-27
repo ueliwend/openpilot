@@ -227,16 +227,17 @@ class InsterStictionFriction:
 # ---------------------------------------------------------------------------------------------------------------------------------
 # Steering-angle PI "F" (switch InsterAngleErrorPI; the owner's 6-parameter controller, set "recommended_F" of the 23 Oct 2026 search in
 # the closed-loop steering simulator, SIM only: 9 drives x 8 plant variants x 2 seeds, on top of v0 with both switches above at 409).
-# It replaces only v0's P and I:
+# Since 27 Oct 2026 it runs the gains G2 (below) in place of F's. It replaces only v0's P and I:
 #   e  = delta_plan - delta_meas   steering-wheel angle error, rad, + right (v0-internal sign)
 #        delta_plan = wheel angle the plan's curvature needs (inverse vehicle model: steer ratio, slip factor, roll),
 #        delta_meas = steeringAngleDeg - learned angleOffsetDeg.
 #        The vehicle model is linear in the angle, so e = R(v) x (desired curvature - measured curvature) with
 #        R(v) = VM.get_steer_from_curvature(1.0, v, 0.0) (rad per 1/m) and v0's roll-compensated measured curvature (angle_error()).
 #   p  = kp(v) e,   i += ki(v) e dt   (v = vEgo in m/s; p and i in v0's lateral-acceleration units, m/s^2)
-#   kp(v) = 4.3447 + 0.40366 v - 0.0072954 v^2   (m/s^2 per rad)       5.9 / 8.81 / 9.80 at 15 / 55 / 115 km/h
-#   ki(v) = 0.93525 + 0.27948 v - 0.0057456 v^2  (m/s^2 per rad s)     2.0 / 3.86 / 4.00 at 15 / 55 / 115 km/h
-# Both clipped at >= 0 (they reach 0 only above 186 km/h). No speed hold above 130 km/h (owner's choice): kp 7.9 / ki 2.0 at 160 km/h.
+#   kp(v) = 3.17477 + 0.606402 v - 0.0119531 v^2    (m/s^2 per rad)      4.77 / 9.65 / 10.35 at 10 / 55 / 115 km/h
+#   ki(v) = 0.93525 + 0.329782 v - 0.00677043 v^2   (m/s^2 per rad s)    1.80 / 4.39 / 4.56 at 10 / 55 / 115 km/h
+# Both clipped at >= 0 (they reach 0 only above 185 km/h (ki) / 199.9 km/h (kp)). No speed hold above 130 km/h (owner's choice):
+# kp 6.51 / ki 2.22 at 160 km/h.
 # The integrator runs from standstill; it freezes only while steeringPressed or steer-limited by safety (v0's flag, which also covers
 # the 3 / 5 raw ramp), and it is reset whenever lateral control is inactive (v0 keeps its own integrator, but F's can be wound at low
 # speed, which v0's cannot: without the reset it would come back as a command towards the old curve on re-engagement).
@@ -246,9 +247,12 @@ class InsterStictionFriction:
 # e = p / kp(vEgo) (rad, + right; angle_pi_gain(ANGLE_PI_KP, vEgo) > 0 at every speed the car drives), or recomputed from carState
 # steeringAngleDeg, liveParameters angleOffsetDeg / roll / steerRatio / stiffnessFactor and controlsState desiredCurvature with
 # angle_error().
-ANGLE_PI_KP = (4.3447, 0.40366, -0.0072954)
-ANGLE_PI_KI = (0.93525, 0.27948, -0.0057456)
-ANGLE_PI_LOG_VERSION = 101    # 100 until 26 Oct 2026; 101 = F with controlsd's crawl plan (crawl_plan_curvature)
+# Gains G2 (27 Oct 2026, SIM only; replace F's kp 4.3447 + 0.40366 v - 0.0072954 v^2, ki 0.93525 + 0.27948 v - 0.0057456 v^2):
+# Nelder-Mead group 2, objective v5, acceptance v4 passed (project doc claude/inster-steering-simulator.md, Nelder-Mead section). The
+# search's coefficients rounded to 6 significant digits (gains within 6e-6 relative up to 160 km/h).
+ANGLE_PI_KP = (3.17477, 0.606402, -0.0119531)
+ANGLE_PI_KI = (0.93525, 0.329782, -0.00677043)
+ANGLE_PI_LOG_VERSION = 102    # 100 until 26 Oct 2026; 101 = F with controlsd's crawl plan (crawl_plan_curvature); 102 = G2 gains
 
 
 def angle_pi_gain(coeffs: tuple[float, float, float], v_ego: float) -> float:
@@ -265,7 +269,7 @@ def angle_error(VM, v_ego: float, desired_curvature: float, measured_curvature: 
 
 
 class InsterAnglePI(PIDController):
-  """common/pid.py with the speed gains of "F" (kp / ki above; kd 0). update(e, ...) takes the wheel-angle error in rad; p, i, f and
+  """common/pid.py with the speed gains of "F" (G2: kp / ki above; kd 0). update(e, ...) takes the wheel-angle error in rad; p, i, f and
   the limits are in v0's lateral-acceleration units."""
 
   def __init__(self, rate: float):
