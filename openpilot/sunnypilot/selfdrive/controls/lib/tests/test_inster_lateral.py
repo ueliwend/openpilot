@@ -29,6 +29,9 @@ from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_
                                                                        ANGLE_PI_P6_BASE_VERSION, ANGLE_PI_P6_KD, ANGLE_PI_P6_KI, \
                                                                        ANGLE_PI_P6_KP, ANGLE_PI_P6_LOG_VERSION, ANGLE_PI_VERSION_D_BIT, \
                                                                        angle_pi_gain_set
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_VERSION_SOFT_P_BIT, SOFT_P_A0, SOFT_P_E0, SOFT_P_GAMMA, \
+                                                                       SOFT_P_PARAM, SOFT_P_RHO, SOFT_P_V_MIN, angle_pi_log_version, \
+                                                                       soft_p_sigma
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import A_NODES, ANGLE_PI_KI, ANGLE_PI_KP, ANGLE_PI_LOG_VERSION, CMD_RAW, F0, \
                                                                        SCALE_CLIP, STEER_MAX_RAW, V_NODES, InsterAnglePI, InsterStictionFriction, \
                                                                        angle_error, angle_pi_gain, ff_lat_accel_equivalent, ff_torque, \
@@ -188,7 +191,7 @@ class TestInsterStictionFriction(OpenpilotTestCase):
 
 def _make_v0(car_name, on=(), after_setup=(), gains=None):
   params = Params()
-  for key in INSTER_KEYS + (G6_KEY, "LateralJerkTorqueController", "NeuralNetworkLateralControl"):
+  for key in INSTER_KEYS + (G6_KEY, O5_KEY, "LateralJerkTorqueController", "NeuralNetworkLateralControl"):
     params.put_bool(key, key in on, block=True)
   if gains is None:
     params.remove(GAINS_KEY)                 # selector unset (G2, or the legacy G6 bool in `on`)
@@ -351,7 +354,7 @@ class TestInsterSteerCap(OpenpilotTestCase):
     from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque as LatControlTorqueV1
     for car_name, cap in ((HYUNDAI.HYUNDAI_INSTER, CAP), (HYUNDAI.HYUNDAI_KONA_EV, 1.0)):
       params = Params()
-      for key in INSTER_KEYS + (G6_KEY, "LateralJerkTorqueController", "NeuralNetworkLateralControl"):
+      for key in INSTER_KEYS + (G6_KEY, O5_KEY, "LateralJerkTorqueController", "NeuralNetworkLateralControl"):
         params.put_bool(key, False, block=True)
       CarInterface = interfaces[car_name]
       CP = CarInterface.get_non_essential_params(car_name)
@@ -438,6 +441,7 @@ class TestInsterSteerCap(OpenpilotTestCase):
     assert set(INSTER_KEYS) <= keys
     assert G6_KEY in keys and G6_KEY not in inster_lateral.INSTER_SWITCHES          # G6: a sub-switch of InsterAngleErrorPI
     assert GAINS_KEY in keys and GAINS_KEY not in inster_lateral.INSTER_SWITCHES    # the gain-set selector that replaces it
+    assert O5_KEY in keys and O5_KEY not in inster_lateral.INSTER_SWITCHES          # option 5: needs InsterAngleErrorPI
 
 
 # G2 (27 Oct 2026; replaces F's gains): the Nelder-Mead result's coefficients at full precision, the 6-significant-digit values the
@@ -1024,6 +1028,138 @@ class TestInsterAnglePIGainSet(OpenpilotTestCase):
     thetas = [_theta_meas(VM, CS.vEgo, CS.steeringAngleDeg, vp.angleOffsetDeg, vp.roll) for CS, vp, *_ in steps[450:]]
     for (CS, _, _, _, _, d, _, _), rate in zip(steps[450:], _lp2_rates(thetas), strict=True):
       assert abs(d - angle_pi_gain(P6_KD, CS.vEgo) * -rate) <= 1e-12 * max(1.0, abs(d))
+
+
+# Option 5 "InsterSoftSmallErrorP" (28 Oct 2026): mild parameters fitted with P6; the design's sigma written out independently
+O5_KEY = "InsterSoftSmallErrorP"
+
+
+def _sigma_design(e, v, r_rad, k_now, k_past, rho=0.5, e0=0.11, a0=0.3, gamma=1.2):
+  """options design v2.1 section 5: v_c = max(v, 7 m/s); e_a = |e| v_c^2 / R_rad; a_p = max(|k_des|, |k_(ld ago)|) v_c^2; phi(x) = x^2 / (1 + x^2)"""
+  def phi(x):
+    return x * x / (1 + x * x)
+  vc = max(v, 7.0)
+  e_a = abs(e) * vc ** 2 / max(r_rad, math.radians(1.0))
+  a_p = max(abs(k_now), abs(k_past)) * vc ** 2
+  return (1 - (1 - rho) * (1 - phi(e_a / e0)) * (1 - phi(a_p / a0))) * (1 + (gamma - 1) * phi(a_p / a0))
+
+
+def _o5_drive(c, VM, n, limited=lambda k: False):
+  """small wheel-angle errors around a gently curving plan (no output clipping); returns per step (CS, dc, lat_delay, p, i, d, f)"""
+  out = []
+  for k in range(n):
+    t = k * DT_CTRL
+    v = 2.0 + 30.0 * (1.0 + math.sin(0.04 * t)) / 2.0
+    dc = (0.004 * math.sin(0.35 * t) + 0.0015 * math.sin(1.7 * t)) * min(1.0, 1.5 / (0.0055 * v * v))   # |a| <= 1.5 m/s^2
+    plan = math.degrees(VM.get_steer_from_curvature(-dc, v, 0.0))
+    CS = _cs(v, plan + 1.5 * math.sin(2.3 * t) + 0.4 * math.sin(9.0 * t))
+    lat_delay = 0.2 + 0.05 * math.sin(0.1 * t)
+    c.update(True, CS, VM, _vp(), limited(k), dc, None, False, lat_delay)
+    out.append((CS, dc, lat_delay, c.pid.p, c.pid.i, c.pid.d, c.pid.f))
+  return out
+
+
+class TestInsterSoftSmallErrorP(OpenpilotTestCase):
+  """option 5: with InsterAngleErrorPI on, p = kp(v) sigma e for any gain set; I and D unchanged"""
+
+  def test_sigma_formula(self):
+    assert (SOFT_P_RHO, SOFT_P_E0, SOFT_P_A0, SOFT_P_GAMMA, SOFT_P_V_MIN, SOFT_P_PARAM) == (0.5, 0.11, 0.3, 1.2, 7.0, O5_KEY)
+    rng = random.Random(3)
+    for _ in range(20000):
+      e = rng.choice([0.0, rng.gauss(0, 0.002), rng.gauss(0, 0.02), rng.gauss(0, 0.2)])
+      v = rng.choice([0.0, rng.uniform(0, 7), rng.uniform(7, 45)])
+      r = rng.choice([rng.uniform(0.2, 0.6), rng.uniform(0.0, 0.02)])      # rad per 1/m (the second: the 1 deg floor)
+      k1, k2 = rng.gauss(0, 0.01), rng.gauss(0, 0.01)
+      s = soft_p_sigma(e, v, r, k1, k2)
+      assert abs(s - _sigma_design(e, v, r, k1, k2)) <= 1e-12, (e, v, r, k1, k2)
+      assert SOFT_P_RHO - 1e-12 <= s <= SOFT_P_GAMMA + 1e-12                 # rho <= sigma <= gamma
+    assert soft_p_sigma(0.0, 20.0, 0.4, 0.0, 0.0) == SOFT_P_RHO                # straight, no error: rho
+    assert abs(soft_p_sigma(0.0, 20.0, 0.4, 1.0, 0.0) - SOFT_P_GAMMA) < 1e-4     # tight curve: -> gamma
+    assert soft_p_sigma(0.01, 20.0, 0.4, 0.003, 0.001) == soft_p_sigma(-0.01, 20.0, 0.4, -0.001, -0.003)   # |e|, max of |k|
+
+  def test_p_strictly_increasing(self):
+    # p(e) = sigma(e) e strictly increasing in e for every plan; slope rho at e = 0 on a straight (sigma(0) with a plan)
+    VM = VehicleModel(interfaces[HYUNDAI.HYUNDAI_INSTER].get_non_essential_params(HYUNDAI.HYUNDAI_INSTER))
+    for v in (0.0, 5.0, 15.0, 30.0, 45.0):
+      r = VM.get_steer_from_curvature(1.0, v, 0.0)
+      es = np.linspace(-0.5, 0.5, 20001)
+      for k_plan in (0.0, 0.0005, 0.002, 0.01, 0.05):
+        p = np.array([soft_p_sigma(e, v, r, k_plan, 0.0) * e for e in es])
+        assert np.all(np.diff(p) > 0.0), (v, k_plan)
+        h = 1e-9
+        slope0 = (soft_p_sigma(h, v, r, k_plan, 0.0) * h - soft_p_sigma(-h, v, r, k_plan, 0.0) * -h) / (2 * h)
+        assert abs(slope0 - soft_p_sigma(0.0, v, r, k_plan, 0.0)) < 1e-6
+      assert soft_p_sigma(0.0, v, r, 0.0, 0.0) == SOFT_P_RHO                   # slope rho kp at 0 on a straight
+
+  def test_switch_rules(self):
+    for gains, cls_d in ((0, False), (1, False), (2, True)):
+      for on in ((ANGLE_PI_KEY, O5_KEY), INSTER_KEYS + (O5_KEY,)):
+        c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, gains=gains)
+        assert c.inster_angle_pi and c.inster_soft_p and c.inster_plan_history and c.inster_angle_pi_d == cls_d
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, gains=gains)
+      assert not c.inster_soft_p and c.pid.p_sigma is None
+    # without F, with NNLC, or on another car: no effect (the run equals the one without the param)
+    for car_name, on in ((HYUNDAI.HYUNDAI_INSTER, ()), (HYUNDAI.HYUNDAI_INSTER, STEP2_KEYS), (HYUNDAI.HYUNDAI_INSTER, ("InsterSpeedFeedforward",)),
+                         (HYUNDAI.HYUNDAI_INSTER, INSTER_KEYS + ("NeuralNetworkLateralControl",)), (HYUNDAI.HYUNDAI_KONA_EV, INSTER_KEYS)):
+      c, VM = _make_v0(car_name, on=on + (O5_KEY,), gains=2)
+      assert not c.inster_soft_p
+      assert _run(c, VM) == _run(*_make_v0(car_name, on=on, gains=2)), (car_name, on)
+    # changes the output with F on; F without the stiction term keeps its own plan history for option 5
+    for on in (INSTER_KEYS, (ANGLE_PI_KEY,)):
+      assert _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER, on=on + (O5_KEY,), gains=2)) != _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, gains=2))
+    c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=(ANGLE_PI_KEY, O5_KEY), gains=2)
+    assert not c.inster_friction and c.inster_plan_history and not hasattr(c, "inster_stiction")
+    # not an Inster switch of its own: alone it leaves the Lateral Jerk Torque Controller on
+    assert O5_KEY not in inster_lateral.INSTER_SWITCHES
+    _make_v0(HYUNDAI.HYUNDAI_INSTER, on=(O5_KEY, "LateralJerkTorqueController"), gains=2)
+    assert Params().get_bool("LateralJerkTorqueController")
+
+  def test_versions(self):
+    assert ANGLE_PI_VERSION_SOFT_P_BIT == 8 and ANGLE_PI_VERSION_D_BIT == 16
+    expected = {(0, False): 102, (1, False): 103, (2, False): 16104, (0, True): 8102, (1, True): 8103, (2, True): 24104}
+    for (gains, soft), version in expected.items():
+      assert angle_pi_log_version(gains, soft) == version, (gains, soft)
+    assert angle_pi_log_version(2, True) == ANGLE_PI_P6_BASE_VERSION + 1000 * (ANGLE_PI_VERSION_D_BIT | ANGLE_PI_VERSION_SOFT_P_BIT)
+    assert angle_pi_log_version(2, False) == ANGLE_PI_P6_LOG_VERSION and angle_pi_log_version(1, False) == ANGLE_PI_G6_LOG_VERSION
+    for (gains, soft), version in expected.items():
+      for on in (INSTER_KEYS, (ANGLE_PI_KEY,)):
+        c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on + ((O5_KEY,) if soft else ()), gains=gains)
+        for active in (True, False):
+          _, _, lac_log = c.update(active, _cs(10.0, 1.0), VM, _vp(), False, 0.0, None, False, 0.2)
+          assert lac_log.version == version, (gains, soft, on, active)
+    for on in (STEP2_KEYS + (O5_KEY,), (O5_KEY,), INSTER_KEYS + (O5_KEY, "NeuralNetworkLateralControl")):
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, gains=2)
+      assert c.update(True, _cs(10.0, 1.0), VM, _vp(), False, 0.0, None, False, 0.2)[2].version == 0
+
+  def test_rule_through_update(self):
+    # every step: p = kp(v) sigma e with sigma from the raw e and the plan now / lat_delay ago (option 5's own 1 s history: the
+    # stiction term is off here, so f does not depend on the output); I and D are the same as without option 5 (same inputs, no
+    # clipping): no sigma on I, D untouched
+    on = ("InsterSpeedFeedforward", ANGLE_PI_KEY)
+    for gains, kp_c in ((0, G2_KP), (1, G6_KP), (2, P6_KP)):
+      def limited(k):
+        return k % 11 == 5
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on + (O5_KEY,), gains=gains)
+      ref, VM_ref = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, gains=gains)
+      VM.update_params(1.0, 14.0)
+      VM_ref.update_params(1.0, 14.0)
+      a = _o5_drive(c, VM, 2500, limited)
+      b = _o5_drive(ref, VM_ref, 2500, limited)
+      hist = [0.0] * 100
+      lim = c.pid.pos_limit
+      sigmas = []
+      for (CS, dc, ld, p, i, d, f), (_, _, _, p_ref, i_ref, d_ref, f_ref) in zip(a, b, strict=True):
+        past = hist[-int(np.clip(ld / DT_CTRL, 1, 100))]
+        hist = hist[1:] + [dc]
+        v = CS.vEgo
+        e = angle_error(VM, v, dc, -VM.calc_curvature(math.radians(CS.steeringAngleDeg), v, 0.0))
+        s = _sigma_design(e, v, VM.get_steer_from_curvature(1.0, v, 0.0), dc, past)
+        sigmas.append(s)
+        assert abs(p - angle_pi_gain(kp_c, v) * s * e) <= 1e-12 * max(1.0, abs(p)), (gains, v)
+        assert abs(p_ref - angle_pi_gain(kp_c, v) * e) <= 1e-12 * max(1.0, abs(p_ref)), (gains, v)
+        assert i == i_ref and d == d_ref and f == f_ref, gains           # I (incl. the steer-limited freezes) and D unchanged
+        assert abs(p + i + d + f) < lim                                  # no clipping on this drive
+      assert min(sigmas) < 0.6 and max(sigmas) > 1.05, (gains, min(sigmas), max(sigmas))
 
 
 def _rate(c, v):

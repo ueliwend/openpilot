@@ -12,7 +12,7 @@ import pyray as rl
 
 from openpilot.common.basedir import BASEDIR
 from openpilot.selfdrive.ui.ui_state import ui_state
-from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_GAINS_PARAM, angle_pi_gain_set, is_inster
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_GAINS_PARAM, SOFT_P_PARAM, angle_pi_gain_set, is_inster
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.sunnypilot.lib.utils import NoElideButtonAction
@@ -138,6 +138,13 @@ class TorqueSettingsLayout(Widget):
     )
     # the gain set in force (also before the G6 bool's migration ran)
     self._inster_angle_pi_gains.action_item.set_selected_button(angle_pi_gain_set(ui_state.params))
+    self._inster_soft_p_toggle = toggle_item_sp(
+      param=SOFT_P_PARAM,
+      title=lambda: tr("Inster: Soft Small-Error P, for P6 (experimental)"),
+      description=lambda: tr("Softer P for small errors on straights, stronger P in curves. In simulation (with P6) much calmer on " +
+                             "straights; at 30-80 km/h slightly closer inside but wider outside; slightly more lateral offset on " +
+                             "straights and more exit overshoot. Fitted for P6. Not validated on the car. Off by default."),
+    )
 
     items = [
       self._jerk_aware_toggle,
@@ -152,6 +159,7 @@ class TorqueSettingsLayout(Widget):
       self._inster_ff_toggle,
       self._inster_angle_pi_toggle,
       self._inster_angle_pi_gains,
+      self._inster_soft_p_toggle,
     ]
     return items
 
@@ -170,6 +178,9 @@ class TorqueSettingsLayout(Widget):
     # gain set G2 / G6 / P6: a selector of the steering-angle PI, shown only while that is on (same change rules)
     self._inster_angle_pi_gains.set_visible(inster and self._inster_angle_pi_toggle.action_item.get_state())
     self._inster_angle_pi_gains.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
+    # option 5 (soft small-error P): under the selector, shown only while the steering-angle PI is on (same change rules)
+    self._inster_soft_p_toggle.set_visible(inster and self._inster_angle_pi_toggle.action_item.get_state())
+    self._inster_soft_p_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
     if not ui_state.params.get_bool("LiveTorqueParamsToggle"):
       ui_state.params.remove("LiveTorqueParamsRelaxedToggle")
       self._relaxed_tune_toggle.action_item.set_state(False)

@@ -11,12 +11,12 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.common.pid import PIDController
 
-from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_G6_KI, ANGLE_PI_G6_KP, ANGLE_PI_G6_LOG_VERSION, \
-                                                                       ANGLE_PI_GAINS_G6, ANGLE_PI_GAINS_P6, ANGLE_PI_LOG_VERSION, \
-                                                                       ANGLE_PI_P6_KD, ANGLE_PI_P6_KI, ANGLE_PI_P6_KP, \
-                                                                       ANGLE_PI_P6_LOG_VERSION, InsterAnglePI, InsterStictionFriction, \
-                                                                       InsterWheelRateFilter, STEER_MAX_RAW, angle_error, \
-                                                                       angle_pi_gain_set, ff_lat_accel_equivalent, is_inster
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_G6_KI, ANGLE_PI_G6_KP, ANGLE_PI_GAINS_G6, \
+                                                                       ANGLE_PI_GAINS_P6, ANGLE_PI_LOG_VERSION, ANGLE_PI_P6_KD, \
+                                                                       ANGLE_PI_P6_KI, ANGLE_PI_P6_KP, SOFT_P_PARAM, InsterAnglePI, \
+                                                                       InsterStictionFriction, InsterWheelRateFilter, STEER_MAX_RAW, \
+                                                                       angle_error, angle_pi_gain_set, angle_pi_log_version, \
+                                                                       ff_lat_accel_equivalent, is_inster, soft_p_sigma
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_ext import LatControlTorqueExt
 
 # At higher speeds (25+mph) we can assume:
@@ -65,6 +65,8 @@ class LatControlTorque(LatControl):
     self.inster_angle_pi = False
     self.inster_angle_pi_g6 = False
     self.inster_angle_pi_d = False
+    self.inster_soft_p = False
+    self.inster_plan_history = False
     self.inster_angle_pi_version = ANGLE_PI_LOG_VERSION
     if is_inster(CP):
       self._init_inster(Params())
@@ -81,29 +83,39 @@ class LatControlTorque(LatControl):
     self.inster_friction = friction
     self.inster_ff = feedforward
     self.inster_angle_pi = angle_pi
+    # option 5 (soft small-error P): only with F
+    soft_p = params.get_bool(SOFT_P_PARAM)
+    if soft_p and not angle_pi:
+      cloudlog.warning("InsterSoftSmallErrorP is ignored: it needs InsterAngleErrorPI")
+    self.inster_soft_p = soft_p and angle_pi
+    # the curvature requested lat_delay ago is an input of the stiction term and of option 5
+    self.inster_plan_history = friction or self.inster_soft_p
     # v0 keeps its own output: the Lateral Jerk Torque Controller extension must not replace it (its torque-params override stays)
     if self.extension._jerk_aware_enabled:
       cloudlog.warning("Inster steering switch enabled: the Lateral Jerk Torque Controller is not used")
       self.extension._jerk_aware_enabled = False
     if friction:
       self.inster_stiction = InsterStictionFriction(self.dt)
+    if self.inster_plan_history:
       # desired curvature of the last second, every step (the request made lat_delay ago is the plan for now)
       self.inster_curvature_buffer = deque([0.] * self.lat_accel_request_buffer_len, maxlen=self.lat_accel_request_buffer_len)
       self.inster_past_curvature = 0.0
+    if friction:
       self.inster_last_output_torque = 0.0
     if angle_pi:
       # P and I of "F" on the steering-wheel angle error replace v0's PID (same limits, feed-forward and output conversion)
       if not (friction and feedforward):
         cloudlog.warning("InsterAngleErrorPI was tuned with InsterStictionFriction and InsterSpeedFeedforward both on")
-      # gain set (selector InsterAngleErrorPIGains): G2 (version 102), G6 (103) or P6 = PID (16104)
+      # gain set (selector InsterAngleErrorPIGains): G2 (version 102), G6 (103) or P6 = PID (16104); + 8000 with option 5
       gain_set = angle_pi_gain_set(params)
+      self.inster_angle_pi_version = angle_pi_log_version(gain_set, self.inster_soft_p)
+      if self.inster_soft_p and gain_set != ANGLE_PI_GAINS_P6:
+        cloudlog.info("InsterSoftSmallErrorP: its parameters were fitted with gain set P6, not the one selected")
       if gain_set == ANGLE_PI_GAINS_G6:
         self.inster_angle_pi_g6 = True
-        self.inster_angle_pi_version = ANGLE_PI_G6_LOG_VERSION
         self.pid = InsterAnglePI(rate=1 / self.dt, kp=ANGLE_PI_G6_KP, ki=ANGLE_PI_G6_KI)
       elif gain_set == ANGLE_PI_GAINS_P6:
         self.inster_angle_pi_d = True
-        self.inster_angle_pi_version = ANGLE_PI_P6_LOG_VERSION
         self.pid = InsterAnglePI(rate=1 / self.dt, kp=ANGLE_PI_P6_KP, ki=ANGLE_PI_P6_KI, kd=ANGLE_PI_P6_KD)
         self.inster_wheel_rate = InsterWheelRateFilter(self.dt)
       else:
@@ -126,7 +138,7 @@ class LatControlTorque(LatControl):
     if self.extension.update_override_torque_params(self.torque_params):
       self.update_limits()
 
-    if self.inster_friction:
+    if self.inster_plan_history:
       # the curvature requested lat_delay ago (the plan for now); the history is kept every step, active or not
       inster_delay_frames = int(np.clip(lat_delay / self.dt, 1, self.lat_accel_request_buffer_len))
       self.inster_past_curvature = self.inster_curvature_buffer[-inster_delay_frames]
@@ -192,7 +204,12 @@ class LatControlTorque(LatControl):
           # 0 while the driver steers (the filter keeps running)
           wheel_rate = self.inster_wheel_rate.update(VM.get_steer_from_curvature(1.0, CS.vEgo, 0.0) * measured_curvature)
           angle_pi_rate = 0.0 if CS.steeringPressed else -wheel_rate
-        output_lataccel = self.pid.update(angle_error(VM, CS.vEgo, desired_curvature, measured_curvature),
+        angle_e = angle_error(VM, CS.vEgo, desired_curvature, measured_curvature)
+        if self.inster_soft_p:
+          # option 5: P x sigma(raw e, plan curvature now / lat_delay ago); I and D unchanged
+          self.pid.p_sigma = soft_p_sigma(angle_e, CS.vEgo, VM.get_steer_from_curvature(1.0, CS.vEgo, 0.0), desired_curvature,
+                                          self.inster_past_curvature)
+        output_lataccel = self.pid.update(angle_e,
                                           angle_pi_rate,
                                           feedforward=ff,
                                           speed=CS.vEgo,

@@ -297,6 +297,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"InsterAngleErrorPI", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"InsterAngleErrorPIG6", {PERSISTENT | BACKUP, BOOL}},  // legacy (G6 only), migrated to InsterAngleErrorPIGains = 1; no default
     {"InsterAngleErrorPIGains", {PERSISTENT | BACKUP, INT, "0"}},
+    {"InsterSoftSmallErrorP", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"InsterSpeedFeedforward", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"InsterStictionFriction", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"LateralJerkTorqueController", {PERSISTENT | BACKUP, BOOL, "0"}},

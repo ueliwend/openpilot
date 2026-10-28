@@ -19,7 +19,8 @@ and a small stateful filter class.
     angle error (rad) with gains that are quadratic in speed, and the integrator runs from standstill. Feed-forward, limits and output
     conversion stay v0's. Tuned and checked in the closed-loop simulator only with both switches above on.
     Gain set (param InsterAngleErrorPIGains, effective only with InsterAngleErrorPI on): G2 (default), G6, or P6 = PI + D on the
-    measured wheel-angle rate.
+    measured wheel-angle rate. Option 5 (InsterSoftSmallErrorP, with InsterAngleErrorPI on, any gain set; fitted for P6): P scaled
+    by sigma, softer for small errors on straights, stronger in curves (soft_p_sigma).
 
   * Torque cap (no switch): the Inster's steering command is capped at 409 raw (opendbc values.INSTER_STEER_MAX, the highest the
     owner's steering unit took without a fault, 23 Oct 2026) with 1.0 = 384 raw (INSTER_STEER_FULL_SCALE): every lateral
@@ -49,6 +50,8 @@ INSTER_SWITCHES = ("InsterStictionFriction", "InsterSpeedFeedforward", "InsterAn
 ANGLE_PI_GAINS_PARAM = "InsterAngleErrorPIGains"
 ANGLE_PI_G6_SWITCH = "InsterAngleErrorPIG6"      # legacy bool, read only by the migration and the fallback
 ANGLE_PI_GAINS_G2, ANGLE_PI_GAINS_G6, ANGLE_PI_GAINS_P6 = 0, 1, 2
+# Option 5 of InsterAngleErrorPI (same rules; alone it changes nothing, so it is not one of INSTER_SWITCHES): soft small-error P
+SOFT_P_PARAM = "InsterSoftSmallErrorP"
 
 # Steering torque cap as a fraction of full scale: 409 / 384 = 1.065 (opendbc values.py: INSTER_STEER_MAX / INSTER_STEER_FULL_SCALE)
 INSTER_STEER_MAX_FRACTION = INSTER_STEER_MAX / INSTER_STEER_FULL_SCALE
@@ -254,7 +257,8 @@ class InsterStictionFriction:
 # or ANGLE_PI_P6_LOG_VERSION (P6) (v0 logs 0, the upstream controller 1); error stays v0's lateral-acceleration error (setpoint -
 # measurement, m/s^2), p / i / d / f are in m/s^2 as in v0 (d is 0 except with P6). F's own error is e = p / kp(vEgo) (rad, + right;
 # kp of the gain set in force, > 0 at every speed the car drives), or recomputed from carState steeringAngleDeg, liveParameters
-# angleOffsetDeg / roll / steerRatio / stiffnessFactor and controlsState desiredCurvature with angle_error().
+# angleOffsetDeg / roll / steerRatio / stiffnessFactor and controlsState desiredCurvature with angle_error() (with option 5, version
+# bit 8: p / kp = sigma e; use angle_error()).
 # Gains G2 (27 Oct 2026, SIM only; replace F's kp 4.3447 + 0.40366 v - 0.0072954 v^2, ki 0.93525 + 0.27948 v - 0.0057456 v^2):
 # Nelder-Mead group 2, objective v5, acceptance v4 passed (project doc claude/inster-steering-simulator.md, Nelder-Mead section). The
 # search's coefficients rounded to 6 significant digits (gains within 6e-6 relative up to 160 km/h).
@@ -287,6 +291,44 @@ ANGLE_PI_D_TAU = 0.03
 ANGLE_PI_P6_BASE_VERSION = 104
 ANGLE_PI_VERSION_D_BIT = 16
 ANGLE_PI_P6_LOG_VERSION = ANGLE_PI_P6_BASE_VERSION + 1000 * ANGLE_PI_VERSION_D_BIT
+# Option 5 "InsterSoftSmallErrorP" (28 Oct 2026, SIM only; options design v2.1 section 5, project doc
+# claude/inster-steering-simulator.md): p = kp(v) sigma e, I and D unchanged (no sigma on I), with
+#   v_c = max(v, 7 m/s), e_a = |e| v_c^2 / R(v) (lateral-acceleration size of the raw wheel-angle error, R in rad per 1/m, >= 1 deg),
+#   a_p = max(|desired curvature|, |curvature requested lat_delay ago|) v_c^2 (the stiction term's two plan inputs), phi(x) = x^2 / (1 + x^2),
+#   sigma = [1 - (1 - rho)(1 - phi(e_a / e0))(1 - phi(a_p / a0))] (1 + (gamma - 1) phi(a_p / a0)),   rho <= sigma <= gamma.
+# p(e) stays strictly increasing (slope rho kp at e = 0 on a straight). Mild parameters fitted with P6 (Nelder-Mead option fit,
+# objective v6; the bound-limited full fit was not taken): rho 0.5, e0 0.11 m/s^2, a0 0.3 m/s^2, gamma 1.2. As the kit's
+# candidates_opts.OptsPID option 'o5'. torqueState.version = gain-set base + 1000 x (D bit 16 | option-5 bit 8): G2 8102, G6 8103,
+# P6 24104 (angle_pi_log_version). Logs: nothing new; sigma = p / (kp(vEgo) e), or recomputed from the logged inputs.
+SOFT_P_RHO = 0.5
+SOFT_P_E0 = 0.11
+SOFT_P_A0 = 0.3
+SOFT_P_GAMMA = 1.2
+SOFT_P_V_MIN = 7.0
+SOFT_P_R_MIN = math.radians(1.0)
+ANGLE_PI_VERSION_SOFT_P_BIT = 8
+
+
+def angle_pi_log_version(gain_set: int, soft_p: bool) -> int:
+  """torqueState.version with F on: the gain set's base + 1000 x mask (D bit with P6, option-5 bit)"""
+  if gain_set == ANGLE_PI_GAINS_P6:
+    base, mask = ANGLE_PI_P6_BASE_VERSION, ANGLE_PI_VERSION_D_BIT
+  else:
+    base, mask = (ANGLE_PI_G6_LOG_VERSION if gain_set == ANGLE_PI_GAINS_G6 else ANGLE_PI_LOG_VERSION), 0
+  if soft_p:
+    mask |= ANGLE_PI_VERSION_SOFT_P_BIT
+  return base + 1000 * mask
+
+
+def soft_p_sigma(e: float, v_ego: float, r_rad: float, curvature_now: float, curvature_past: float) -> float:
+  """option 5's P multiplier sigma (see above) for the raw wheel-angle error e (rad) and R(v) = r_rad (rad per 1/m)"""
+  vc = v_ego if v_ego > SOFT_P_V_MIN else SOFT_P_V_MIN
+  rr = r_rad if r_rad > SOFT_P_R_MIN else SOFT_P_R_MIN
+  xe = abs(e) * vc * vc / rr / SOFT_P_E0
+  xa = max(abs(curvature_now), abs(curvature_past)) * vc * vc / SOFT_P_A0
+  pe = xe * xe / (1.0 + xe * xe)
+  pa = xa * xa / (1.0 + xa * xa)
+  return (1.0 - (1.0 - SOFT_P_RHO) * (1.0 - pe) * (1.0 - pa)) * (1.0 + (SOFT_P_GAMMA - 1.0) * pa)
 
 
 def angle_pi_gain_set(params) -> int:
@@ -321,10 +363,12 @@ class InsterAnglePI(PIDController):
     self.kp_coeffs = kp
     self.ki_coeffs = ki
     self.kd_coeffs = kd
+    self.p_sigma: float | None = None     # option 5: P multiplier of the current step (None: off)
 
   @property
   def k_p(self):
-    return angle_pi_gain(self.kp_coeffs, self.speed)
+    kp = angle_pi_gain(self.kp_coeffs, self.speed)
+    return kp if self.p_sigma is None else kp * self.p_sigma
 
   @property
   def k_i(self):
