@@ -29,6 +29,8 @@ from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_
                                                                        LATERAL_PID, ANGLE_PI_P6_BASE_VERSION, ANGLE_PI_P6_KD, \
                                                                        ANGLE_PI_P6_KI, ANGLE_PI_P6_KP, ANGLE_PI_P6_LOG_VERSION, \
                                                                        ANGLE_PI_VERSION_D_BIT, angle_lateral_controller
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_VERSION_FREEZE_DIR_BIT, LIMIT_TOL_RAW, \
+                                                                       InsterSteerLimitObserver, freeze_angle_integrator
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_VERSION_SOFT_P_BIT, SOFT_P_A0, SOFT_P_E0, SOFT_P_GAMMA, \
                                                                        SOFT_P_PARAM, SOFT_P_RHO, SOFT_P_V_MIN, angle_pi_log_version, \
                                                                        soft_p_sigma
@@ -48,6 +50,24 @@ INSTER_KEYS = STEP2_KEYS + (ANGLE_PI_KEY,)
 CTRL_KEY = "InsterLateralController"         # controller type: 0 = PI (G6), 1 = PID (P6)
 SPEEDS = [0.0, 2.0, 5.0, 6.1] + list(np.linspace(6.11, 30.83, 60)) + [31.0, 35.0, 45.0]
 ACCELS = list(np.linspace(0.0, 4.0, 161))
+
+
+class _ScriptedLimit:
+  """test stand-in for InsterSteerLimitObserver: the limit direction seen by the n-th active step is direction_of(n), so the
+  integration rule can be checked without the car-side ramp in the way (the observer itself: TestInsterIntegratorFreeze)"""
+
+  def __init__(self, direction_of=lambda n: 0):
+    self.direction_of = direction_of
+    self.n = 0
+    self.direction = direction_of(0)
+
+  def reset(self):
+    pass
+
+  def update(self, torque, driver_torque):
+    self.n += 1
+    self.direction = self.direction_of(self.n)
+    return self.direction
 
 
 def _term(x, h, v=20.0, rate=0.0, lat_delay=0.2):
@@ -527,15 +547,16 @@ class TestInsterAnglePI(OpenpilotTestCase):
     mc = -VM.calc_curvature(math.radians(10.0), 20.0, 0.0)
     assert abs(angle_error(VM, 20.0, 0.0, mc) - math.radians(10.0)) < 1e-12
 
-  def _check_rule(self, c, CS, VM, params, steer_limited, desired_curvature, i_prev):
-    """the F rule for the step just run: p = kp e, i += ki e dt unless frozen, anti-windup and clip as common/pid.py"""
+  def _check_rule(self, c, CS, VM, params, limit_direction, desired_curvature, i_prev):
+    """the F rule for the step just run: p = kp e, i += ki e dt unless frozen (pressed, or the last request held back by the car-side
+    limiter in the direction of this update), anti-windup and clip as common/pid.py"""
     measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
     e = angle_error(VM, CS.vEgo, desired_curvature, measured_curvature)
     kp, ki = angle_pi_gain(G6_KP, CS.vEgo), angle_pi_gain(G6_KI, CS.vEgo)   # selector unset: PI
     pid = c.pid
     assert pid.p == kp * e
     lim = pid.pos_limit
-    if steer_limited or CS.steeringPressed:
+    if freeze_angle_integrator(CS.steeringPressed, limit_direction, e):
       assert pid.i == i_prev
     else:
       i_new = i_prev + ki * DT_CTRL * e
@@ -553,6 +574,7 @@ class TestInsterAnglePI(OpenpilotTestCase):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
       assert c.inster_angle_pi and isinstance(c.pid, InsterAnglePI) and c.extension._pid is c.pid
       assert abs(c.pid.pos_limit / c.torque_params.latAccelFactor - CAP) < 1e-9
+      c.inster_limit_observer = _ScriptedLimit(lambda n: (0, 1, 0, -1, 0, 0, 1)[n % 7])
       rng = random.Random(5)
       angle = 0.0
       frozen = 0
@@ -567,11 +589,12 @@ class TestInsterAnglePI(OpenpilotTestCase):
         params = _vp(0.02 * math.sin(0.05 * t), 0.3)
         if k % 100 == 0:
           c.update_torque_parameters(2.8 + 0.3 * math.sin(0.02 * t), 0.04, 0.09)
-        sl = (k % 41) == 0
+        sl = (k % 41) == 0                     # controlsd's flag: no longer freezes F (its integrator uses the limit direction)
         i_prev = c.pid.i
+        ld = c.inster_limit_observer.direction
         tq, _, lac_log = c.update(True, CS, VM, params, sl, dc, None, False, 0.2)
-        self._check_rule(c, CS, VM, params, sl, dc, i_prev)
-        frozen += sl or CS.steeringPressed
+        e = self._check_rule(c, CS, VM, params, ld, dc, i_prev)
+        frozen += freeze_angle_integrator(CS.steeringPressed, ld, e)
         assert abs(tq) <= CAP + 1e-12
         assert tq == -c.pid.control / c.torque_params.latAccelFactor
         # logs: p / i in lateral-acceleration units, error stays v0's lateral-acceleration error
@@ -582,6 +605,7 @@ class TestInsterAnglePI(OpenpilotTestCase):
 
   def test_integrator_from_standstill(self):
     c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS)
+    c.inster_limit_observer = _ScriptedLimit()       # no speed rule, and no car-side limit in this check (see TestInsterIntegratorFreeze)
     params = _vp()
     for v in (0.0, 1.0, 4.9):
       c.pid.reset()
@@ -607,14 +631,36 @@ class TestInsterAnglePI(OpenpilotTestCase):
     for _ in range(20):
       c.update(True, _cs(10.0, angle=-5.0), VM, params, False, 0.0, None, False, 0.2)
     i0 = c.pid.i
-    assert i0 < 0.0
+    assert i0 < 0.0                                 # e < 0 (wheel right of a straight plan): i < 0, actuators.torque > 0 (left)
+    script = _ScriptedLimit(lambda n: 0)
+    c.inster_limit_observer = script
     for _ in range(30):
       c.update(True, _cs(10.0, angle=-5.0, pressed=True), VM, params, False, 0.0, None, False, 0.2)
       assert c.pid.i == i0                                                                   # steeringPressed
+    # the last request held back towards + (left, the direction of this update): frozen; controlsd's flag alone: no freeze
+    script.direction_of = lambda n: 1
+    script.direction = 1
+    for _ in range(30):
       c.update(True, _cs(10.0, angle=-5.0), VM, params, True, 0.0, None, False, 0.2)
-      assert c.pid.i == i0                                                                   # steer_limited_by_safety (cap / ramp)
+      assert c.pid.i == i0
+    script.direction_of = lambda n: 0
+    script.direction = 0
+    c.update(True, _cs(10.0, angle=-5.0), VM, params, True, 0.0, None, False, 0.2)
+    assert c.pid.i < i0                                                                       # flag set, limiter quiet: integrates
+    # held back towards - (right) while this update pushes left: integrates (only the limited direction is frozen)
+    i1 = c.pid.i
+    script.direction_of = lambda n: -1
+    script.direction = -1
     c.update(True, _cs(10.0, angle=-5.0), VM, params, False, 0.0, None, False, 0.2)
-    assert c.pid.i < i0
+    assert c.pid.i < i1
+    # ... and unwinding through a limit in the other direction is allowed: wheel left of the plan (e > 0) with the push to the right
+    i2 = c.pid.i
+    c.update(True, _cs(10.0, angle=5.0), VM, params, False, 0.0, None, False, 0.2)
+    assert c.pid.i == i2                          # e > 0 pushes right (-), the request was held back towards - : frozen
+    script.direction_of = lambda n: 1
+    script.direction = 1
+    c.update(True, _cs(10.0, angle=5.0), VM, params, False, 0.0, None, False, 0.2)
+    assert c.pid.i > i2                           # held back towards + while the update pushes right: unwinds
     # inactive: no output, and F's integrator is reset (v0 keeps its own, see test_stale_integrator_after_inactive)
     assert c.pid.i != 0.0
     tq, _, lac_log = c.update(False, _cs(10.0, angle=-5.0), VM, params, False, 0.0, None, False, 0.2)
@@ -639,14 +685,15 @@ class TestInsterAnglePI(OpenpilotTestCase):
     assert first["F"][0] < -1.5                                     # F did wind at 2 m/s
     assert abs(first["F"][1]) < 1e-3                                # reset: only the first step's I at the re-engagement
     assert abs(first["F"][2]) < 0.5 and abs(first["F"][2] - first["v0_step2"][2]) < 0.5   # ~0 raw, as v0 (was 170.6 raw)
-    assert first["F"][3] == ANGLE_PI_G6_LOG_VERSION
+    assert first["F"][3] == angle_pi_log_version(LATERAL_PI, False)
 
   def test_log_version(self):
-    # F drives are identifiable in the logs: torqueState.version 103 with F on and the selector unset (PI = G6; older drives: 102 G2,
-    # 101 F's gains with the crawl plan, 100 before it), 0 for v0 otherwise (upstream: 1)
-    assert ANGLE_PI_G6_LOG_VERSION == 103
+    # F drives are identifiable in the logs: torqueState.version 64103 with F on and the selector unset (PI = G6 base 103 + freeze-rule
+    # bit 64; before the freeze fix 103; older drives: 102 G2, 101 F's gains with the crawl plan, 100 before it), 0 for v0 otherwise
+    # (upstream: 1)
+    assert ANGLE_PI_G6_LOG_VERSION == 103 and ANGLE_PI_VERSION_FREEZE_DIR_BIT == 64
     assert ANGLE_PI_G6_LOG_VERSION not in (latcontrol_torque_v0.VERSION, 1)
-    for on, expected in ((INSTER_KEYS, 103), ((ANGLE_PI_KEY,), 103), (STEP2_KEYS, 0), ((), 0),
+    for on, expected in ((INSTER_KEYS, 64103), ((ANGLE_PI_KEY,), 64103), (STEP2_KEYS, 0), ((), 0),
                          (INSTER_KEYS + ("NeuralNetworkLateralControl",), 0)):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
       for active in (True, False):
@@ -725,6 +772,7 @@ class TestInsterAnglePI(OpenpilotTestCase):
             assert (e > 0.0) == (wheel_vs_plan > 0.0)        # wheel left of the plan -> e > 0 -> steer right (v0-internal +)
             assert abs(e - math.radians(CS.steeringAngleDeg - plan_deg)) < 1e-6
             c.pid.reset()
+            c.inster_limit_observer.reset()                    # a fresh step: no request held back before it
             c.update(True, CS, VM, vp, False, desired_curvature, None, False, 0.2)
             kp, ki = angle_pi_gain(G6_KP, v), angle_pi_gain(G6_KI, v)
             assert abs(c.pid.p - kp * e) <= 1e-12 * max(1.0, abs(kp * e)), (kmh, desired_curvature, wheel_vs_plan, roll)
@@ -744,6 +792,7 @@ class TestInsterAnglePI(OpenpilotTestCase):
     params = _vp()
     c.update(True, _cs(30 / 3.6, angle=1.0), VM, params, False, 0.0, None, False, 0.2)        # a step at another speed first
     c.pid.reset()
+    c.inster_limit_observer.reset()
     CS = _cs(100 / 3.6, angle=1.0)                                                           # wheel 1 deg left of a straight plan
     _, _, lac_log = c.update(True, CS, VM, params, False, 0.0, None, False, 0.2)
     v = CS.vEgo
@@ -819,9 +868,10 @@ class TestInsterAnglePIG6(OpenpilotTestCase):
     assert Params().get_bool("LateralJerkTorqueController")
 
   def test_log_version(self):
-    # PI drives are identifiable in the logs: torqueState.version 103, 0 for v0 (upstream: 1); 102 (G2) is no longer produced
+    # PI drives are identifiable in the logs: torqueState.version 64103 (103 + freeze-rule bit 64; 103 before the freeze fix), 0 for v0
+    # (upstream: 1); 102 (G2) is no longer produced
     assert ANGLE_PI_G6_LOG_VERSION == 103
-    for on, expected in ((INSTER_KEYS + (G6_KEY,), 103), ((ANGLE_PI_KEY, G6_KEY), 103), (INSTER_KEYS, 103), ((ANGLE_PI_KEY,), 103),
+    for on, expected in ((INSTER_KEYS + (G6_KEY,), 64103), ((ANGLE_PI_KEY, G6_KEY), 64103), (INSTER_KEYS, 64103), ((ANGLE_PI_KEY,), 64103),
                          (STEP2_KEYS + (G6_KEY,), 0), ((G6_KEY,), 0), (INSTER_KEYS + (G6_KEY, "NeuralNetworkLateralControl"), 0)):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
       for active in (True, False):
@@ -839,6 +889,7 @@ class TestInsterAnglePIG6(OpenpilotTestCase):
         v = CS.vEgo
         e = angle_error(VM, v, 0.0, -VM.calc_curvature(math.radians(wheel), v, 0.0))
         c.pid.reset()
+        c.inster_limit_observer.reset()
         c.update(True, CS, VM, _vp(), False, 0.0, None, False, 0.2)
         kp, ki = angle_pi_gain(G6_KP, v), angle_pi_gain(G6_KI, v)
         assert abs(c.pid.p - kp * e) <= 1e-12 * max(1.0, abs(kp * e)), kmh
@@ -921,9 +972,9 @@ class TestInsterLateralController(OpenpilotTestCase):
     params.remove(CTRL_KEY)
     params.remove(GAINS_KEY)
     assert params.get(CTRL_KEY, return_default=True) == LATERAL_PI       # the UI's default
-    for ctrl, legacy_gains, kp, ki, kd, version in ((0, None, G6_KP, G6_KI, None, 103), (1, None, P6_KP, P6_KI, P6_KD, 16104),
-                                                    (None, None, G6_KP, G6_KI, None, 103), (None, 0, G6_KP, G6_KI, None, 103),
-                                                    (None, 2, P6_KP, P6_KI, P6_KD, 16104)):
+    for ctrl, legacy_gains, kp, ki, kd, version in ((0, None, G6_KP, G6_KI, None, 64103), (1, None, P6_KP, P6_KI, P6_KD, 80104),
+                                                    (None, None, G6_KP, G6_KI, None, 64103), (None, 0, G6_KP, G6_KI, None, 64103),
+                                                    (None, 2, P6_KP, P6_KI, P6_KD, 80104)):
       for on in ((ANGLE_PI_KEY,), INSTER_KEYS):
         c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl, legacy_gains=legacy_gains)
         assert c.inster_angle_pi and (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (kp, ki, kd)
@@ -973,9 +1024,10 @@ class TestInsterLateralController(OpenpilotTestCase):
       assert (pi.k_p, pi.k_i, pi.k_d) == (angle_pi_gain(P6_KP, v), angle_pi_gain(P6_KI, v), angle_pi_gain(P6_KD, v))
 
   def test_versions(self):
+    # base versions (before the freeze fix the logged values); logged now with the freeze-rule bit 64: PI 64103, PID 80104
     assert (ANGLE_PI_G6_LOG_VERSION, ANGLE_PI_P6_LOG_VERSION) == (103, 16104)
     assert ANGLE_PI_P6_LOG_VERSION == ANGLE_PI_P6_BASE_VERSION + 1000 * ANGLE_PI_VERSION_D_BIT and ANGLE_PI_VERSION_D_BIT == 16
-    for on, ctrl, expected in ((INSTER_KEYS, 1, 16104), ((ANGLE_PI_KEY,), 1, 16104), (INSTER_KEYS, 0, 103), (INSTER_KEYS, None, 103),
+    for on, ctrl, expected in ((INSTER_KEYS, 1, 80104), ((ANGLE_PI_KEY,), 1, 80104), (INSTER_KEYS, 0, 64103), (INSTER_KEYS, None, 64103),
                                (STEP2_KEYS, 1, 0), ((), 1, 0), (INSTER_KEYS + ("NeuralNetworkLateralControl",), 1, 0)):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl)
       for active in (True, False):
@@ -984,13 +1036,17 @@ class TestInsterLateralController(OpenpilotTestCase):
 
   def test_p6_rule(self):
     # every step through the real update(): p = kp e, d = -kd d/dt LP2(theta_meas), i with common/pid.py's anti-windup incl. d,
-    # control = clip(p + i + d + f); D from the first step (settled filter: d = 0 on the first step). Steer-limited steps (every 7th)
-    # freeze I but keep D, as simulated
-    def limited(k):
-      return k % 7 == 3
+    # control = clip(p + i + d + f); D from the first step (settled filter: d = 0 on the first step). Steps whose last request was
+    # held back (scripted: every 7th towards +, every 7th + 4 towards -) freeze I if the update pushes that way, and keep D
+    def direction(k):
+      return 1 if k % 7 == 3 else (-1 if k % 7 == 0 else 0)
     c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=1)
+    c.inster_limit_observer = _ScriptedLimit(direction)
     VM.update_params(1.0, 14.0)
-    steps = _p6_drive(c, VM, 1500, limited=limited)
+    steps = _p6_drive(c, VM, 1500, limited=lambda k: k % 5 == 1)   # controlsd's flag: no longer used by the PID's integrator
+    def limited(k):
+      e = steps[k][3] / angle_pi_gain(P6_KP, steps[k][0].vEgo)
+      return freeze_angle_integrator(False, direction(k), e)
     rates = _lp2_rates([_theta_meas(VM, CS.vEgo, CS.steeringAngleDeg, vp.angleOffsetDeg, vp.roll) for CS, vp, *_ in steps])
     i_prev = 0.0
     lim = c.pid.pos_limit
@@ -1000,7 +1056,7 @@ class TestInsterLateralController(OpenpilotTestCase):
       v = CS.vEgo
       assert abs(d - angle_pi_gain(P6_KD, v) * -rate) <= 1e-12 * max(1.0, abs(d)), (k, v)
       if limited(k):
-        expected_i = i_prev                             # frozen while steer-limited by safety
+        expected_i = i_prev                             # frozen: the last request held back in the direction of this update
       else:
         i_new = i_prev + angle_pi_gain(P6_KI, v) * DT_CTRL * (p / angle_pi_gain(P6_KP, v))
         test = p + i_new + d + f
@@ -1129,12 +1185,13 @@ class TestInsterSoftSmallErrorP(OpenpilotTestCase):
 
   def test_versions(self):
     assert ANGLE_PI_VERSION_SOFT_P_BIT == 8 and ANGLE_PI_VERSION_D_BIT == 16
-    expected = {(0, False): 103, (1, False): 16104, (0, True): 8103, (1, True): 24104}
+    expected = {(0, False): 64103, (1, False): 80104, (0, True): 72103, (1, True): 88104}     # incl. the freeze-rule bit 64
     for (ctrl, soft), version in expected.items():
       assert angle_pi_log_version(ctrl, soft) == version, (ctrl, soft)
-    assert angle_pi_log_version(LATERAL_PID, True) == ANGLE_PI_P6_BASE_VERSION + 1000 * (ANGLE_PI_VERSION_D_BIT | ANGLE_PI_VERSION_SOFT_P_BIT)
-    assert angle_pi_log_version(LATERAL_PID, False) == ANGLE_PI_P6_LOG_VERSION
-    assert angle_pi_log_version(LATERAL_PI, False) == ANGLE_PI_G6_LOG_VERSION
+    assert angle_pi_log_version(LATERAL_PID, True) == ANGLE_PI_P6_BASE_VERSION + 1000 * (ANGLE_PI_VERSION_D_BIT | ANGLE_PI_VERSION_SOFT_P_BIT
+                                                                                         | ANGLE_PI_VERSION_FREEZE_DIR_BIT)
+    assert angle_pi_log_version(LATERAL_PID, False) == ANGLE_PI_P6_LOG_VERSION + 1000 * ANGLE_PI_VERSION_FREEZE_DIR_BIT
+    assert angle_pi_log_version(LATERAL_PI, False) == ANGLE_PI_G6_LOG_VERSION + 1000 * ANGLE_PI_VERSION_FREEZE_DIR_BIT
     for (ctrl, soft), version in expected.items():
       for on in (INSTER_KEYS, (ANGLE_PI_KEY,)):
         c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on + ((O5_KEY,) if soft else ()), ctrl=ctrl)
@@ -1337,3 +1394,96 @@ class TestInsterCrawlPlan(OpenpilotTestCase):
       else:
         expected = model
       assert env["new_desired_curvature"] == expected
+
+
+def _car_params(car_name):
+  return interfaces[car_name].get_non_essential_params(car_name).as_reader()
+
+
+class TestInsterIntegratorFreeze(OpenpilotTestCase):
+  """the steering-angle controller's integrator freeze (29 Oct 2026, owner: a fix for every PI / PID variant): the car-side limiter
+  re-run on the controller's own requests (same frame, no carOutput lag), frozen only in the limited direction or while pressed"""
+
+  def test_observer_is_the_car_side_limiter(self):
+    # same command as the Hyundai carcontroller for random request / driver-torque sequences (cap 409, ramp 3 / 5, driver rule)
+    from opendbc.car.hyundai.values import CarControllerParams
+    from opendbc.car.lateral import apply_driver_steer_torque_limits
+    CP = _car_params(HYUNDAI.HYUNDAI_INSTER)
+    ccp = CarControllerParams(CP)
+    assert (ccp.STEER_MAX, ccp.STEER_FULL_SCALE, ccp.STEER_DELTA_UP, ccp.STEER_DELTA_DOWN) == (INSTER_STEER_MAX, INSTER_STEER_FULL_SCALE, 3, 5)
+    obs = InsterSteerLimitObserver.for_car(CP)
+    rng = random.Random(11)
+    last = 0
+    n_limited = {1: 0, -1: 0, 0: 0}
+    for k in range(20000):
+      torque = rng.choice((rng.uniform(-1.2, 1.2), 0.3 * math.sin(k / 40.0), rng.gauss(0.0, 0.02)))
+      driver = rng.choice((0.0, rng.uniform(-200.0, 200.0)))
+      new = int(round(torque * INSTER_STEER_FULL_SCALE))
+      apply = apply_driver_steer_torque_limits(new, last, driver, ccp)
+      last = apply
+      d = obs.update(torque, driver)
+      assert obs.apply_torque_last == apply, k
+      assert d == (1 if new - apply > LIMIT_TOL_RAW else (-1 if new - apply < -LIMIT_TOL_RAW else 0)), k
+      n_limited[d] += 1
+    assert min(n_limited.values()) > 1000
+    obs.reset()
+    assert obs.apply_torque_last == 0 and obs.direction == 0
+
+  def test_no_lag_artefact(self):
+    # a request moving at <= 3 raw per step (inside the ramp) is never limited, however long it moves; controlsd's flag (request vs a
+    # carOutput 2 frames older) read such a request as limited once it moved by more than ~2 raw per step
+    obs = InsterSteerLimitObserver.for_car(_car_params(HYUNDAI.HYUNDAI_INSTER))
+    for k in range(120):                                            # 0 -> 360 raw at 3 raw / step, then back at 5 raw / step
+      assert obs.update(3.0 * k / INSTER_STEER_FULL_SCALE, 0.0) == 0
+    for k in range(72):
+      assert obs.update((357.0 - 5.0 * k) / INSTER_STEER_FULL_SCALE, 0.0) == 0
+    assert obs.update(400.0 / INSTER_STEER_FULL_SCALE, 0.0) == 1    # a jump the ramp holds back: limited towards +
+    assert obs.update(500.0 / INSTER_STEER_FULL_SCALE, 0.0) == 1    # beyond the 409 cap: limited towards +
+    obs.reset()
+    assert obs.update(-0.5, 0.0) == -1
+
+  def test_freeze_rule(self):
+    for pressed in (False, True):
+      for d in (-1, 0, 1):
+        for e in (-0.01, 0.0, 0.01):
+          # e > 0: output to the right = actuators.torque negative, so the update pushes towards -1
+          expected = pressed or (d != 0 and e != 0.0 and d == (1 if e < 0.0 else -1))
+          assert freeze_angle_integrator(pressed, d, e) == expected, (pressed, d, e)
+
+  def test_ramp_through_update(self):
+    # PI and PID through the real update(): a 6 deg wheel error at 30 km/h engaged from 0. The request jumps far beyond the 3 raw / step
+    # ramp: the integrator stays frozen while the car-side command ramps up (the request held back in the direction of the update),
+    # and integrates again once the command has caught up; controlsd's flag (passed True throughout) does not freeze it
+    for ctrl in (0, 1):
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=ctrl)
+      VM.update_params(1.0, 14.0)
+      frozen = []
+      for _ in range(600):
+        i_prev = c.pid.i
+        c.update(True, _cs(30 / 3.6, angle=-6.0), VM, _vp(), True, 0.0, None, False, 0.2)
+        frozen.append(bool(c.pid.i == i_prev))
+      assert not frozen[0]                                         # first step: nothing held back yet
+      assert all(frozen[1:20])                                     # the ramp holds the request back in the push direction
+      assert not all(frozen) and not frozen[-1]                    # integrates again once the command is no longer held back
+      assert c.inster_limit_observer.apply_torque_last > 0         # wheel right of a straight plan: steering left (+)
+    # v0 (steering-angle controller off) is unchanged: controlsd's flag still freezes its integrator
+    off, VM_off = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=STEP2_KEYS)
+    for _ in range(50):
+      off.update(True, _cs(30 / 3.6, angle=-6.0), VM_off, _vp(), True, 0.0, None, False, 0.2)
+    assert off.pid.i == 0.0
+
+  def test_non_finite_request(self):
+    # the observer runs before controlsd's non-finite guard: a NaN / inf request must not raise and counts as the 0 the car then gets
+    obs = InsterSteerLimitObserver.for_car(_car_params(HYUNDAI.HYUNDAI_INSTER))
+    for _ in range(10):
+      obs.update(100.0 / INSTER_STEER_FULL_SCALE, 0.0)
+    last = obs.apply_torque_last
+    for bad in (float('nan'), float('inf'), -float('inf')):
+      obs.update(bad, 0.0)
+      assert obs.apply_torque_last == last - 5 and obs.direction == -1     # towards 0 at the 5 raw / step release ramp
+      last = obs.apply_torque_last
+    obs.update(0.0, float('nan'))                                          # a non-finite driver torque reading: treated as 0
+    assert obs.apply_torque_last == last - 5
+    # and through update(): a non-finite desired curvature reaches the controller output without raising
+    c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=1)
+    c.update(True, _cs(20.0, 1.0), VM, _vp(), False, float('nan'), None, False, 0.2)

@@ -34,7 +34,8 @@ Nothing here is validated on the car.
 """
 import math
 
-from opendbc.car.hyundai.values import CAR, INSTER_STEER_FULL_SCALE, INSTER_STEER_MAX
+from opendbc.car.hyundai.values import CAR, INSTER_STEER_FULL_SCALE, INSTER_STEER_MAX, CarControllerParams
+from opendbc.car.lateral import apply_driver_steer_torque_limits
 from openpilot.common.pid import PIDController
 
 # Full-scale command the table and the friction term are expressed in (actuators.torque 1.0; opendbc INSTER_STEER_FULL_SCALE).
@@ -251,14 +252,18 @@ class InsterStictionFriction:
 #        R(v) = VM.get_steer_from_curvature(1.0, v, 0.0) (rad per 1/m) and v0's roll-compensated measured curvature (angle_error()).
 #   p  = kp(v) e,   i += ki(v) e dt   (v = vEgo in m/s; p and i in v0's lateral-acceleration units, m/s^2; kp, ki quadratic in v,
 #   clipped at >= 0, no speed hold above 130 km/h (owner's choice))
-# The integrator runs from standstill; it freezes only while steeringPressed or steer-limited by safety (v0's flag, which also covers
-# the 3 / 5 raw ramp), and it is reset whenever lateral control is inactive (v0 keeps its own integrator, but F's can be wound at low
-# speed, which v0's cannot: without the reset it would come back as a command towards the old curve on re-engagement).
+# The integrator runs from standstill; it freezes while steeringPressed or when the car-side limiter (cap, 3 / 5 raw ramp, driver rule)
+# held the last request back in the direction of this step's update (since 29 Oct 2026, see freeze_angle_integrator below; before:
+# controlsd's steer_limited_by_safety flag in both directions), and it is reset whenever lateral control is inactive (v0 keeps its own
+# integrator, but F's can be wound at low speed, which v0's cannot: without the reset it would come back as a command towards the old
+# curve on re-engagement).
 # Anti-windup and output clip are common/pid.py's (InsterAnglePI is a PIDController with these gains).
-# Logs (controlsState.lateralControlState.torqueState) with F on: version = ANGLE_PI_G6_LOG_VERSION (PI) or ANGLE_PI_P6_LOG_VERSION
-# (PID) (v0 logs 0, the upstream controller 1; older drives: 100 / 101 F, 102 G2); error stays v0's lateral-acceleration error (setpoint -
-# measurement, m/s^2), p / i / d / f are in m/s^2 as in v0 (d is 0 except with the PID). F's own error is e = p / kp(vEgo) (rad, + right;
-# kp of the gain set in force, > 0 at every speed the car drives), or recomputed from carState steeringAngleDeg, liveParameters
+# Logs (controlsState.lateralControlState.torqueState) with F on: version = angle_pi_log_version(): PI 64103, PID 80104, with option 5
+# 72103 / 88104 (base ANGLE_PI_G6_LOG_VERSION / ANGLE_PI_P6_LOG_VERSION + 1000 x mask bits; bit 64 = the freeze rule since 29 Oct 2026;
+# drives before it: 103 / 16104 / 8103 / 24104) (v0 logs 0, the upstream controller 1; older drives: 100 / 101 F, 102 G2); error stays
+# v0's lateral-acceleration error (setpoint - measurement, m/s^2), p / i / d / f are in m/s^2 as in v0 (d is 0 except with the PID).
+# F's own error is e = p / kp(vEgo) (rad, + right; kp of the gain set in force, > 0 at every speed the car drives), or recomputed from
+# carState steeringAngleDeg, liveParameters
 # angleOffsetDeg / roll / steerRatio / stiffnessFactor and controlsState desiredCurvature with angle_error() (with option 5, version
 # bit 8: p / kp = sigma e; use angle_error()).
 # History, for reading older logs (no longer selectable since 29 Oct 2026): version 100 = F (kp 4.3447 + 0.40366 v - 0.0072954 v^2,
@@ -310,14 +315,72 @@ ANGLE_PI_VERSION_SOFT_P_BIT = 8
 
 
 def angle_pi_log_version(controller: int, soft_p: bool) -> int:
-  """torqueState.version with F on: the controller type's base + 1000 x mask (D bit with the PID, option-5 bit)"""
+  """torqueState.version with F on: the controller type's base + 1000 x mask (D bit with the PID, option-5 bit, freeze-rule bit 64)"""
   if controller == LATERAL_PID:
     base, mask = ANGLE_PI_P6_BASE_VERSION, ANGLE_PI_VERSION_D_BIT
   else:
     base, mask = ANGLE_PI_G6_LOG_VERSION, 0
   if soft_p:
     mask |= ANGLE_PI_VERSION_SOFT_P_BIT
-  return base + 1000 * mask
+  return base + 1000 * (mask | ANGLE_PI_VERSION_FREEZE_DIR_BIT)
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# Integrator freeze of the steering-angle controller (PI and PID, with or without option 5; owner 29 Oct 2026: a fix for every variant).
+# Before (versions without bit 64): frozen while controlsd's steer_limited_by_safety or steeringPressed. controlsd sets the flag in
+# publish() from |actuators.torque - carOutput.actuatorsOutput.torque| > 0.01, but that carOutput belongs to a request about 2 frames
+# older (LOG: the car's command matches the request of 2 frames earlier in 81-86 % of active steps on three drives), so any request that
+# moves by more than ~2 raw per frame read as "limited" although no limiter acted; and it froze the integrator in both directions.
+# LOG (kit steps of 000000aa / a1 / 97): integrator frozen 56-67 % of active time (curves 78-82 %), ~20 points of it the lag alone.
+# Now: InsterSteerLimitObserver re-runs the car-side limiter (opendbc apply_driver_steer_torque_limits with the Inster's
+# CarControllerParams: 409 cap, ramp 3 up / 5 down, driver-torque rule) on this controller's own requests, so the limiting of a request
+# is known in the same frame; the integrator is frozen while the driver steers, or when the previous request was held back by more than
+# LIMIT_TOL_RAW and this step's integrator update would push the output further in that direction. Unwinding is always allowed (the
+# conditional integration form of anti-windup; common/pid.py's clip against the output limit stays). controlsd's flag still drives
+# pid_log.saturated and every other controller. Version bit 64 marks the rule in the logs.
+ANGLE_PI_VERSION_FREEZE_DIR_BIT = 64
+LIMIT_TOL_RAW = 1.5          # rounding (+-0.5 raw) and the limiter's driver-torque frame (one carState later on the car side)
+
+
+class InsterSteerLimitObserver:
+  """the car-side command for this controller's requests (CODE: hyundai carcontroller, apply_torque = apply_driver_steer_torque_limits(
+  round(actuators.torque x STEER_FULL_SCALE), apply_torque_last, steeringTorque, params); 0 while lateral control is inactive) and the
+  direction in which the last request was held back: +1 / -1 in actuators.torque sign, 0 if it passed within LIMIT_TOL_RAW."""
+
+  def __init__(self, ccp):
+    self.ccp = ccp
+    self.reset()
+
+  @classmethod
+  def for_car(cls, CP):
+    return cls(CarControllerParams(CP))
+
+  def reset(self) -> None:
+    self.apply_torque_last = 0
+    self.direction = 0
+
+  def update(self, torque: float, driver_torque: float) -> int:
+    if not math.isfinite(torque):
+      torque = 0.0              # controlsd replaces a non-finite actuators.torque by 0 after this update (its NaN guard)
+    if not math.isfinite(driver_torque):
+      driver_torque = 0.0
+    new_torque = int(round(torque * self.ccp.STEER_FULL_SCALE))
+    apply_torque = apply_driver_steer_torque_limits(new_torque, self.apply_torque_last, driver_torque, self.ccp)
+    self.apply_torque_last = apply_torque
+    gap = new_torque - apply_torque
+    self.direction = 1 if gap > LIMIT_TOL_RAW else (-1 if gap < -LIMIT_TOL_RAW else 0)
+    return self.direction
+
+
+def freeze_angle_integrator(steering_pressed: bool, limit_direction: int, e: float) -> bool:
+  """freeze of the steering-angle integrator for this step: while the driver steers, or when the previous request was held back in
+  the direction this step's integrator update pushes. e: the integrator input (wheel-angle error, rad, + right = output + right =
+  actuators.torque negative, so the update pushes actuators.torque by -sign(e) x ki x dt x |e|)."""
+  if steering_pressed:
+    return True
+  if limit_direction == 0 or e == 0.0:
+    return False
+  return (limit_direction > 0) == (e < 0.0)
 
 
 def soft_p_sigma(e: float, v_ego: float, r_rad: float, curvature_now: float, curvature_past: float) -> float:
