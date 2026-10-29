@@ -12,7 +12,8 @@ import pyray as rl
 
 from openpilot.common.basedir import BASEDIR
 from openpilot.selfdrive.ui.ui_state import ui_state
-from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_GAINS_PARAM, SOFT_P_PARAM, angle_pi_gain_set, is_inster
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import LATERAL_CONTROLLER_PARAM, SOFT_P_PARAM, angle_lateral_controller, \
+  is_inster
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.sunnypilot.lib.utils import NoElideButtonAction
@@ -118,32 +119,32 @@ class TorqueSettingsLayout(Widget):
     )
     self._inster_angle_pi_toggle = toggle_item_sp(
       param="InsterAngleErrorPI",
-      title=lambda: tr("Inster: Steering-Angle PI \"F\" (experimental)"),
-      description=lambda: tr("Hyundai Inster only. Replaces the torque controller's P and I with ones that act on the steering-wheel " +
-                             "angle error, with speed-dependent gains and a stronger integrator that also works at low speed. " +
+      title=lambda: tr("Inster: Steering-Angle Controller (experimental)"),
+      description=lambda: tr("Hyundai Inster only. Replaces the torque controller's P and I (and adds D with the PID) with a controller that acts on the " +
+                             "steering-wheel angle error, with speed-dependent gains and a stronger integrator that also works at low " +
+                             "speed; choose PI or PID below. " +
                              "Tuned in simulation with both Inster switches above on. Turning it on switches the Lateral Jerk " +
                              "Torque Controller off. Off by default."),
     )
     self._inster_angle_pi_gains = multiple_button_item_sp(
-      param=ANGLE_PI_GAINS_PARAM,
-      title=lambda: tr("Inster: Angle-PI Gain Set (experimental)"),
-      description=lambda: tr("Hyundai Inster only, with the steering-angle PI above on. G2: the default. G6: less P, more I; calmer " +
-                             "on straights and drifts wide less, but runs curves a little further inside and releases curve exits " +
-                             "slightly later. P6: PID; smaller, smoother corrections, less exit overshoot and closer to the line " +
-                             "in mid-speed curves; wider in slow tight turns, a little further inside on the motorway, and slightly " +
-                             "later exit release. Simulation only, not validated on the car."),
-      buttons=["G2", "G6", "P6"],
+      param=LATERAL_CONTROLLER_PARAM,
+      title=lambda: tr("Inster: Controller Type (experimental)"),
+      description=lambda: tr("Hyundai Inster only, with the steering-angle controller above on. PI (default): proportional and " +
+                             "integral action on the steering-wheel angle error. PID: the same plus a damping term on the measured " +
+                             "steering-angle rate (off while you steer); smaller, smoother corrections. Tuned in simulation only, " +
+                             "not validated on the car."),
+      buttons=["PI", "PID"],
       inline=False,
       button_width=250,
     )
-    # the gain set in force (also before the G6 bool's migration ran)
-    self._inster_angle_pi_gains.action_item.set_selected_button(angle_pi_gain_set(ui_state.params))
+    # the controller type in force (also before the old gain-set selector's migration ran)
+    self._inster_angle_pi_gains.action_item.set_selected_button(angle_lateral_controller(ui_state.params))
     self._inster_soft_p_toggle = toggle_item_sp(
       param=SOFT_P_PARAM,
-      title=lambda: tr("Inster: Soft Small-Error P, for P6 (experimental)"),
-      description=lambda: tr("Softer P for small errors on straights, stronger P in curves. In simulation (with P6) much calmer on " +
+      title=lambda: tr("Inster: Soft Small-Error P, for the PID (experimental)"),
+      description=lambda: tr("Softer P for small errors on straights, stronger P in curves. In simulation (with the PID) much calmer on " +
                              "straights; at 30-80 km/h slightly closer inside but wider outside; slightly more lateral offset on " +
-                             "straights and more exit overshoot. Fitted for P6. Not validated on the car. Off by default."),
+                             "straights and more exit overshoot. Fitted for the PID. Not validated on the car. Off by default."),
     )
 
     items = [
@@ -175,7 +176,7 @@ class TorqueSettingsLayout(Widget):
     for inster_toggle in inster_toggles:
       inster_toggle.set_visible(inster)
       inster_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
-    # gain set G2 / G6 / P6: a selector of the steering-angle PI, shown only while that is on (same change rules)
+    # controller type PI / PID: a selector of the steering-angle controller, shown only while that is on (same change rules)
     self._inster_angle_pi_gains.set_visible(inster and self._inster_angle_pi_toggle.action_item.get_state())
     self._inster_angle_pi_gains.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
     # option 5 (soft small-error P): under the selector, shown only while the steering-angle PI is on (same change rules)

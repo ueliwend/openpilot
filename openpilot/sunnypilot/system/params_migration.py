@@ -116,6 +116,22 @@ def _migrate_inster_angle_pi_gains(_params):
     cloudlog.exception(f"Error migrating InsterAngleErrorPIG6: {e}")
 
 
+def _migrate_inster_lateral_controller(_params):
+  # Hyundai Inster: the gain-set selector InsterAngleErrorPIGains (0 = G2, 1 = G6, 2 = P6) became the controller-type selector
+  # InsterLateralController (0 = PI = gains G6, 1 = PID = gains P6; G2 is no longer selectable): P6 -> 1, G2 / G6 / anything else
+  # -> 0, unless the new selector is already set. Runs after _migrate_inster_angle_pi_gains; the old key is removed either way.
+  try:
+    old = _params.get("InsterAngleErrorPIGains")
+    if old is not None:
+      if _params.get("InsterLateralController") is None:
+        new = 1 if old == 2 else 0
+        _params.put("InsterLateralController", new, block=True)
+        cloudlog.info(f"params_migration: InsterAngleErrorPIGains = {old} -> InsterLateralController = {new}")
+      _params.remove("InsterAngleErrorPIGains")
+  except Exception as e:
+    cloudlog.exception(f"Error migrating InsterAngleErrorPIGains: {e}")
+
+
 def run_migration(_params):
   # migrate OnroadScreenOffBrightness
   if _params.get("OnroadScreenOffBrightnessMigrated") != ONROAD_BRIGHTNESS_MIGRATION_VERSION:
@@ -156,5 +172,6 @@ def run_migration(_params):
   # seed the chestnut model slot from the pre-split single slot
   _migrate_model_bundle_slots(_params)
 
-  # Hyundai Inster: G6 bool -> angle-PI gain-set selector
+  # Hyundai Inster: G6 bool -> angle-PI gain-set selector -> controller-type selector (PI / PID), in this order
   _migrate_inster_angle_pi_gains(_params)
+  _migrate_inster_lateral_controller(_params)

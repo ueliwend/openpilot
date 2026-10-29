@@ -11,11 +11,11 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.common.pid import PIDController
 
-from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_G6_KI, ANGLE_PI_G6_KP, ANGLE_PI_GAINS_G6, \
-                                                                       ANGLE_PI_GAINS_P6, ANGLE_PI_LOG_VERSION, ANGLE_PI_P6_KD, \
-                                                                       ANGLE_PI_P6_KI, ANGLE_PI_P6_KP, SOFT_P_PARAM, InsterAnglePI, \
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_G6_KI, ANGLE_PI_G6_KP, ANGLE_PI_G6_LOG_VERSION, \
+                                                                       ANGLE_PI_P6_KD, ANGLE_PI_P6_KI, ANGLE_PI_P6_KP, LATERAL_PID, \
+                                                                       SOFT_P_PARAM, InsterAnglePI, \
                                                                        InsterStictionFriction, InsterWheelRateFilter, STEER_MAX_RAW, \
-                                                                       angle_error, angle_pi_gain_set, angle_pi_log_version, \
+                                                                       angle_error, angle_lateral_controller, angle_pi_log_version, \
                                                                        ff_lat_accel_equivalent, is_inster, soft_p_sigma
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_ext import LatControlTorqueExt
 
@@ -63,11 +63,10 @@ class LatControlTorque(LatControl):
     self.inster_friction = False
     self.inster_ff = False
     self.inster_angle_pi = False
-    self.inster_angle_pi_g6 = False
     self.inster_angle_pi_d = False
     self.inster_soft_p = False
     self.inster_plan_history = False
-    self.inster_angle_pi_version = ANGLE_PI_LOG_VERSION
+    self.inster_angle_pi_version = ANGLE_PI_G6_LOG_VERSION
     if is_inster(CP):
       self._init_inster(Params())
 
@@ -106,20 +105,17 @@ class LatControlTorque(LatControl):
       # P and I of "F" on the steering-wheel angle error replace v0's PID (same limits, feed-forward and output conversion)
       if not (friction and feedforward):
         cloudlog.warning("InsterAngleErrorPI was tuned with InsterStictionFriction and InsterSpeedFeedforward both on")
-      # gain set (selector InsterAngleErrorPIGains): G2 (version 102), G6 (103) or P6 = PID (16104); + 8000 with option 5
-      gain_set = angle_pi_gain_set(params)
-      self.inster_angle_pi_version = angle_pi_log_version(gain_set, self.inster_soft_p)
-      if self.inster_soft_p and gain_set != ANGLE_PI_GAINS_P6:
-        cloudlog.info("InsterSoftSmallErrorP: its parameters were fitted with gain set P6, not the one selected")
-      if gain_set == ANGLE_PI_GAINS_G6:
-        self.inster_angle_pi_g6 = True
-        self.pid = InsterAnglePI(rate=1 / self.dt, kp=ANGLE_PI_G6_KP, ki=ANGLE_PI_G6_KI)
-      elif gain_set == ANGLE_PI_GAINS_P6:
+      # controller type (selector InsterLateralController): PI = gains G6 (version 103) or PID = gains P6 (16104); + 8000 with option 5
+      controller = angle_lateral_controller(params)
+      self.inster_angle_pi_version = angle_pi_log_version(controller, self.inster_soft_p)
+      if self.inster_soft_p and controller != LATERAL_PID:
+        cloudlog.info("InsterSoftSmallErrorP: its parameters were fitted with the PID, not the PI selected")
+      if controller == LATERAL_PID:
         self.inster_angle_pi_d = True
         self.pid = InsterAnglePI(rate=1 / self.dt, kp=ANGLE_PI_P6_KP, ki=ANGLE_PI_P6_KI, kd=ANGLE_PI_P6_KD)
         self.inster_wheel_rate = InsterWheelRateFilter(self.dt)
       else:
-        self.pid = InsterAnglePI(rate=1 / self.dt)
+        self.pid = InsterAnglePI(rate=1 / self.dt, kp=ANGLE_PI_G6_KP, ki=ANGLE_PI_G6_KI)
       self.update_limits()
       self.extension._pid = self.pid
 
@@ -198,9 +194,9 @@ class LatControlTorque(LatControl):
       if self.inster_angle_pi:
         # Inster "F": P and I on the steering-wheel angle error (rad); integrator from standstill, frozen only while pressed or
         # limited by safety. pid_log.error stays v0's lateral-acceleration error; p and i stay in lateral-acceleration units.
-        angle_pi_rate = -measurement_rate   # unused (kd 0) with G2 / G6
+        angle_pi_rate = -measurement_rate   # unused (kd 0) with the PI
         if self.inster_angle_pi_d:
-          # P6: D on the measured wheel angle (rad, + right, the quantity e is built from): -d/dt LP2(theta_meas), every active step;
+          # PID: D on the measured wheel angle (rad, + right, the quantity e is built from): -d/dt LP2(theta_meas), every active step;
           # 0 while the driver steers (the filter keeps running)
           wheel_rate = self.inster_wheel_rate.update(VM.get_steer_from_curvature(1.0, CS.vEgo, 0.0) * measured_curvature)
           angle_pi_rate = 0.0 if CS.steeringPressed else -wheel_rate

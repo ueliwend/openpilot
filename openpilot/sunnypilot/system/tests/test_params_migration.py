@@ -7,7 +7,8 @@ See the LICENSE.md file in the root directory for more details.
 
 from openpilot.common.params import Params
 from openpilot.common.test import OpenpilotTestCase
-from openpilot.sunnypilot.system.params_migration import _migrate_inster_angle_pi_gains, _migrate_model_bundle_slots, run_migration
+from openpilot.sunnypilot.system.params_migration import _migrate_inster_angle_pi_gains, _migrate_inster_lateral_controller, \
+  _migrate_model_bundle_slots, run_migration
 
 
 class TestModelBundleSlotMigration(OpenpilotTestCase):
@@ -64,7 +65,44 @@ class TestInsterAnglePIGainsMigration(OpenpilotTestCase):
     assert params.get("InsterAngleErrorPIGains") == 2 and params.get("InsterAngleErrorPIG6") is None
 
   def test_runs_from_run_migration(self):
+    # the full chain: G6 bool -> gain-set selector 1 -> controller type PI (0); both old keys removed
     params = Params()
     params.put_bool("InsterAngleErrorPIG6", True, block=True)
     run_migration(params)
-    assert params.get("InsterAngleErrorPIGains") == 1 and params.get("InsterAngleErrorPIG6") is None
+    assert params.get("InsterLateralController") == 0
+    assert params.get("InsterAngleErrorPIGains") is None and params.get("InsterAngleErrorPIG6") is None
+
+
+class TestInsterLateralControllerMigration(OpenpilotTestCase):
+  """Hyundai Inster: the gain-set selector InsterAngleErrorPIGains (0 = G2, 1 = G6, 2 = P6) became the controller-type selector
+  InsterLateralController (0 = PI = G6, 1 = PID = P6)"""
+
+  def test_mapping(self):
+    for old, new in ((0, 0), (1, 0), (2, 1), (7, 0), (-1, 0)):
+      params = Params()
+      params.remove("InsterLateralController")
+      params.put("InsterAngleErrorPIGains", old, block=True)
+      _migrate_inster_lateral_controller(params)
+      assert params.get("InsterLateralController") == new, old
+      assert params.get("InsterAngleErrorPIGains") is None
+      _migrate_inster_lateral_controller(params)                  # idempotent
+      assert params.get("InsterLateralController") == new, old
+
+  def test_unset_leaves_new_selector_unset(self):
+    params = Params()
+    _migrate_inster_lateral_controller(params)
+    assert params.get("InsterLateralController") is None
+    assert params.get("InsterLateralController", return_default=True) == 0   # default PI
+
+  def test_new_selector_already_set_wins(self):
+    params = Params()
+    params.put("InsterLateralController", 1, block=True)
+    params.put("InsterAngleErrorPIGains", 0, block=True)
+    _migrate_inster_lateral_controller(params)
+    assert params.get("InsterLateralController") == 1 and params.get("InsterAngleErrorPIGains") is None
+
+  def test_p6_from_run_migration(self):
+    params = Params()
+    params.put("InsterAngleErrorPIGains", 2, block=True)
+    run_migration(params)
+    assert params.get("InsterLateralController") == 1 and params.get("InsterAngleErrorPIGains") is None
