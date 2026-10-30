@@ -37,8 +37,8 @@ from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_VERSION_SOFT_P_BIT, SOFT_P_A0, SOFT_P_E0, SOFT_P_GAMMA, \
                                                                        SOFT_P_PARAM, SOFT_P_RHO, SOFT_P_V_MIN, angle_pi_log_version, \
                                                                        soft_p_sigma
-from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import A_NODES, CMD_RAW, F0, \
-                                                                       SCALE_CLIP, STEER_MAX_RAW, V_NODES, InsterAnglePI, InsterStictionFriction, \
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import A_NODES, ANGLE_PI_VERSION_FIXED_FACTOR_BIT, CMD_RAW, F0, \
+                                                                       INSTER_FIXED_FACTOR, STEER_MAX_RAW, V_NODES, InsterAnglePI, InsterStictionFriction, \
                                                                        angle_error, angle_pi_gain, ff_lat_accel_equivalent, ff_torque, \
                                                                        table_torque
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import CRAWL_PER_M_RELEASE, CRAWL_PLAN_RELEASE_SPEED, CRAWL_PLAN_SPEED, \
@@ -94,14 +94,13 @@ class TestInsterTable(OpenpilotTestCase):
   def test_zero_at_zero(self):
     for v in SPEEDS:
       assert table_torque(0.0, v) == 0.0
-      assert ff_torque(0.0, v, 2.8) == 0.0
-      assert ff_lat_accel_equivalent(0.0, v, 2.8) == 0.0
+      assert ff_torque(0.0, v) == 0.0
+      assert ff_lat_accel_equivalent(0.0, v, F0) == 0.0
 
   def test_odd(self):
     for v in SPEEDS:
       for a in ACCELS:
-        for f in (1.0, 2.8, 3.7):
-          assert ff_torque(-a, v, f) == -ff_torque(a, v, f)
+        assert ff_torque(-a, v) == -ff_torque(a, v)
 
   def test_monotone_in_lateral_accel(self):
     for v in SPEEDS:
@@ -117,23 +116,20 @@ class TestInsterTable(OpenpilotTestCase):
   def test_bounded(self):
     for v in SPEEDS:
       for a in ACCELS + [10.0, 100.0]:
-        for f in (0.0, 0.5, 2.8, 10.0):
-          assert abs(ff_torque(a, v, f)) <= 409 / 384
-          assert abs(ff_torque(-a, v, f)) <= 409 / 384
+        assert abs(ff_torque(a, v)) <= 409 / 384
+        assert abs(ff_torque(-a, v)) <= 409 / 384
 
   def test_clamped_outside_speed_nodes(self):
     for a in ACCELS:
       assert table_torque(a, 1.0) == table_torque(a, V_NODES[0])
       assert table_torque(a, 40.0) == table_torque(a, V_NODES[-1])
 
-  def test_scale_clip(self):
+  def test_table_read_unscaled(self):
+    # 30 Oct 2026: the table is read as measured, no scaling by a learned factor
     for v in (5.0, 12.0, 25.0):
       for a in (0.1, 0.6, 1.3, 2.2):
-        assert ff_torque(a, v, F0) == table_torque(a, v)
-        assert ff_torque(a, v, 3.0) == table_torque(a * (F0 / 3.0), v)             # inside the clip: scaled by F0 / factor
-        assert ff_torque(a, v, 1.0) == table_torque(a * SCALE_CLIP[1], v)          # factor far below F0: at most +15 %
-        assert ff_torque(a, v, 0.0) == table_torque(a * SCALE_CLIP[1], v)
-        assert ff_torque(a, v, 10.0) == table_torque(a * SCALE_CLIP[0], v)         # factor far above F0: at most -15 %
+        assert ff_torque(a, v) == table_torque(a, v)
+        assert ff_torque(-a, v) == -table_torque(a, v)
 
   def test_smooth_in_lateral_accel(self):
     # the rule the table is built and refit by (t2_table409): below the cap, neighbouring slopes in a differ by at most x2.5 up and
@@ -144,17 +140,15 @@ class TestInsterTable(OpenpilotTestCase):
         if row[i + 2] < INSTER_STEER_MAX and s[i] > 0.0:
           assert 0.4 - 0.01 <= s[i + 1] / s[i] <= 2.5 + 0.01, (row, i)
 
-  def test_logged_learner_range_inside_scale_clip(self):
-    # learned factor logged on the table drives 22-26 Oct 2026 (torqued, per minute): filtered 2.679 .. 3.064 (what controlsd passes),
-    # raw 2.551 .. 3.123; the clip must not cut any of them, so the table follows the learner one to one in that range
-    for f in (2.551, 2.679, 3.064, 3.123):
-      assert SCALE_CLIP[0] < F0 / f < SCALE_CLIP[1]
+  def test_fixed_factor_is_f0(self):
+    # the Inster path's one conversion constant (the closed-loop simulator's factor)
+    assert INSTER_FIXED_FACTOR == F0 == 2.8
 
   def test_lat_accel_equivalent(self):
     for v in (5.0, 20.0):
       for a in (-2.0, -0.3, 0.4, 1.7):
         for f in (2.0, 2.8, 3.7):
-          assert ff_lat_accel_equivalent(a, v, f) == f * ff_torque(a, v, f)
+          assert ff_lat_accel_equivalent(a, v, f) == f * ff_torque(a, v)      # unit conversion only: the query is not scaled
 
 
 class TestInsterStictionFriction(OpenpilotTestCase):
@@ -446,8 +440,7 @@ class TestInsterSteerCap(OpenpilotTestCase):
     assert all(0.0 <= c <= INSTER_STEER_MAX for row in CMD_RAW for c in row)
     for v in SPEEDS:
       for a in ACCELS + [10.0]:
-        for f in (1.0, 2.8, 3.7):
-          assert abs(ff_torque(a, v, f)) * STEER_MAX_RAW <= INSTER_STEER_MAX + 1e-9
+        assert abs(ff_torque(a, v)) * STEER_MAX_RAW <= INSTER_STEER_MAX + 1e-9
     assert inster_lateral.FRICTION_MAX < INSTER_STEER_MAX
 
   def test_ceiling(self):
@@ -599,6 +592,7 @@ class TestInsterAnglePI(OpenpilotTestCase):
         e = self._check_rule(c, CS, VM, params, ld, dc, i_prev)
         frozen += freeze_angle_integrator(CS.steeringPressed, ld, e)
         assert abs(tq) <= CAP + 1e-12
+        assert c.torque_params.latAccelFactor == F0_STORED    # fixed factor: the learner's 2.5-3.1 above is not used
         assert tq == -c.pid.control / c.torque_params.latAccelFactor
         # logs: p / i in lateral-acceleration units, error stays v0's lateral-acceleration error
         assert lac_log.p == np.float32(c.pid.p) and lac_log.i == np.float32(c.pid.i)
@@ -691,12 +685,12 @@ class TestInsterAnglePI(OpenpilotTestCase):
     assert first["F"][3] == angle_pi_log_version(LATERAL_PI, False)
 
   def test_log_version(self):
-    # F drives are identifiable in the logs: torqueState.version 64105 with F on and the selector unset (PI = PI-30Oct base 105 +
-    # freeze-rule bit 64; 29 Oct 2026 with G6 64103; before the freeze fix 103; older drives: 102 G2, 101 F's gains with the crawl
-    # plan, 100 before it), 0 for v0 otherwise (upstream: 1)
-    assert ANGLE_PI_G6_LOG_VERSION == 103 and ANGLE_PI_VERSION_FREEZE_DIR_BIT == 64
+    # F drives are identifiable in the logs: torqueState.version 320105 with F on and the selector unset (PI = PI-30Oct base 105 +
+    # 1000 x (freeze-rule bit 64 | fixed-factor bit 256); 30 Oct 2026 before the fixed factor 320105, 29 Oct 2026 with G6 64103; before
+    # the freeze fix 103; older drives: 102 G2, 101 F's gains with the crawl plan, 100 before it), 0 for v0 otherwise (upstream: 1)
+    assert ANGLE_PI_G6_LOG_VERSION == 103 and ANGLE_PI_VERSION_FREEZE_DIR_BIT == 64 and ANGLE_PI_VERSION_FIXED_FACTOR_BIT == 256
     assert ANGLE_PI_G6_LOG_VERSION not in (latcontrol_torque_v0.VERSION, 1)
-    for on, expected in ((INSTER_KEYS, 64105), ((ANGLE_PI_KEY,), 64105), (STEP2_KEYS, 0), ((), 0),
+    for on, expected in ((INSTER_KEYS, 320105), ((ANGLE_PI_KEY,), 320105), (STEP2_KEYS, 0), ((), 0),
                          (INSTER_KEYS + ("NeuralNetworkLateralControl",), 0)):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
       for active in (True, False):
@@ -728,10 +722,13 @@ class TestInsterAnglePI(OpenpilotTestCase):
     assert -CAP + 0.1 < tq
 
   def test_alone_replaces_only_p_and_i(self):
-    # F with both step-2 switches off: v0's linear feed-forward and get_friction (on v0's lateral-acceleration error) stay
+    # F with both step-2 switches off: v0's linear feed-forward and get_friction (on v0's lateral-acceleration error) stay; compared
+    # with v0 at the Inster path's fixed factor F0 (with a switch on, the learned factor is not used: TestInsterFixedFactor)
     c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=(ANGLE_PI_KEY,))
     assert not c.inster_friction and not c.inster_ff and c.inster_angle_pi
     base, VM_base = _make_v0(HYUNDAI.HYUNDAI_INSTER)
+    base_update = base.update_torque_parameters
+    base.update_torque_parameters = lambda factor, offset, friction: base_update(F0, offset, friction)
     with mock.patch.object(latcontrol_torque_v0, "get_friction", wraps=latcontrol_torque_v0.get_friction) as gf:
       a = _run(c, VM)
       assert gf.call_count > 0
@@ -871,11 +868,11 @@ class TestInsterAnglePIG6(OpenpilotTestCase):
     assert Params().get_bool("LateralJerkTorqueController")
 
   def test_log_version(self):
-    # PI drives are identifiable in the logs: torqueState.version 64105 (PI-30Oct base 105 + freeze-rule bit 64; G6: 64103 on
-    # 29 Oct 2026, 103 before the freeze fix), 0 for v0
+    # PI drives are identifiable in the logs: torqueState.version 320105 (PI-30Oct base 105 + 1000 x (freeze-rule bit 64 | fixed-factor
+    # bit 256); G6: 64103 on 29 Oct 2026, 103 before the freeze fix), 0 for v0
     # (upstream: 1); 102 (G2) is no longer produced
     assert ANGLE_PI_G6_LOG_VERSION == 103
-    for on, expected in ((INSTER_KEYS + (G6_KEY,), 64105), ((ANGLE_PI_KEY, G6_KEY), 64105), (INSTER_KEYS, 64105), ((ANGLE_PI_KEY,), 64105),
+    for on, expected in ((INSTER_KEYS + (G6_KEY,), 320105), ((ANGLE_PI_KEY, G6_KEY), 320105), (INSTER_KEYS, 320105), ((ANGLE_PI_KEY,), 320105),
                          (STEP2_KEYS + (G6_KEY,), 0), ((G6_KEY,), 0), (INSTER_KEYS + (G6_KEY, "NeuralNetworkLateralControl"), 0)):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
       for active in (True, False):
@@ -960,7 +957,7 @@ class TestInsterGainSets30Oct(OpenpilotTestCase):
     assert (ANGLE_PI_PI_BASE_VERSION, ANGLE_PI_PID_BASE_VERSION) == (105, 106)
     assert ANGLE_PI_PI_BASE_VERSION not in (ANGLE_PI_G6_LOG_VERSION, ANGLE_PI_P6_BASE_VERSION, 100, 101, 102)
     assert ANGLE_PI_PID_BASE_VERSION not in (ANGLE_PI_G6_LOG_VERSION, ANGLE_PI_P6_BASE_VERSION, 100, 101, 102)
-    expected = {(0, False): 64105, (1, False): 80106, (0, True): 72105, (1, True): 88106}
+    expected = {(0, False): 320105, (1, False): 336106, (0, True): 328105, (1, True): 344106}
     for (ctrl, soft), version in expected.items():
       assert angle_pi_log_version(ctrl, soft) == version
 
@@ -1026,9 +1023,9 @@ class TestInsterLateralController(OpenpilotTestCase):
     params.remove(CTRL_KEY)
     params.remove(GAINS_KEY)
     assert params.get(CTRL_KEY, return_default=True) == LATERAL_PI       # the UI's default
-    for ctrl, legacy_gains, kp, ki, kd, version in ((0, None, CAR_PI_KP, CAR_PI_KI, None, 64105), (1, None, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD, 80106),
-                                                    (None, None, CAR_PI_KP, CAR_PI_KI, None, 64105), (None, 0, CAR_PI_KP, CAR_PI_KI, None, 64105),
-                                                    (None, 2, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD, 80106)):
+    for ctrl, legacy_gains, kp, ki, kd, version in ((0, None, CAR_PI_KP, CAR_PI_KI, None, 320105), (1, None, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD, 336106),
+                                                    (None, None, CAR_PI_KP, CAR_PI_KI, None, 320105), (None, 0, CAR_PI_KP, CAR_PI_KI, None, 320105),
+                                                    (None, 2, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD, 336106)):
       for on in ((ANGLE_PI_KEY,), INSTER_KEYS):
         c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl, legacy_gains=legacy_gains)
         assert c.inster_angle_pi and (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (kp, ki, kd)
@@ -1078,10 +1075,11 @@ class TestInsterLateralController(OpenpilotTestCase):
       assert (pi.k_p, pi.k_i, pi.k_d) == (angle_pi_gain(P6_KP, v), angle_pi_gain(P6_KI, v), angle_pi_gain(P6_KD, v))
 
   def test_versions(self):
-    # base versions (before the freeze fix the logged values); logged now with the freeze-rule bit 64: PI 64105, PID 80106
+    # base versions (before the freeze fix the logged values); logged now with the freeze-rule bit 64 and the fixed-factor bit 256:
+    # PI 320105, PID 336106 (gain sets PI-30Oct / PID-30Oct)
     assert (ANGLE_PI_G6_LOG_VERSION, ANGLE_PI_P6_LOG_VERSION) == (103, 16104)
     assert ANGLE_PI_P6_LOG_VERSION == ANGLE_PI_P6_BASE_VERSION + 1000 * ANGLE_PI_VERSION_D_BIT and ANGLE_PI_VERSION_D_BIT == 16
-    for on, ctrl, expected in ((INSTER_KEYS, 1, 80106), ((ANGLE_PI_KEY,), 1, 80106), (INSTER_KEYS, 0, 64105), (INSTER_KEYS, None, 64105),
+    for on, ctrl, expected in ((INSTER_KEYS, 1, 336106), ((ANGLE_PI_KEY,), 1, 336106), (INSTER_KEYS, 0, 320105), (INSTER_KEYS, None, 320105),
                                (STEP2_KEYS, 1, 0), ((), 1, 0), (INSTER_KEYS + ("NeuralNetworkLateralControl",), 1, 0)):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl)
       for active in (True, False):
@@ -1239,13 +1237,16 @@ class TestInsterSoftSmallErrorP(OpenpilotTestCase):
 
   def test_versions(self):
     assert ANGLE_PI_VERSION_SOFT_P_BIT == 8 and ANGLE_PI_VERSION_D_BIT == 16
-    expected = {(0, False): 64105, (1, False): 80106, (0, True): 72105, (1, True): 88106}     # incl. the freeze-rule bit 64
+    # incl. the freeze-rule bit 64 and the fixed-factor bit 256 (128 stays free)
+    expected = {(0, False): 320105, (1, False): 336106, (0, True): 328105, (1, True): 344106}
     for (ctrl, soft), version in expected.items():
       assert angle_pi_log_version(ctrl, soft) == version, (ctrl, soft)
+    always = ANGLE_PI_VERSION_FREEZE_DIR_BIT | ANGLE_PI_VERSION_FIXED_FACTOR_BIT
     assert angle_pi_log_version(LATERAL_PID, True) == ANGLE_PI_PID_BASE_VERSION + 1000 * (ANGLE_PI_VERSION_D_BIT | ANGLE_PI_VERSION_SOFT_P_BIT
-                                                                                         | ANGLE_PI_VERSION_FREEZE_DIR_BIT)
-    assert angle_pi_log_version(LATERAL_PID, False) == ANGLE_PI_PID_BASE_VERSION + 1000 * (ANGLE_PI_VERSION_D_BIT | ANGLE_PI_VERSION_FREEZE_DIR_BIT)
-    assert angle_pi_log_version(LATERAL_PI, False) == ANGLE_PI_PI_BASE_VERSION + 1000 * ANGLE_PI_VERSION_FREEZE_DIR_BIT
+                                                                                         | always)
+    assert angle_pi_log_version(LATERAL_PID, False) == ANGLE_PI_PID_BASE_VERSION + 1000 * (ANGLE_PI_VERSION_D_BIT | always)
+    assert angle_pi_log_version(LATERAL_PI, False) == ANGLE_PI_PI_BASE_VERSION + 1000 * always
+    assert not any(angle_pi_log_version(ctrl, soft) // 1000 & 128 for ctrl, soft in expected)
     for (ctrl, soft), version in expected.items():
       for on in (INSTER_KEYS, (ANGLE_PI_KEY,)):
         c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on + ((O5_KEY,) if soft else ()), ctrl=ctrl)
@@ -1266,6 +1267,10 @@ class TestInsterSoftSmallErrorP(OpenpilotTestCase):
         return k % 11 == 5
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on + (O5_KEY,), ctrl=ctrl)
       ref, VM_ref = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl)
+      # the same limit directions for both: the car-side ramp sees different outputs (P differs), so the real observer would freeze
+      # them on different steps (at the fixed factor F0 this drive touches the 3 raw / step ramp)
+      for x in (c, ref):
+        x.inster_limit_observer = _ScriptedLimit(lambda n: (0, 0, 1, 0, 0, -1, 0)[n % 7])
       VM.update_params(1.0, 14.0)
       VM_ref.update_params(1.0, 14.0)
       a = _o5_drive(c, VM, 2500, limited)
@@ -1518,7 +1523,9 @@ class TestInsterIntegratorFreeze(OpenpilotTestCase):
         frozen.append(bool(c.pid.i == i_prev))
       assert not frozen[0]                                         # first step: nothing held back yet
       assert all(frozen[1:20])                                     # the ramp holds the request back in the push direction
-      assert not all(frozen) and not frozen[-1]                    # integrates again once the command is no longer held back
+      caught_up = frozen.index(False, 1)
+      assert caught_up < 100 and not any(frozen[caught_up:500])    # integrates again once the command is no longer held back
+      # (at the fixed factor F0 the integrator then drives the command to the 409 cap after ~550 steps: frozen there, by the cap)
       assert c.inster_limit_observer.apply_torque_last > 0         # wheel right of a straight plan: steering left (+)
     # v0 (steering-angle controller off) is unchanged: controlsd's flag still freezes its integrator
     off, VM_off = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=STEP2_KEYS)
@@ -1541,3 +1548,71 @@ class TestInsterIntegratorFreeze(OpenpilotTestCase):
     # and through update(): a non-finite desired curvature reaches the controller output without raising
     c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=1)
     c.update(True, _cs(20.0, 1.0), VM, _vp(), False, float('nan'), None, False, 0.2)
+
+
+F0_STORED = np.float32(F0)   # torque parameters are float32 (cereal)
+
+
+class TestInsterFixedFactor(OpenpilotTestCase):
+  """30 Oct 2026: with any Inster switch on, v0's lateral-acceleration factor is F0 for the whole path (P / I / D conversion, limits,
+  feed-forward, stiction): the output does not depend on the learned or the override factor; the learned offset still applies."""
+
+  def _drive(self, c, VM, factor, offset=0.04, override=None, n=1500):
+    if override is not None:
+      def _override(torque_params):
+        torque_params.latAccelFactor = override
+        torque_params.friction = 0.09
+        return True
+      c.extension.update_override_torque_params = _override
+    out = []
+    angle = 0.0
+    rng = random.Random(7)
+    for k in range(n):
+      t = k * DT_CTRL
+      v = max(0.0, 12.0 + 13.0 * math.sin(0.11 * t))
+      dc = 0.02 * math.sin(0.7 * t) + 0.01 * math.sin(2.9 * t)
+      target = math.degrees(VM.get_steer_from_curvature(-dc, v, 0.0))
+      rate = (target - angle) * 3.0 + rng.gauss(0, 5.0)
+      angle += rate * DT_CTRL
+      if k % 100 == 0:
+        c.update_torque_parameters(factor(t), offset, 0.09)
+        c.extension.update_limits()
+      tq, _, lac_log = c.update(not (900 <= k < 960), _cs(v, angle, pressed=(k % 700) < 25, rate=abs(rate)), VM,
+                                _vp(0.02 * math.sin(0.05 * t), 0.3), k % 41 == 0, dc, None, False, 0.2)
+      out.append((tq, lac_log.p, lac_log.i, lac_log.f, lac_log.output, lac_log.saturated))
+    return out
+
+  def test_output_invariant_to_learned_factor(self):
+    schedules = (lambda t: 2.6, lambda t: 3.7, lambda t: 2.8 + 0.6 * math.sin(0.02 * t))
+    for on, ctrl in ((("InsterStictionFriction",), None), (("InsterSpeedFeedforward",), None), (STEP2_KEYS, None),
+                     ((ANGLE_PI_KEY,), None), (INSTER_KEYS, None), (INSTER_KEYS, 1), (INSTER_KEYS + (O5_KEY,), 1)):
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl)
+      assert c.inster_fixed_factor and c.torque_params.latAccelFactor == F0_STORED
+      ref = self._drive(c, VM, lambda t: F0)
+      for factor in schedules:
+        c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl)
+        assert self._drive(c, VM, factor) == ref, on
+        assert c.torque_params.latAccelFactor == F0_STORED and c.torque_params.latAccelOffset == np.float32(0.04)
+        assert abs(c.pid.pos_limit / F0 - CAP) < 1e-6                    # limits at 409 / 384 through F0
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl)
+      assert self._drive(c, VM, lambda t: F0, override=3.7) == ref, on   # the override factor is ignored too
+      assert c.torque_params.latAccelFactor == F0_STORED and c.torque_params.friction == np.float32(0.09)
+
+  def test_learned_offset_kept(self):
+    c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=1)
+    ref = self._drive(c, VM, lambda t: F0, n=400)
+    c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=1)
+    assert self._drive(c, VM, lambda t: F0, offset=0.3, n=400) != ref
+    assert c.torque_params.latAccelOffset == np.float32(0.3)
+
+  def test_learner_factor_elsewhere(self):
+    # other cars, the Inster with every switch off or with NNLC: v0 keeps the learned factor
+    for car_name, on in ((HYUNDAI.HYUNDAI_KONA_EV, INSTER_KEYS), (HYUNDAI.HYUNDAI_INSTER, ()),
+                         (HYUNDAI.HYUNDAI_INSTER, INSTER_KEYS + ("NeuralNetworkLateralControl",))):
+      outs = []
+      for f in (2.6, 3.7):
+        c, VM = _make_v0(car_name, on=on)
+        assert not c.inster_fixed_factor
+        outs.append(self._drive(c, VM, lambda t, f=f: f, n=400))
+        assert c.torque_params.latAccelFactor == np.float32(f)
+      assert outs[0] != outs[1], (car_name, on)

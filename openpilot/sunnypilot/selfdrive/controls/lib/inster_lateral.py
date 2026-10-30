@@ -11,7 +11,8 @@ and a small stateful filter class.
   * Speed feed-forward table (switch InsterSpeedFeedforward): ff_torque() gives the steering command the Inster needs to hold a
     lateral acceleration at a given speed, from a measured table, instead of v0's single linear factor. v0 uses it only for its
     feed-forward, expressed back in lateral-acceleration units (ff_lat_accel_equivalent), so P, I, the limits and the output
-    conversion stay linear and unchanged.
+    conversion stay linear. With any Inster switch on, v0's lateral-acceleration factor is fixed at F0 (learner ignored for the
+    factor, see INSTER_FIXED_FACTOR below); the table is read without any factor scaling.
   * Stiction friction term (switch InsterStictionFriction): InsterStictionFriction replaces v0's get_friction(). It pushes the wheel
     in the direction the plan wants it to move, smoothly (no dead zone, no hysteresis), with an amplitude matched to the Inster's
     measured steering friction, and lets go of the held torque early when the plan starts to unwind.
@@ -111,8 +112,14 @@ CMD_RAW = (                                                                # row
 # 23 Oct 2026: the 13 cells that were pinned at the old cap of 384 now run up to the new cap of 409 (torque-map extension of the owner's
 # route 0000007f at the 409 cap; agents/r7f_tmap/ff_table_409.json); every cell <= INSTER_STEER_MAX (tested). In raw units of the
 # full scale 384, so the 409 cells are 409 / 384 = 1.065 of full torque.
-F0 = 2.8                          # latAccelFactor at which the table is used as measured (the learner's value when it was built)
-SCALE_CLIP = (1.0 / 1.15, 1.15)   # bound on how far the learned factor can scale the table (the table is read at |a| * F0 / factor)
+# 30 Oct 2026 (owner's go for the over-turn fix, step 2): the table is no longer scaled by the learned factor. It was read at |a| x F0 /
+# factor (clipped +-15 %), but the table is fitted on a physical axis (EPS torque against v x yaw minus the gravity term; no factor), the
+# hands-off torque of the drives does not fall with a higher learned factor (LOG: correlation +0.22 / +0.66 at 32 km/h @ 0.5 / 48 km/h
+# @ 0.75 m/s^2 over 10-14 drives, factor 2.60-3.70), and the factor is learned from the car's own commands with this table in the loop.
+# At the factor 2.60 the learner gave after its reset with the 29 Oct update, the table was read 7.7 % high (over-turning at 15-30
+# km/h, drive 000000af), and P / I / D torque was 7.7 % above the simulator's (the factor swing seen, 2.60-3.70, spans +8 % to -24 %).
+# F0 is now the single conversion constant of the whole Inster path (INSTER_FIXED_FACTOR).
+F0 = 2.8                          # m/s^2 per unit torque: the Inster path's fixed lateral-acceleration factor (the simulator's value)
 _TAB = tuple(tuple(c / STEER_MAX_RAW for c in row) for row in CMD_RAW)
 
 
@@ -142,22 +149,27 @@ def table_torque(a_abs: float, v_ego: float) -> float:
   return c0 + (c1 - c0) * (a_abs - an[i]) / (an[i + 1] - an[i])
 
 
-def ff_torque(lateral_accel: float, v_ego: float, lat_accel_factor: float) -> float:
-  """Feed-forward torque (fraction of full torque, signed like lateral_accel) for a gravity-adjusted lateral acceleration (m/s^2).
-  The learned factor scales the table only within SCALE_CLIP around F0."""
-  scale = F0 / (lat_accel_factor if lat_accel_factor > 0.1 else 0.1)
-  scale = SCALE_CLIP[0] if scale < SCALE_CLIP[0] else (SCALE_CLIP[1] if scale > SCALE_CLIP[1] else scale)
+def ff_torque(lateral_accel: float, v_ego: float) -> float:
+  """Feed-forward torque (fraction of full torque, signed like lateral_accel) for a gravity-adjusted lateral acceleration (m/s^2):
+  the table, odd in the acceleration, no factor scaling."""
   if lateral_accel > 0.0:
-    return table_torque(lateral_accel * scale, v_ego)
+    return table_torque(lateral_accel, v_ego)
   if lateral_accel < 0.0:
-    return -table_torque(-lateral_accel * scale, v_ego)
+    return -table_torque(-lateral_accel, v_ego)
   return 0.0
 
 
 def ff_lat_accel_equivalent(lateral_accel: float, v_ego: float, lat_accel_factor: float) -> float:
-  """The table's feed-forward in v0's lateral-acceleration units (factor x torque): v0's linear torque_from_lateral_accel (/ factor)
-  then returns exactly the table torque for the feed-forward part."""
-  return lat_accel_factor * ff_torque(lateral_accel, v_ego, lat_accel_factor)
+  """The table's feed-forward in v0's lateral-acceleration units (factor x torque) for v0's factor in use (INSTER_FIXED_FACTOR on the
+  Inster path, as stored in v0's torque parameters): v0's linear torque_from_lateral_accel (/ factor) then returns exactly the table
+  torque for the feed-forward part. The factor only converts units; it does not scale the table query."""
+  return lat_accel_factor * ff_torque(lateral_accel, v_ego)
+
+
+# v0's lateral-acceleration factor while any Inster switch is in force (learned latAccelFactor ignored for the factor; latAccelOffset and
+# friction from the learner are kept): P / I / D -> torque, the output limits, the feed-forward and the stiction term all use it, as the
+# closed-loop simulator always did. Other cars and the Inster with every switch off keep the learner.
+INSTER_FIXED_FACTOR = F0
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -266,9 +278,10 @@ class InsterStictionFriction:
 # curve on re-engagement).
 # Anti-windup and output clip are common/pid.py's (InsterAnglePI is a PIDController with these gains).
 # Logs (controlsState.lateralControlState.torqueState) with F on: version = angle_pi_log_version(): PI 64105, PID 80106, with option 5
-# 72105 / 88106 since 30 Oct 2026 (gain sets PI-30Oct / PID-30Oct; base 105 / 106 + 1000 x mask bits; bit 64 = the freeze rule since
-# 29 Oct 2026); 29 Oct 2026 with G6 / P6: 64103 / 80104 / 72103 / 88104; drives before the freeze rule: 103 / 16104 / 8103 / 24104
-# (v0 logs 0, the upstream controller 1; older drives: 100 / 101 F, 102 G2); error stays
+# 72105 / 88106 for the gain sets PI-30Oct / PID-30Oct (base 105 / 106 + 1000 x mask bits; bit 64 = the freeze rule since 29 Oct 2026),
+# and with the fixed factor F0 (bit 256, since 30 Oct 2026, no learner factor) base + 1000 x (64 | 256): PI 320105, PID 336106, with
+# option 5 328105 / 344106; 29 Oct 2026 with G6 / P6: 64103 / 80104 / 72103 / 88104; drives before the freeze rule: 103 / 16104 /
+# 8103 / 24104 (v0 logs 0, the upstream controller 1; older drives: 100 / 101 F, 102 G2); error stays
 # v0's lateral-acceleration error (setpoint - measurement, m/s^2), p / i / d / f are in m/s^2 as in v0 (d is 0 except with the PID).
 # F's own error is e = p / kp(vEgo) (rad, + right; kp of the gain set in force, > 0 at every speed the car drives), or recomputed from
 # carState steeringAngleDeg, liveParameters
@@ -342,15 +355,16 @@ ANGLE_PI_VERSION_SOFT_P_BIT = 8
 
 
 def angle_pi_log_version(controller: int, soft_p: bool) -> int:
-  """torqueState.version with F on: the controller type's base + 1000 x mask (D bit with the PID, option-5 bit, freeze-rule bit 64).
-  Since 30 Oct 2026 (gain sets PI-30Oct / PID-30Oct): PI 64105, PID 80106, with option 5 72105 / 88106."""
+  """torqueState.version with F on: the controller type's base + 1000 x mask (D bit with the PID, option-5 bit, freeze-rule bit 64,
+  fixed-factor bit 256). Since 30 Oct 2026 (gain sets PI-30Oct / PID-30Oct, fixed factor): PI 320105, PID 336106, with option 5
+  328105 / 344106."""
   if controller == LATERAL_PID:
     base, mask = ANGLE_PI_PID_BASE_VERSION, ANGLE_PI_VERSION_D_BIT
   else:
     base, mask = ANGLE_PI_PI_BASE_VERSION, 0
   if soft_p:
     mask |= ANGLE_PI_VERSION_SOFT_P_BIT
-  return base + 1000 * (mask | ANGLE_PI_VERSION_FREEZE_DIR_BIT)
+  return base + 1000 * (mask | ANGLE_PI_VERSION_FREEZE_DIR_BIT | ANGLE_PI_VERSION_FIXED_FACTOR_BIT)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -367,6 +381,7 @@ def angle_pi_log_version(controller: int, soft_p: bool) -> int:
 # conditional integration form of anti-windup; common/pid.py's clip against the output limit stays). controlsd's flag still drives
 # pid_log.saturated and every other controller. Version bit 64 marks the rule in the logs.
 ANGLE_PI_VERSION_FREEZE_DIR_BIT = 64
+ANGLE_PI_VERSION_FIXED_FACTOR_BIT = 256   # 30 Oct 2026: fixed factor F0 on the Inster path (INSTER_FIXED_FACTOR); 128 is kept free
 LIMIT_TOL_RAW = 1.5          # rounding (+-0.5 raw) and the limiter's driver-torque frame (one carState later on the car side)
 
 

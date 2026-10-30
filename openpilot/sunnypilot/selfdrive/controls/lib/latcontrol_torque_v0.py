@@ -13,7 +13,7 @@ from openpilot.common.pid import PIDController
 
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_PI_KI, ANGLE_PI_PI_KP, ANGLE_PI_PI_BASE_VERSION, \
                                                                        ANGLE_PI_PID_KD, ANGLE_PI_PID_KI, ANGLE_PI_PID_KP, LATERAL_PID, \
-                                                                       SOFT_P_PARAM, InsterAnglePI, InsterSteerLimitObserver, \
+                                                                       INSTER_FIXED_FACTOR, SOFT_P_PARAM, InsterAnglePI, InsterSteerLimitObserver, \
                                                                        InsterStictionFriction, InsterWheelRateFilter, STEER_MAX_RAW, \
                                                                        angle_error, angle_lateral_controller, angle_pi_log_version, \
                                                                        freeze_angle_integrator, \
@@ -67,6 +67,7 @@ class LatControlTorque(LatControl):
     self.inster_angle_pi_d = False
     self.inster_soft_p = False
     self.inster_plan_history = False
+    self.inster_fixed_factor = False
     self.inster_angle_pi_version = ANGLE_PI_PI_BASE_VERSION
     if is_inster(CP):
       self._init_inster(Params(), CP)
@@ -83,6 +84,11 @@ class LatControlTorque(LatControl):
     self.inster_friction = friction
     self.inster_ff = feedforward
     self.inster_angle_pi = angle_pi
+    # fixed lateral-acceleration factor F0 for the whole Inster path (P / I / D conversion, limits, feed-forward, stiction): the learned
+    # and the override factor are ignored; the learned offset and friction stay (inster_lateral.py, INSTER_FIXED_FACTOR)
+    self.inster_fixed_factor = True
+    self.torque_params.latAccelFactor = INSTER_FIXED_FACTOR
+    self.update_limits()
     # option 5 (soft small-error P): only with F
     soft_p = params.get_bool(SOFT_P_PARAM)
     if soft_p and not angle_pi:
@@ -106,8 +112,9 @@ class LatControlTorque(LatControl):
       # P and I of "F" on the steering-wheel angle error replace v0's PID (same limits, feed-forward and output conversion)
       if not (friction and feedforward):
         cloudlog.warning("InsterAngleErrorPI was tuned with InsterStictionFriction and InsterSpeedFeedforward both on")
-      # controller type (selector InsterLateralController): PI = gains PI-30Oct (version 64105) or PID = gains PID-30Oct (80106); + 8000
-      # with option 5 (bit 64 = the integrator-freeze rule; G6 / P6 on 29 Oct 2026: 64103 / 80104; before the freeze rule: 103 / 16104)
+      # controller type (selector InsterLateralController): PI = gains PI-30Oct (version 320105) or PID = gains PID-30Oct (336106); + 8000
+      # with option 5 (bit 64 = the integrator-freeze rule, bit 256 = fixed factor; G6 / P6 on 29 Oct 2026: 64103 / 80104; before the
+      # freeze rule: 103 / 16104)
       controller = angle_lateral_controller(params)
       self.inster_angle_pi_version = angle_pi_log_version(controller, self.inster_soft_p)
       if self.inster_soft_p and controller != LATERAL_PID:
@@ -124,7 +131,7 @@ class LatControlTorque(LatControl):
       self.inster_limit_observer = InsterSteerLimitObserver.for_car(CP)
 
   def update_torque_parameters(self, latAccelFactor, latAccelOffset, friction):
-    self.torque_params.latAccelFactor = latAccelFactor
+    self.torque_params.latAccelFactor = INSTER_FIXED_FACTOR if self.inster_fixed_factor else latAccelFactor
     self.torque_params.latAccelOffset = latAccelOffset
     self.torque_params.friction = friction
     self.update_limits()
@@ -136,6 +143,8 @@ class LatControlTorque(LatControl):
   def update(self, active, CS, VM, params, steer_limited_by_safety, desired_curvature, calibrated_pose, curvature_limited, lat_delay):
     # Override torque params from extension
     if self.extension.update_override_torque_params(self.torque_params):
+      if self.inster_fixed_factor:
+        self.torque_params.latAccelFactor = INSTER_FIXED_FACTOR
       self.update_limits()
 
     if self.inster_plan_history:
