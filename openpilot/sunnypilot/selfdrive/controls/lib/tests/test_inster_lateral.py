@@ -29,6 +29,9 @@ from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_
                                                                        LATERAL_PID, ANGLE_PI_P6_BASE_VERSION, ANGLE_PI_P6_KD, \
                                                                        ANGLE_PI_P6_KI, ANGLE_PI_P6_KP, ANGLE_PI_P6_LOG_VERSION, \
                                                                        ANGLE_PI_VERSION_D_BIT, angle_lateral_controller
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_PI_BASE_VERSION, ANGLE_PI_PI_KI, ANGLE_PI_PI_KP, \
+                                                                       ANGLE_PI_PID_BASE_VERSION, ANGLE_PI_PID_KD, ANGLE_PI_PID_KI, \
+                                                                       ANGLE_PI_PID_KP
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_VERSION_FREEZE_DIR_BIT, LIMIT_TOL_RAW, \
                                                                        InsterSteerLimitObserver, freeze_angle_integrator
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_VERSION_SOFT_P_BIT, SOFT_P_A0, SOFT_P_E0, SOFT_P_GAMMA, \
@@ -552,7 +555,7 @@ class TestInsterAnglePI(OpenpilotTestCase):
     limiter in the direction of this update), anti-windup and clip as common/pid.py"""
     measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
     e = angle_error(VM, CS.vEgo, desired_curvature, measured_curvature)
-    kp, ki = angle_pi_gain(G6_KP, CS.vEgo), angle_pi_gain(G6_KI, CS.vEgo)   # selector unset: PI
+    kp, ki = angle_pi_gain(CAR_PI_KP, CS.vEgo), angle_pi_gain(CAR_PI_KI, CS.vEgo)   # selector unset: PI
     pid = c.pid
     assert pid.p == kp * e
     lim = pid.pos_limit
@@ -617,8 +620,8 @@ class TestInsterAnglePI(OpenpilotTestCase):
       e = angle_error(VM, v, 0.0, -VM.calc_curvature(math.radians(-5.0), v, 0.0))
       assert e < 0.0 and abs(e - math.radians(-5.0)) < 1e-12                                 # the plan is left of the wheel: e < 0
       # integrates from the first step at every speed (v0 freezes below 5 m/s)
-      assert abs(i_values[0] - angle_pi_gain(G6_KI, v) * DT_CTRL * e) < 1e-15
-      assert abs(i_values[-1] - 50 * angle_pi_gain(G6_KI, v) * DT_CTRL * e) < 1e-12
+      assert abs(i_values[0] - angle_pi_gain(CAR_PI_KI, v) * DT_CTRL * e) < 1e-15
+      assert abs(i_values[-1] - 50 * angle_pi_gain(CAR_PI_KI, v) * DT_CTRL * e) < 1e-12
     # v0 (switch off) keeps its freeze below 5 m/s
     off, VM_off = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=STEP2_KEYS)
     for _ in range(50):
@@ -688,12 +691,12 @@ class TestInsterAnglePI(OpenpilotTestCase):
     assert first["F"][3] == angle_pi_log_version(LATERAL_PI, False)
 
   def test_log_version(self):
-    # F drives are identifiable in the logs: torqueState.version 64103 with F on and the selector unset (PI = G6 base 103 + freeze-rule
-    # bit 64; before the freeze fix 103; older drives: 102 G2, 101 F's gains with the crawl plan, 100 before it), 0 for v0 otherwise
-    # (upstream: 1)
+    # F drives are identifiable in the logs: torqueState.version 64105 with F on and the selector unset (PI = PI-30Oct base 105 +
+    # freeze-rule bit 64; 29 Oct 2026 with G6 64103; before the freeze fix 103; older drives: 102 G2, 101 F's gains with the crawl
+    # plan, 100 before it), 0 for v0 otherwise (upstream: 1)
     assert ANGLE_PI_G6_LOG_VERSION == 103 and ANGLE_PI_VERSION_FREEZE_DIR_BIT == 64
     assert ANGLE_PI_G6_LOG_VERSION not in (latcontrol_torque_v0.VERSION, 1)
-    for on, expected in ((INSTER_KEYS, 64103), ((ANGLE_PI_KEY,), 64103), (STEP2_KEYS, 0), ((), 0),
+    for on, expected in ((INSTER_KEYS, 64105), ((ANGLE_PI_KEY,), 64105), (STEP2_KEYS, 0), ((), 0),
                          (INSTER_KEYS + ("NeuralNetworkLateralControl",), 0)):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
       for active in (True, False):
@@ -774,7 +777,7 @@ class TestInsterAnglePI(OpenpilotTestCase):
             c.pid.reset()
             c.inster_limit_observer.reset()                    # a fresh step: no request held back before it
             c.update(True, CS, VM, vp, False, desired_curvature, None, False, 0.2)
-            kp, ki = angle_pi_gain(G6_KP, v), angle_pi_gain(G6_KI, v)
+            kp, ki = angle_pi_gain(CAR_PI_KP, v), angle_pi_gain(CAR_PI_KI, v)
             assert abs(c.pid.p - kp * e) <= 1e-12 * max(1.0, abs(kp * e)), (kmh, desired_curvature, wheel_vs_plan, roll)
             i_new = ki * DT_CTRL * e                                  # first step from i = 0, then common/pid.py's anti-windup
             test, lim = c.pid.p + i_new + c.pid.f, c.pid.pos_limit
@@ -796,9 +799,9 @@ class TestInsterAnglePI(OpenpilotTestCase):
     CS = _cs(100 / 3.6, angle=1.0)                                                           # wheel 1 deg left of a straight plan
     _, _, lac_log = c.update(True, CS, VM, params, False, 0.0, None, False, 0.2)
     v = CS.vEgo
-    kp, ki = angle_pi_gain(G6_KP, v), angle_pi_gain(G6_KI, v)
-    assert abs(kp - 9.31) < 0.01 and abs(ki - 6.02) < 0.01                                  # the PI (G6) at 100 km/h
-    assert abs(c.pid.p - kp * math.radians(1.0)) < 1e-12                                     # 0.162 m/s^2
+    kp, ki = angle_pi_gain(CAR_PI_KP, v), angle_pi_gain(CAR_PI_KI, v)
+    assert abs(kp - 10.72) < 0.01 and abs(ki - 5.69) < 0.01                                  # the PI (PI-30Oct) at 100 km/h
+    assert abs(c.pid.p - kp * math.radians(1.0)) < 1e-12                                     # 0.187 m/s^2
     assert abs(c.pid.i - ki * math.radians(1.0) * DT_CTRL) < 1e-15
     # v0's lateral-acceleration error for the same 1 deg is (curvature error) x v^2: a different quantity
     lat_error = (0.0 + VM.calc_curvature(math.radians(1.0), v, 0.0)) * v ** 2
@@ -854,7 +857,7 @@ class TestInsterAnglePIG6(OpenpilotTestCase):
       for ctrl in (None, LATERAL_PI):
         c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl)
         assert c.inster_angle_pi and not c.inster_angle_pi_d and isinstance(c.pid, InsterAnglePI) and c.extension._pid is c.pid
-        assert (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (G6_KP, G6_KI, None), (on, ctrl)
+        assert (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (CAR_PI_KP, CAR_PI_KI, None), (on, ctrl)
     # the legacy G6 bool changes nothing any more (PI either way)
     assert _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (G6_KEY,))) == _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS))
     # G6 bool alone, with NNLC, or on another car: no effect (the run equals the one without the G6 param)
@@ -868,10 +871,11 @@ class TestInsterAnglePIG6(OpenpilotTestCase):
     assert Params().get_bool("LateralJerkTorqueController")
 
   def test_log_version(self):
-    # PI drives are identifiable in the logs: torqueState.version 64103 (103 + freeze-rule bit 64; 103 before the freeze fix), 0 for v0
+    # PI drives are identifiable in the logs: torqueState.version 64105 (PI-30Oct base 105 + freeze-rule bit 64; G6: 64103 on
+    # 29 Oct 2026, 103 before the freeze fix), 0 for v0
     # (upstream: 1); 102 (G2) is no longer produced
     assert ANGLE_PI_G6_LOG_VERSION == 103
-    for on, expected in ((INSTER_KEYS + (G6_KEY,), 64103), ((ANGLE_PI_KEY, G6_KEY), 64103), (INSTER_KEYS, 64103), ((ANGLE_PI_KEY,), 64103),
+    for on, expected in ((INSTER_KEYS + (G6_KEY,), 64105), ((ANGLE_PI_KEY, G6_KEY), 64105), (INSTER_KEYS, 64105), ((ANGLE_PI_KEY,), 64105),
                          (STEP2_KEYS + (G6_KEY,), 0), ((G6_KEY,), 0), (INSTER_KEYS + (G6_KEY, "NeuralNetworkLateralControl"), 0)):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
       for active in (True, False):
@@ -891,7 +895,7 @@ class TestInsterAnglePIG6(OpenpilotTestCase):
         c.pid.reset()
         c.inster_limit_observer.reset()
         c.update(True, CS, VM, _vp(), False, 0.0, None, False, 0.2)
-        kp, ki = angle_pi_gain(G6_KP, v), angle_pi_gain(G6_KI, v)
+        kp, ki = angle_pi_gain(CAR_PI_KP, v), angle_pi_gain(CAR_PI_KI, v)
         assert abs(c.pid.p - kp * e) <= 1e-12 * max(1.0, abs(kp * e)), kmh
         i_new = ki * DT_CTRL * e
         test, lim = c.pid.p + i_new + c.pid.f, c.pid.pos_limit
@@ -914,6 +918,56 @@ P6_KD = (0.361727, 0.000854274, -8.68703e-06)
 P6_KP_ANCHOR = (3.33059, 4.66290, 8.85715, 9.86483, 7.18209)
 P6_KI_ANCHOR = (0.93525, 2.07591, 5.45742, 5.50782, 2.20191)
 P6_KD_ANCHOR = (0.361727, 0.364033, 0.372751, 0.380152, 0.382535)
+
+# The gain sets the car runs since 30 Oct 2026 (owner: refined fits go to the car as soon as they exist): PI-30Oct / PID-30Oct = the
+# refined plateau centroids (4 simulator members, +-1 % jitter) of the PI / PID refits under the large-error objective with the
+# integrator-freeze rule of 29 Oct 2026; the search's coefficients at full precision and the 6-significant-digit values the car uses
+CAR_PI_KP_SEARCH = (3.9714508767002017, 0.5786595102717313, -0.012083981418475878)
+CAR_PI_KI_SEARCH = (0.9352500000000001, 0.4252513282125513, -0.009146448037856603)
+CAR_PID_KP_SEARCH = (3.5363805804058277, 0.6377225397370454, -0.012945495431809693)
+CAR_PID_KI_SEARCH = (0.93525, 0.472450086742904, -0.010106428772096797)
+CAR_PID_KD_SEARCH = (0.3999999999999999, -0.004485739014260417, 4.623027432735433e-05)
+CAR_PI_KP = (3.97145, 0.57866, -0.012084)
+CAR_PI_KI = (0.93525, 0.425251, -0.00914645)
+CAR_PID_KP = (3.53638, 0.637723, -0.0129455)
+CAR_PID_KI = (0.93525, 0.47245, -0.0101064)
+CAR_PID_KD = (0.4, -0.00448574, 4.62303e-05)
+
+
+class TestInsterGainSets30Oct(OpenpilotTestCase):
+  """the gain sets the car's PI / PID run since 30 Oct 2026 (PI-30Oct base version 105, PID-30Oct 106); G6 / P6 stay for older logs"""
+
+  def test_coded_gains(self):
+    assert (ANGLE_PI_PI_KP, ANGLE_PI_PI_KI) == (CAR_PI_KP, CAR_PI_KI)
+    assert (ANGLE_PI_PID_KP, ANGLE_PI_PID_KI, ANGLE_PI_PID_KD, ANGLE_PI_D_TAU) == (CAR_PID_KP, CAR_PID_KI, CAR_PID_KD, 0.03)
+    for full, coded, tol in ((CAR_PI_KP_SEARCH, CAR_PI_KP, 1e-5), (CAR_PI_KI_SEARCH, CAR_PI_KI, 2e-5), (CAR_PID_KP_SEARCH, CAR_PID_KP, 1e-5),
+                             (CAR_PID_KI_SEARCH, CAR_PID_KI, 3e-5), (CAR_PID_KD_SEARCH, CAR_PID_KD, 1e-6)):
+      assert coded == tuple(float(f"{c:.6g}") for c in full)
+      for v in np.linspace(0.0, 160 / 3.6, 1601):                      # rounding: within tol relative up to 160 km/h
+        assert abs(angle_pi_gain(coded, v) / angle_pi_gain(full, v) - 1.0) < tol, (coded, v)
+
+  def test_never_negative(self):
+    # kp > 0 below 194 km/h, ki > 0 below 174 km/h (clipped at 0 above), kd > 0 everywhere
+    for v in np.linspace(0.0, 200 / 3.6, 2001):
+      for c in (CAR_PI_KP, CAR_PI_KI, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD):
+        assert angle_pi_gain(c, v) >= 0.0
+      assert angle_pi_gain(CAR_PID_KD, v) > 0.0
+      if v < 174 / 3.6:
+        assert min(angle_pi_gain(c, v) for c in (CAR_PI_KP, CAR_PI_KI, CAR_PID_KP, CAR_PID_KI)) > 0.0
+    assert abs(angle_pi_gain(CAR_PID_KD, 0.0) - 0.4) < 1e-12
+
+  def test_versions(self):
+    assert (ANGLE_PI_PI_BASE_VERSION, ANGLE_PI_PID_BASE_VERSION) == (105, 106)
+    assert ANGLE_PI_PI_BASE_VERSION not in (ANGLE_PI_G6_LOG_VERSION, ANGLE_PI_P6_BASE_VERSION, 100, 101, 102)
+    assert ANGLE_PI_PID_BASE_VERSION not in (ANGLE_PI_G6_LOG_VERSION, ANGLE_PI_P6_BASE_VERSION, 100, 101, 102)
+    expected = {(0, False): 64105, (1, False): 80106, (0, True): 72105, (1, True): 88106}
+    for (ctrl, soft), version in expected.items():
+      assert angle_pi_log_version(ctrl, soft) == version
+
+  def test_car_runs_the_new_sets(self):
+    for ctrl, kp, ki, kd in ((0, CAR_PI_KP, CAR_PI_KI, None), (1, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD), (None, CAR_PI_KP, CAR_PI_KI, None)):
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=ctrl)
+      assert (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (kp, ki, kd), ctrl
 
 
 def _theta_meas(VM, v, angle, offset, roll):
@@ -972,9 +1026,9 @@ class TestInsterLateralController(OpenpilotTestCase):
     params.remove(CTRL_KEY)
     params.remove(GAINS_KEY)
     assert params.get(CTRL_KEY, return_default=True) == LATERAL_PI       # the UI's default
-    for ctrl, legacy_gains, kp, ki, kd, version in ((0, None, G6_KP, G6_KI, None, 64103), (1, None, P6_KP, P6_KI, P6_KD, 80104),
-                                                    (None, None, G6_KP, G6_KI, None, 64103), (None, 0, G6_KP, G6_KI, None, 64103),
-                                                    (None, 2, P6_KP, P6_KI, P6_KD, 80104)):
+    for ctrl, legacy_gains, kp, ki, kd, version in ((0, None, CAR_PI_KP, CAR_PI_KI, None, 64105), (1, None, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD, 80106),
+                                                    (None, None, CAR_PI_KP, CAR_PI_KI, None, 64105), (None, 0, CAR_PI_KP, CAR_PI_KI, None, 64105),
+                                                    (None, 2, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD, 80106)):
       for on in ((ANGLE_PI_KEY,), INSTER_KEYS):
         c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl, legacy_gains=legacy_gains)
         assert c.inster_angle_pi and (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (kp, ki, kd)
@@ -1024,10 +1078,10 @@ class TestInsterLateralController(OpenpilotTestCase):
       assert (pi.k_p, pi.k_i, pi.k_d) == (angle_pi_gain(P6_KP, v), angle_pi_gain(P6_KI, v), angle_pi_gain(P6_KD, v))
 
   def test_versions(self):
-    # base versions (before the freeze fix the logged values); logged now with the freeze-rule bit 64: PI 64103, PID 80104
+    # base versions (before the freeze fix the logged values); logged now with the freeze-rule bit 64: PI 64105, PID 80106
     assert (ANGLE_PI_G6_LOG_VERSION, ANGLE_PI_P6_LOG_VERSION) == (103, 16104)
     assert ANGLE_PI_P6_LOG_VERSION == ANGLE_PI_P6_BASE_VERSION + 1000 * ANGLE_PI_VERSION_D_BIT and ANGLE_PI_VERSION_D_BIT == 16
-    for on, ctrl, expected in ((INSTER_KEYS, 1, 80104), ((ANGLE_PI_KEY,), 1, 80104), (INSTER_KEYS, 0, 64103), (INSTER_KEYS, None, 64103),
+    for on, ctrl, expected in ((INSTER_KEYS, 1, 80106), ((ANGLE_PI_KEY,), 1, 80106), (INSTER_KEYS, 0, 64105), (INSTER_KEYS, None, 64105),
                                (STEP2_KEYS, 1, 0), ((), 1, 0), (INSTER_KEYS + ("NeuralNetworkLateralControl",), 1, 0)):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl)
       for active in (True, False):
@@ -1045,7 +1099,7 @@ class TestInsterLateralController(OpenpilotTestCase):
     VM.update_params(1.0, 14.0)
     steps = _p6_drive(c, VM, 1500, limited=lambda k: k % 5 == 1)   # controlsd's flag: no longer used by the PID's integrator
     def limited(k):
-      e = steps[k][3] / angle_pi_gain(P6_KP, steps[k][0].vEgo)
+      e = steps[k][3] / angle_pi_gain(CAR_PID_KP, steps[k][0].vEgo)
       return freeze_angle_integrator(False, direction(k), e)
     rates = _lp2_rates([_theta_meas(VM, CS.vEgo, CS.steeringAngleDeg, vp.angleOffsetDeg, vp.roll) for CS, vp, *_ in steps])
     i_prev = 0.0
@@ -1054,11 +1108,11 @@ class TestInsterLateralController(OpenpilotTestCase):
     big = big_limited = 0
     for k, ((CS, _, _, p, i, d, f, control), rate) in enumerate(zip(steps, rates, strict=True)):
       v = CS.vEgo
-      assert abs(d - angle_pi_gain(P6_KD, v) * -rate) <= 1e-12 * max(1.0, abs(d)), (k, v)
+      assert abs(d - angle_pi_gain(CAR_PID_KD, v) * -rate) <= 1e-12 * max(1.0, abs(d)), (k, v)
       if limited(k):
         expected_i = i_prev                             # frozen: the last request held back in the direction of this update
       else:
-        i_new = i_prev + angle_pi_gain(P6_KI, v) * DT_CTRL * (p / angle_pi_gain(P6_KP, v))
+        i_new = i_prev + angle_pi_gain(CAR_PID_KI, v) * DT_CTRL * (p / angle_pi_gain(CAR_PID_KP, v))
         test = p + i_new + d + f
         expected_i = min(max(i_new, i_prev if test < -lim else -lim), i_prev if test > lim else lim)
       assert abs(i - expected_i) <= 1e-12, (k, v)
@@ -1081,8 +1135,8 @@ class TestInsterLateralController(OpenpilotTestCase):
       if pressed(k):
         assert d == 0.0, k
       else:
-        assert abs(d - angle_pi_gain(P6_KD, CS.vEgo) * -rate) <= 1e-12 * max(1.0, abs(d)), k
-    assert max(abs(angle_pi_gain(P6_KD, CS.vEgo) * rate) for (CS, *_), rate in list(zip(steps, rates, strict=True))[400:520]) > 0.1
+        assert abs(d - angle_pi_gain(CAR_PID_KD, CS.vEgo) * -rate) <= 1e-12 * max(1.0, abs(d)), k
+    assert max(abs(angle_pi_gain(CAR_PID_KD, CS.vEgo) * rate) for (CS, *_), rate in list(zip(steps, rates, strict=True))[400:520]) > 0.1
 
   def test_p6_filter_restart_after_inactive(self):
     # the D filter restarts settled on the first active step after lateral was inactive: d = 0 there (no kick from the wheel moved
@@ -1096,7 +1150,7 @@ class TestInsterLateralController(OpenpilotTestCase):
     assert steps[450][5] == 0.0 and abs(steps[449 - 150][5]) > 0.0
     thetas = [_theta_meas(VM, CS.vEgo, CS.steeringAngleDeg, vp.angleOffsetDeg, vp.roll) for CS, vp, *_ in steps[450:]]
     for (CS, _, _, _, _, d, _, _), rate in zip(steps[450:], _lp2_rates(thetas), strict=True):
-      assert abs(d - angle_pi_gain(P6_KD, CS.vEgo) * -rate) <= 1e-12 * max(1.0, abs(d))
+      assert abs(d - angle_pi_gain(CAR_PID_KD, CS.vEgo) * -rate) <= 1e-12 * max(1.0, abs(d))
 
 
 # Option 5 "InsterSoftSmallErrorP" (28 Oct 2026): mild parameters fitted with P6; the design's sigma written out independently
@@ -1185,13 +1239,13 @@ class TestInsterSoftSmallErrorP(OpenpilotTestCase):
 
   def test_versions(self):
     assert ANGLE_PI_VERSION_SOFT_P_BIT == 8 and ANGLE_PI_VERSION_D_BIT == 16
-    expected = {(0, False): 64103, (1, False): 80104, (0, True): 72103, (1, True): 88104}     # incl. the freeze-rule bit 64
+    expected = {(0, False): 64105, (1, False): 80106, (0, True): 72105, (1, True): 88106}     # incl. the freeze-rule bit 64
     for (ctrl, soft), version in expected.items():
       assert angle_pi_log_version(ctrl, soft) == version, (ctrl, soft)
-    assert angle_pi_log_version(LATERAL_PID, True) == ANGLE_PI_P6_BASE_VERSION + 1000 * (ANGLE_PI_VERSION_D_BIT | ANGLE_PI_VERSION_SOFT_P_BIT
+    assert angle_pi_log_version(LATERAL_PID, True) == ANGLE_PI_PID_BASE_VERSION + 1000 * (ANGLE_PI_VERSION_D_BIT | ANGLE_PI_VERSION_SOFT_P_BIT
                                                                                          | ANGLE_PI_VERSION_FREEZE_DIR_BIT)
-    assert angle_pi_log_version(LATERAL_PID, False) == ANGLE_PI_P6_LOG_VERSION + 1000 * ANGLE_PI_VERSION_FREEZE_DIR_BIT
-    assert angle_pi_log_version(LATERAL_PI, False) == ANGLE_PI_G6_LOG_VERSION + 1000 * ANGLE_PI_VERSION_FREEZE_DIR_BIT
+    assert angle_pi_log_version(LATERAL_PID, False) == ANGLE_PI_PID_BASE_VERSION + 1000 * (ANGLE_PI_VERSION_D_BIT | ANGLE_PI_VERSION_FREEZE_DIR_BIT)
+    assert angle_pi_log_version(LATERAL_PI, False) == ANGLE_PI_PI_BASE_VERSION + 1000 * ANGLE_PI_VERSION_FREEZE_DIR_BIT
     for (ctrl, soft), version in expected.items():
       for on in (INSTER_KEYS, (ANGLE_PI_KEY,)):
         c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on + ((O5_KEY,) if soft else ()), ctrl=ctrl)
@@ -1207,7 +1261,7 @@ class TestInsterSoftSmallErrorP(OpenpilotTestCase):
     # stiction term is off here, so f does not depend on the output); I and D are the same as without option 5 (same inputs, no
     # clipping): no sigma on I, D untouched
     on = ("InsterSpeedFeedforward", ANGLE_PI_KEY)
-    for ctrl, kp_c in ((0, G6_KP), (1, P6_KP)):
+    for ctrl, kp_c in ((0, CAR_PI_KP), (1, CAR_PID_KP)):
       def limited(k):
         return k % 11 == 5
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on + (O5_KEY,), ctrl=ctrl)

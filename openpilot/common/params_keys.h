@@ -297,7 +297,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"InsterAngleErrorPI", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"InsterAngleErrorPIG6", {PERSISTENT | BACKUP, BOOL}},  // legacy (G6 only), migrated to InsterLateralController = 0 (PI); no default
     {"InsterAngleErrorPIGains", {PERSISTENT | BACKUP, INT}},  // legacy (0 G2, 1 G6, 2 P6), migrated to InsterLateralController; no default
-    {"InsterLateralController", {PERSISTENT | BACKUP, INT, "0"}},  // 0 = PI (gains G6), 1 = PID (gains P6)
+    {"InsterLateralController", {PERSISTENT | BACKUP, INT, "0"}},  // 0 = PI (gains PI-30Oct), 1 = PID (gains PID-30Oct); G6 / P6 until 30 Oct 2026
     {"InsterSoftSmallErrorP", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"InsterSpeedFeedforward", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"InsterStictionFriction", {PERSISTENT | BACKUP, BOOL, "0"}},

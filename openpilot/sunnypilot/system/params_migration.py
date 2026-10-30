@@ -118,7 +118,8 @@ def _migrate_inster_angle_pi_gains(_params):
 
 def _migrate_inster_lateral_controller(_params):
   # Hyundai Inster: the gain-set selector InsterAngleErrorPIGains (0 = G2, 1 = G6, 2 = P6) became the controller-type selector
-  # InsterLateralController (0 = PI = gains G6, 1 = PID = gains P6; G2 is no longer selectable): P6 -> 1, G2 / G6 / anything else
+  # InsterLateralController (0 = PI = PI-30Oct gains, 1 = PID = PID-30Oct gains (G6 / P6 until 30 Oct 2026); G2 is no longer
+  # selectable): P6 -> 1, G2 / G6 / anything else
   # -> 0, unless the new selector is already set. Runs after _migrate_inster_angle_pi_gains; the old key is removed either way.
   try:
     old = _params.get("InsterAngleErrorPIGains")

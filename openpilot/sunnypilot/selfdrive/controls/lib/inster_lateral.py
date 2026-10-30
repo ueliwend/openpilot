@@ -18,9 +18,9 @@ and a small stateful filter class.
   * Steering-angle PI "F" (switch InsterAngleErrorPI): InsterAnglePI replaces only v0's P and I. They act on the steering-wheel
     angle error (rad) with gains that are quadratic in speed, and the integrator runs from standstill. Feed-forward, limits and output
     conversion stay v0's. Tuned and checked in the closed-loop simulator only with both switches above on.
-    Controller type (param InsterLateralController, effective only with InsterAngleErrorPI on): PI (default; gains G6) or PID
-    (gains P6 = PI + D on the measured wheel-angle rate). Option 5 (InsterSoftSmallErrorP, with InsterAngleErrorPI on, either type;
-    fitted for the PID): P scaled by sigma, softer for small errors on straights, stronger in curves (soft_p_sigma).
+    Controller type (param InsterLateralController, effective only with InsterAngleErrorPI on): PI (default; gains PI-30Oct) or PID
+    (gains PID-30Oct = PI + D on the measured wheel-angle rate; G6 / P6 until 30 Oct 2026). Option 5 (InsterSoftSmallErrorP, with
+    InsterAngleErrorPI on, either type; fitted for the PID): P scaled by sigma, softer for small errors on straights, stronger in curves (soft_p_sigma).
 
   * Torque cap (no switch): the Inster's steering command is capped at 409 raw (opendbc values.INSTER_STEER_MAX, the highest the
     owner's steering unit took without a fault, 23 Oct 2026) with 1.0 = 384 raw (INSTER_STEER_FULL_SCALE): every lateral
@@ -249,7 +249,8 @@ class InsterStictionFriction:
 # ---------------------------------------------------------------------------------------------------------------------------------
 # Steering-angle PI "F" (switch InsterAngleErrorPI; the owner's 6-parameter controller, set "recommended_F" of the 23 Oct 2026 search in
 # the closed-loop steering simulator, SIM only: 9 drives x 8 plant variants x 2 seeds, on top of v0 with both switches above at 409).
-# Since 29 Oct 2026 it runs one of two controller types in place of F's gains: PI (gains G6) or PID (gains P6), both below. It
+# Since 29 Oct 2026 it runs one of two controller types in place of F's gains: PI or PID (gains PI-30Oct / PID-30Oct since 30 Oct 2026,
+# G6 / P6 before), all below. It
 # replaces only v0's P and I (and adds D with the PID):
 #   e  = delta_plan - delta_meas   steering-wheel angle error, rad, + right (v0-internal sign)
 #        delta_plan = wheel angle the plan's curvature needs (inverse vehicle model: steer ratio, slip factor, roll),
@@ -264,9 +265,10 @@ class InsterStictionFriction:
 # integrator, but F's can be wound at low speed, which v0's cannot: without the reset it would come back as a command towards the old
 # curve on re-engagement).
 # Anti-windup and output clip are common/pid.py's (InsterAnglePI is a PIDController with these gains).
-# Logs (controlsState.lateralControlState.torqueState) with F on: version = angle_pi_log_version(): PI 64103, PID 80104, with option 5
-# 72103 / 88104 (base ANGLE_PI_G6_LOG_VERSION / ANGLE_PI_P6_LOG_VERSION + 1000 x mask bits; bit 64 = the freeze rule since 29 Oct 2026;
-# drives before it: 103 / 16104 / 8103 / 24104) (v0 logs 0, the upstream controller 1; older drives: 100 / 101 F, 102 G2); error stays
+# Logs (controlsState.lateralControlState.torqueState) with F on: version = angle_pi_log_version(): PI 64105, PID 80106, with option 5
+# 72105 / 88106 since 30 Oct 2026 (gain sets PI-30Oct / PID-30Oct; base 105 / 106 + 1000 x mask bits; bit 64 = the freeze rule since
+# 29 Oct 2026); 29 Oct 2026 with G6 / P6: 64103 / 80104 / 72103 / 88104; drives before the freeze rule: 103 / 16104 / 8103 / 24104
+# (v0 logs 0, the upstream controller 1; older drives: 100 / 101 F, 102 G2); error stays
 # v0's lateral-acceleration error (setpoint - measurement, m/s^2), p / i / d / f are in m/s^2 as in v0 (d is 0 except with the PID).
 # F's own error is e = p / kp(vEgo) (rad, + right; kp of the gain set in force, > 0 at every speed the car drives), or recomputed from
 # carState steeringAngleDeg, liveParameters
@@ -302,6 +304,25 @@ ANGLE_PI_D_TAU = 0.03
 ANGLE_PI_P6_BASE_VERSION = 104
 ANGLE_PI_VERSION_D_BIT = 16
 ANGLE_PI_P6_LOG_VERSION = ANGLE_PI_P6_BASE_VERSION + 1000 * ANGLE_PI_VERSION_D_BIT
+# Gain sets the car runs since 30 Oct 2026 (owner: refined fits go to the car as soon as they exist). G6 / P6 above stay for reading
+# older logs (versions 103 / 16104 and their option / freeze-rule variants).
+# PI = gains "PI-30Oct": refined plateau centroid (4 simulator members, +-1 % jitter set) of the PI refit under the large-error objective
+# (interim path metric, lane changes cut) with the integrator-freeze rule of 29 Oct 2026; SIM J7 -0.289 vs v0 (G6 -0.253; 2 members).
+# kp 3.97 / 5.49 / 9.99 / 10.13 / 5.82, ki 0.94 / 2.05 / 5.30 / 5.19 / 1.77 at 0 / 10 / 55 / 115 / 160 km/h; clipped at >= 0: ki reaches
+# 0 above 175 km/h, kp above 194 km/h. Coefficients rounded to 6 significant digits (within 1.1e-5 relative up to 160 km/h).
+ANGLE_PI_PI_KP = (3.97145, 0.57866, -0.012084)
+ANGLE_PI_PI_KI = (0.93525, 0.425251, -0.00914645)
+ANGLE_PI_PI_BASE_VERSION = 105
+# PID = gains "PID-30Oct": refined plateau centroid of the PID refit, same objective and freeze rule, D path unchanged (D on the measured
+# wheel angle through LP2, tau ANGLE_PI_D_TAU = 0.03 s, D = 0 while steeringPressed); SIM J7 -0.333 vs v0 (P6 -0.314; 2 members).
+# kp 3.54 / 5.21 / 10.26 / 10.70 / 6.31, ki 0.94 / 2.17 / 5.79 / 5.71 / 1.97, kd 0.400 / 0.388 / 0.342 / 0.304 / 0.292 at
+# 0 / 10 / 55 / 115 / 160 km/h; clipped at >= 0: ki reaches 0 above 175 km/h, kp above 195 km/h, kd stays > 0. Rounded to 6 significant
+# digits (within 2.7e-5 relative up to 160 km/h). Caveats (SIM): interim path metric, logged plan, learned latAccelFactor fixed at 2.8 in
+# the simulator (the car divides P / I / D by the learned factor: about 7.7 % stronger at 2.60), no 32-member re-score yet.
+ANGLE_PI_PID_KP = (3.53638, 0.637723, -0.0129455)
+ANGLE_PI_PID_KI = (0.93525, 0.47245, -0.0101064)
+ANGLE_PI_PID_KD = (0.4, -0.00448574, 4.62303e-05)
+ANGLE_PI_PID_BASE_VERSION = 106
 # Option 5 "InsterSoftSmallErrorP" (28 Oct 2026, SIM only; options design v2.1 section 5, project doc
 # claude/inster-steering-simulator.md): p = kp(v) sigma e, I and D unchanged (no sigma on I), with
 #   v_c = max(v, 7 m/s), e_a = |e| v_c^2 / R(v) (lateral-acceleration size of the raw wheel-angle error, R in rad per 1/m, >= 1 deg),
@@ -321,11 +342,12 @@ ANGLE_PI_VERSION_SOFT_P_BIT = 8
 
 
 def angle_pi_log_version(controller: int, soft_p: bool) -> int:
-  """torqueState.version with F on: the controller type's base + 1000 x mask (D bit with the PID, option-5 bit, freeze-rule bit 64)"""
+  """torqueState.version with F on: the controller type's base + 1000 x mask (D bit with the PID, option-5 bit, freeze-rule bit 64).
+  Since 30 Oct 2026 (gain sets PI-30Oct / PID-30Oct): PI 64105, PID 80106, with option 5 72105 / 88106."""
   if controller == LATERAL_PID:
-    base, mask = ANGLE_PI_P6_BASE_VERSION, ANGLE_PI_VERSION_D_BIT
+    base, mask = ANGLE_PI_PID_BASE_VERSION, ANGLE_PI_VERSION_D_BIT
   else:
-    base, mask = ANGLE_PI_G6_LOG_VERSION, 0
+    base, mask = ANGLE_PI_PI_BASE_VERSION, 0
   if soft_p:
     mask |= ANGLE_PI_VERSION_SOFT_P_BIT
   return base + 1000 * (mask | ANGLE_PI_VERSION_FREEZE_DIR_BIT)
