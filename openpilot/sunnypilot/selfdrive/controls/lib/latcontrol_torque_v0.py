@@ -1,4 +1,5 @@
 import math
+import time
 import numpy as np
 from collections import deque
 
@@ -14,6 +15,8 @@ from openpilot.common.pid import PIDController
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_PI_KI, ANGLE_PI_PI_KP, ANGLE_PI_PI_BASE_VERSION, \
                                                                        ANGLE_PI_PID_KD, ANGLE_PI_PID_KI, ANGLE_PI_PID_KP, LATERAL_PID, \
                                                                        INSTER_FIXED_FACTOR, SOFT_P_PARAM, InsterAnglePI, InsterSteerLimitObserver, \
+                                                                       MPC_PARAM, InsterMPC, ff_table_slope_raw, ANGLE_PI_MPC_D_TAU, \
+                                                                       ANGLE_PI_MPC_KD, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KP, \
                                                                        InsterStictionFriction, InsterWheelRateFilter, STEER_MAX_RAW, \
                                                                        angle_error, angle_lateral_controller, angle_pi_log_version, \
                                                                        freeze_angle_integrator, \
@@ -69,6 +72,10 @@ class LatControlTorque(LatControl):
     self.inster_plan_history = False
     self.inster_fixed_factor = False
     self.inster_angle_pi_version = ANGLE_PI_PI_BASE_VERSION
+    self.inster_mpc = None
+    self.inster_mpc_delta = 0.0
+    self.inster_mpc_overrun = False
+    self.inster_mpc_overrun_log_t = -1e9
     if is_inster(CP):
       self._init_inster(Params(), CP)
 
@@ -116,10 +123,31 @@ class LatControlTorque(LatControl):
       # with option 5 (bit 64 = the integrator-freeze rule, bit 256 = fixed factor; G6 / P6 on 29 Oct 2026: 64103 / 80104; before the
       # freeze rule: 103 / 16104)
       controller = angle_lateral_controller(params)
-      self.inster_angle_pi_version = angle_pi_log_version(controller, self.inster_soft_p)
+      # model predictive control (InsterMPC): on top of the PID only, with the speed feed-forward table (its slope converts the shift's
+      # ramp); gain rows computed here, at start-up. Any set-up failure: plain PID (PID-30Oct, version without the MPC bit)
+      mpc = params.get_bool(MPC_PARAM)
+      if mpc and controller != LATERAL_PID:
+        cloudlog.warning("InsterMPC is ignored: it runs on top of the PID (controller type PID)")
+      elif mpc and not feedforward:
+        cloudlog.warning("InsterMPC is ignored: it needs InsterSpeedFeedforward")
+      mpc = mpc and controller == LATERAL_PID and feedforward
+      if mpc:
+        try:
+          from openpilot.selfdrive.modeld.constants import ModelConstants
+          self.inster_mpc = InsterMPC(self.dt, model_t_idxs=ModelConstants.T_IDXS)
+        except Exception:
+          cloudlog.exception("InsterMPC set-up failed: running the plain PID")
+          self.inster_mpc = None
+          mpc = False
+      self.inster_angle_pi_version = angle_pi_log_version(controller, self.inster_soft_p, mpc)
       if self.inster_soft_p and controller != LATERAL_PID:
         cloudlog.info("InsterSoftSmallErrorP: its parameters were fitted with the PID, not the PI selected")
-      if controller == LATERAL_PID:
+      if controller == LATERAL_PID and mpc:
+        # the MPC variant's own gain set and D filter (fitted jointly with the MPC)
+        self.inster_angle_pi_d = True
+        self.pid = InsterAnglePI(rate=1 / self.dt, kp=ANGLE_PI_MPC_KP, ki=ANGLE_PI_MPC_KI, kd=ANGLE_PI_MPC_KD)
+        self.inster_wheel_rate = InsterWheelRateFilter(self.dt, tau=ANGLE_PI_MPC_D_TAU)
+      elif controller == LATERAL_PID:
         self.inster_angle_pi_d = True
         self.pid = InsterAnglePI(rate=1 / self.dt, kp=ANGLE_PI_PID_KP, ki=ANGLE_PI_PID_KI, kd=ANGLE_PI_PID_KD)
         self.inster_wheel_rate = InsterWheelRateFilter(self.dt)
@@ -153,6 +181,10 @@ class LatControlTorque(LatControl):
       self.inster_past_curvature = self.inster_curvature_buffer[-inster_delay_frames]
       self.inster_curvature_buffer.append(desired_curvature)
 
+    if self.inster_mpc is not None:
+      # the model frame's age counts every step, active or not (controlsd passes modelV2 to the extension each step)
+      self.inster_mpc.observe_model(getattr(self.extension, 'model_v2', None))
+
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     pid_log.version = self.inster_angle_pi_version if self.inster_angle_pi else VERSION
     if not active:
@@ -168,6 +200,8 @@ class LatControlTorque(LatControl):
         self.inster_limit_observer.reset()   # the car applies 0 while lateral control is inactive
         if self.inster_angle_pi_d:
           self.inster_wheel_rate.reset()   # PID: the D filter restarts settled on the next active step
+        if self.inster_mpc is not None:
+          self.inster_mpc.reset()          # MPC: restarts from the measured wheel and the plan on the next active step
     else:
       measured_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
       roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY
@@ -194,6 +228,15 @@ class LatControlTorque(LatControl):
       ff = gravity_adjusted_future_lateral_accel
       # latAccelOffset corrects roll compensation bias from device roll misalignment relative to car roll
       ff -= self.torque_params.latAccelOffset
+      inster_kappa_ref = desired_curvature
+      if self.inster_mpc is not None:
+        # MPC (on top of the PID): reference curvature for P / I and a rate-limited shift of the feed-forward lateral acceleration
+        inster_kappa_ref, mpc_delta = self.inster_mpc.update(
+          CS.vEgo, desired_curvature, measured_curvature, lat_delay, CS.steeringPressed, ff,
+          ff_table_slope_raw(ff, CS.vEgo), clock=time.monotonic)
+        ff += mpc_delta
+        self.inster_mpc_delta = mpc_delta
+        self._inster_mpc_log_overrun()
       if self.inster_ff:
         # Inster: feed-forward from the measured speed x lateral-acceleration table, in linear-equivalent lateral acceleration
         ff = ff_lat_accel_equivalent(ff, CS.vEgo, self.torque_params.latAccelFactor)
@@ -215,7 +258,7 @@ class LatControlTorque(LatControl):
           # 0 while the driver steers (the filter keeps running)
           wheel_rate = self.inster_wheel_rate.update(VM.get_steer_from_curvature(1.0, CS.vEgo, 0.0) * measured_curvature)
           angle_pi_rate = 0.0 if CS.steeringPressed else -wheel_rate
-        angle_e = angle_error(VM, CS.vEgo, desired_curvature, measured_curvature)
+        angle_e = angle_error(VM, CS.vEgo, inster_kappa_ref, measured_curvature)   # = desired curvature unless the MPC is on
         if self.inster_soft_p:
           # option 5: P x sigma(raw e, plan curvature now / lat_delay ago); I and D unchanged
           self.pid.p_sigma = soft_p_sigma(angle_e, CS.vEgo, VM.get_steer_from_curvature(1.0, CS.vEgo, 0.0), desired_curvature,
@@ -256,9 +299,25 @@ class LatControlTorque(LatControl):
       pid_log.desiredLateralAccel = float(setpoint)
       pid_log.desiredLateralJerk = float(desired_lateral_jerk)
       pid_log.saturated = bool(self._check_saturation(self.steer_max - abs(output_torque) < 1e-3, CS, steer_limited_by_safety, curvature_limited))
+      if self.inster_mpc is not None:
+        # MPC: the feed-forward shift (m/s^2) in the otherwise unused errorRate field (version bit 128 marks it)
+        pid_log.errorRate = float(self.inster_mpc_delta)
 
     # TODO left is positive in this convention
     return -output_torque, 0.0, pid_log
+
+  def _inster_mpc_log_overrun(self):
+    # MPC solve-budget fallback (three solves in a row over budget) entered / left: one cloudlog line each, at most one per 10 s
+    overrun = self.inster_mpc.overruns >= 3
+    if overrun != self.inster_mpc_overrun:
+      self.inster_mpc_overrun = overrun
+      now = time.monotonic()
+      if now - self.inster_mpc_overrun_log_t >= 10.0:
+        self.inster_mpc_overrun_log_t = now
+        if overrun:
+          cloudlog.warning("InsterMPC: solve over budget three times in a row, fallen back to the PID")
+        else:
+          cloudlog.warning("InsterMPC: solve back within budget")
 
   def _inster_friction_raw(self, CS, VM, desired_curvature, past_curvature, measured_curvature, lat_delay):
     # steering-wheel degrees per unit curvature at this speed (vehicle model without the roll term; the measured curvature keeps its

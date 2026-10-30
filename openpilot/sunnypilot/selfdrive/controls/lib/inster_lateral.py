@@ -354,9 +354,9 @@ SOFT_P_R_MIN = math.radians(1.0)
 ANGLE_PI_VERSION_SOFT_P_BIT = 8
 
 
-def angle_pi_log_version(controller: int, soft_p: bool) -> int:
+def angle_pi_log_version(controller: int, soft_p: bool, mpc: bool = False) -> int:
   """torqueState.version with F on: the controller type's base + 1000 x mask (D bit with the PID, option-5 bit, freeze-rule bit 64,
-  fixed-factor bit 256). Since 30 Oct 2026 (gain sets PI-30Oct / PID-30Oct, fixed factor): PI 320105, PID 336106, with option 5
+  fixed-factor bit 256, MPC bit 128). Since 30 Oct 2026 (gain sets PI-30Oct / PID-30Oct, fixed factor): PI 320105, PID 336106, with option 5
   328105 / 344106."""
   if controller == LATERAL_PID:
     base, mask = ANGLE_PI_PID_BASE_VERSION, ANGLE_PI_VERSION_D_BIT
@@ -364,6 +364,8 @@ def angle_pi_log_version(controller: int, soft_p: bool) -> int:
     base, mask = ANGLE_PI_PI_BASE_VERSION, 0
   if soft_p:
     mask |= ANGLE_PI_VERSION_SOFT_P_BIT
+  if mpc:
+    mask |= ANGLE_PI_VERSION_MPC_BIT
   return base + 1000 * (mask | ANGLE_PI_VERSION_FREEZE_DIR_BIT | ANGLE_PI_VERSION_FIXED_FACTOR_BIT)
 
 
@@ -508,6 +510,311 @@ class InsterWheelRateFilter:
     self.x1 += self.a * (theta - self.x1)
     self.x2 += self.a * (self.x1 - self.x2)
     return (self.x2 - prev) / self.dt
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# Model predictive control (switch InsterMPC; on top of the PID only; SIM only, NOT validated on the car). Unconstrained LQ-MPC
+# (LQ preview controller), a 2-degree-of-freedom trajectory generator: every 5 steps (20 Hz) it plans the lateral-acceleration command
+# for the next 1.2 s (24 blocks of 50 ms) on a nominal steering model (dead time 1 block, first-order lag tau_a(v)), with the plan's
+# preview; the PID's P / I / D stay the 100 Hz feedback with the MPC variant's OWN gain set (ANGLE_PI_MPC_KP / KI / KD, D filter
+# ANGLE_PI_MPC_D_TAU; fitted jointly with MPC_PARAMS, NOT PID-30Oct once the fit is in). Table at the fixed factor F0 (no learned-factor
+# scaling); effective only with InsterSpeedFeedforward on (the feed-forward shift's ramp conversion uses that table's slope).
+# Design: simulator kit agents/mpc/design_mpc.md (candidates_mpc.MPCPID; this class reproduces it step for step, kit-vs-car match
+# test agents/mpc/scripts/kit_car_match.py).
+#   nominal state [y, psi, kappa_n, a_prev] (offset / heading vs the plan, nominal curvature, in-flight command); y0 = psi0 = 0 at each
+#   solve (the plan is re-anchored at the car; no plan reaction is assumed); cost sum q_y y^2 + q_psi psi^2 + q_a v^4 (kappa_n - kappa_p)^2
+#   + r_d du^2 + r_u (u - v^2 kappa_p(j + 1))^2; optimum u0 = K(v) . [kappa_n, a_prev, kappa_p(0 .. 24)] with K precomputed per speed
+#   (1 m/s grid, linear in v) once at start-up (mpc_gain_rows, ~0.1 s here, ~0.7 s EST on the device).
+#   Outputs, blended with w = g(v) h f_v (g: g_lo at 15 km/h, linear to g at 40 km/h; f_v: smoothstep 8 -> 15 km/h; h: fallback weight):
+#     feed-forward  delta added to v0's gravity-adjusted feed-forward lateral acceleration (before the table), rate-limited to the car's
+#                   ramp in raw-equivalent units (3 raw / step growing, 5 shrinking; table slope floor 30 raw per m/s^2) and to 5 m/s^3;
+#     reference     kappa_ref = kappa_des + w (kappa_nom - kappa_des) for the angle error of P and I (and the integrator-freeze direction);
+#                   kappa_nom = the nominal model driven by the command (dead time 5 steps), not reset to the measurement.
+#   The stiction term, option 5's plan inputs and D keep the unshifted plan / the measurement.
+#   Preview kappa_p(t + tau), tau = 0 .. 1.2 s: tau <= lat_delay from the plan's own past (1 s buffer of desired curvature); beyond from the
+#   latest modelV2 frame (orientationRate.z / velocity.x at T = tau + 0.075 s + frame age; anchored to the desired curvature within
+#   0.15 m/s^2, age <= 15 steps, laneChangeState off), else the plan held; clipped to 3.3 m/s^2 / v^2. |u0| <= max(3.3, |kappa_des| v^2).
+#   Fallback (h -> 0, low-pass 0.15 s; the nominal state resynchronised to the measured wheel while h < 0.05): steeringPressed, lane
+#   change (state >= 2), non-finite numbers (held until the next finite solve), three solves in a row over MPC_BUDGET_S.
+#   On the car the controller state is reset whenever lateral control is inactive (as the kit at a stretch start); missed model frames
+#   only age the preview (hold beyond 15 steps) and never reset the feed-forward part.
+# torqueState.version: + 1000 x ANGLE_PI_VERSION_MPC_BIT (128). Parameters: MPC_PARAMS (the kit's start point until the fit replaces it).
+MPC_PARAM = "InsterMPC"
+ANGLE_PI_VERSION_MPC_BIT = 128
+MPC_PARAMS = {'g': 0.5, 'g_lo': 0.25, 'wy': 0.0, 'wpsi': 4.0, 'wdu': -0.5, 'wu': -1.0, 'tau_lo': 0.25,   # NOT FITTED: kit start point
+              'tau_hi': 0.20}
+# the PID's gain set when the MPC is in use (selected only then; PI-30Oct / PID-30Oct unchanged otherwise). PLACEHOLDER = PID-30Oct
+# until the joint fit (MPC + PID gains + D filter tau) replaces it.
+ANGLE_PI_MPC_KP = ANGLE_PI_PID_KP
+ANGLE_PI_MPC_KI = ANGLE_PI_PID_KI
+ANGLE_PI_MPC_KD = ANGLE_PI_PID_KD
+ANGLE_PI_MPC_D_TAU = ANGLE_PI_D_TAU
+MPC_WA = -1.0                      # log10 q_a (fixed)
+MPC_NBLK = 5                       # control steps per block / solve (20 Hz at dt 0.01)
+MPC_NH = 24                        # horizon blocks (1.2 s)
+MPC_DT = 0.01                      # the kit's step; the car's controlsd step DT_CTRL (checked in __init__)
+MPC_DTB = MPC_DT * MPC_NBLK
+MPC_V_OFF, MPC_V_ON = 8.0, 15.0    # km/h: f_v fade-in
+MPC_V_TLO, MPC_V_THI = 15.0, 100.0  # km/h: tau_lo / tau_hi nodes
+MPC_V_GLO, MPC_V_GHI = 15.0, 40.0  # km/h: g_lo / g nodes
+MPC_TAU_H = 0.15                   # s: fallback weight low-pass
+MPC_ANCHOR = 0.15                  # m/s^2: frame preview anchored to the desired curvature within this
+MPC_AGE_MAX = 15                   # steps: oldest usable model frame
+MPC_A_LIM = 3.3                    # m/s^2: preview / command clip
+MPC_RAMP_UP, MPC_RAMP_DOWN = 3.0, 5.0   # raw per step (the Inster's ramp)
+MPC_SLOPE_MIN = 30.0               # raw per m/s^2: floor of the table slope for the ramp conversion
+MPC_JERK_MAX = 5.0                 # m/s^3: jerk limit of the feed-forward part
+MPC_BUDGET_S = 0.002               # s per solve; three solves in a row over it -> fallback
+MPC_NBUF = 101                     # own desired-curvature buffer (1 s)
+
+
+def _smoothstep(x: float) -> float:
+  if x <= 0.0:
+    return 0.0
+  if x >= 1.0:
+    return 1.0
+  return x * x * (3.0 - 2.0 * x)
+
+
+def mpc_tau(p: dict, v_ego: float) -> float:
+  """nominal model lag (s): tau_lo at 15 km/h, linear to tau_hi at 100 km/h, flat outside"""
+  s = (v_ego * 3.6 - MPC_V_TLO) / (MPC_V_THI - MPC_V_TLO)
+  s = 0.0 if s < 0.0 else (1.0 if s > 1.0 else s)
+  return p['tau_lo'] + (p['tau_hi'] - p['tau_lo']) * s
+
+
+def mpc_gain_rows(p: dict):
+  """K rows (len(MPC_VGRID) x (2 + MPC_NH + 1)): u0 = K . [kappa_n, a_prev, kappa_p(0 .. NH)] (least squares; as the kit's lq_rows)"""
+  import numpy as np
+  qy, qp, rd, ru = (10.0 ** float(p[k]) for k in ('wy', 'wpsi', 'wdu', 'wu'))
+  qa = 10.0 ** MPC_WA
+  nc = 4 + MPC_NH + 1
+  rows = np.zeros((len(MPC_VGRID), 2 + MPC_NH + 1))
+  for iv, v in enumerate(MPC_VGRID):
+    v2 = v * v
+    al = math.exp(-MPC_DTB / mpc_tau(p, v))
+    Fx = np.zeros((4, nc))
+    Fx[:, :4] = np.eye(4)
+    Fu = np.zeros((4, MPC_NH))
+    Rc, Ru = [], []
+    for j in range(MPC_NH):
+      ec = np.zeros(nc)
+      eu = np.zeros(MPC_NH)
+      eu[j] = 1.0
+      if j == 0:
+        ec[3] = -1.0
+      else:
+        eu[j - 1] = -1.0
+      s = math.sqrt(rd)
+      Rc.append(s * ec)
+      Ru.append(s * eu)
+      ec = np.zeros(nc)
+      eu = np.zeros(MPC_NH)
+      eu[j] = 1.0
+      ec[4 + min(j + 1, MPC_NH)] = -v2
+      s = math.sqrt(ru)
+      Rc.append(s * ec)
+      Ru.append(s * eu)
+      nFx = np.zeros_like(Fx)
+      nFu = np.zeros_like(Fu)
+      nFx[0] = Fx[0] + MPC_DTB * v * Fx[1]
+      nFu[0] = Fu[0] + MPC_DTB * v * Fu[1]
+      nFx[1] = Fx[1] + MPC_DTB * v * Fx[2]
+      nFx[1, 4 + j] -= MPC_DTB * v
+      nFu[1] = Fu[1] + MPC_DTB * v * Fu[2]
+      nFx[2] = al * Fx[2] + (1.0 - al) / v2 * Fx[3]
+      nFu[2] = al * Fu[2] + (1.0 - al) / v2 * Fu[3]
+      nFu[3, j] = 1.0
+      Fx, Fu = nFx, nFu
+      s = math.sqrt(qy)
+      Rc.append(s * Fx[0])
+      Ru.append(s * Fu[0])
+      s = math.sqrt(qp)
+      Rc.append(s * Fx[1])
+      Ru.append(s * Fu[1])
+      ec = Fx[2].copy()
+      ec[4 + j + 1] -= 1.0
+      s = math.sqrt(qa) * v2
+      Rc.append(s * ec)
+      Ru.append(s * Fu[2])
+    Rc = np.array(Rc)
+    Ru = np.array(Ru)
+    K = -np.linalg.solve(Ru.T @ Ru, Ru.T @ Rc)
+    rows[iv] = K[0, 2:]
+  return rows
+
+
+MPC_VGRID = tuple(float(v) for v in range(1, 46))                    # m/s
+MPC_TG = tuple(round(0.05 * i, 3) for i in range(31))                # s after the frame: the frame profile grid
+MPC_TAUS = tuple(MPC_DTB * j for j in range(MPC_NH + 1))             # preview offsets
+
+
+class InsterMPC:
+  """The MPC on top of the PID (see above). observe_model() every controlsd step (active or not), update() on active steps, reset()
+  while lateral control is inactive. Signs: v0-internal curvatures (desired and measured curvature as v0 uses them)."""
+
+  def __init__(self, dt: float, params: dict | None = None, model_t_idxs=None):
+    import numpy as np
+    if abs(dt - MPC_DT) > 1e-9:
+      raise ValueError(f'InsterMPC is built for dt {MPC_DT} (blocks of {MPC_NBLK} steps), got {dt}')
+    self.np = np
+    self.p = dict(MPC_PARAMS if params is None else params)
+    self.rows = mpc_gain_rows(self.p)        # start-up: never in the control loop
+    self.vgrid0 = MPC_VGRID[0]
+    self.al_h = 1.0 - math.exp(-dt / MPC_TAU_H)
+    self.taus = np.array(MPC_TAUS)
+    self.tg = np.array(MPC_TG)
+    self.t_idxs = None if model_t_idxs is None else np.array(model_t_idxs, dtype=np.float64)
+    # model frame bookkeeping (kept across resets: the frame stream does not stop when lateral control does)
+    self.frame_id = None
+    self.row = None
+    self.age = 0
+    self.lane_change = 0
+    self.overruns = 0
+    self.n_solve = 0
+    self.w = 0.0
+    self.bad = False                         # non-finite solve: fallback held until the next finite solve
+    self.reset()
+
+  def reset(self) -> None:
+    self.fresh = True
+
+  # ---- model frames ---------------------------------------------------------------------------------------------------------------
+  def frame_row(self, yaw_rate, v_x):
+    """instantaneous plan curvature on MPC_TG (s after the frame) from one model frame (lists on the model's T_IDXS)"""
+    np = self.np
+    yr = np.interp(self.tg, self.t_idxs, np.asarray(yaw_rate, dtype=np.float64))
+    vx = np.interp(self.tg, self.t_idxs, np.asarray(v_x, dtype=np.float64))
+    return yr / np.maximum(vx, 1.0)
+
+  def observe_model(self, model_v2) -> None:
+    """one controlsd step: a new modelV2 frame restarts the age, otherwise the frame ages by one step"""
+    if model_v2 is not None and self.t_idxs is not None and len(model_v2.orientationRate.z) == len(self.t_idxs) \
+       and len(model_v2.velocity.x) == len(self.t_idxs):
+      if model_v2.frameId != self.frame_id:
+        self.frame_id = model_v2.frameId
+        self.row = self.frame_row(model_v2.orientationRate.z, model_v2.velocity.x)
+        self.age = 0
+      else:
+        self.age += 1
+      # capnp enum (SubMaster reader: _DynamicEnum, int() raises) -> its raw value; plain ints (tests) pass through
+      lcs = model_v2.meta.laneChangeState
+      self.lane_change = int(getattr(lcs, 'raw', lcs))
+    else:
+      self.age += 1
+
+  def set_frame(self, row, age: int, lane_change: int) -> None:
+    """test hook (kit-vs-car match): the frame profile / age / lane-change state of this step, as the kit has them"""
+    self.row = None if row is None else self.np.asarray(row, dtype=self.np.float64)
+    self.age = age
+    self.lane_change = lane_change
+
+  # ---- preview ---------------------------------------------------------------------------------------------------------------------
+  def preview(self, kd: float, v_ego: float, lat_delay: float):
+    np = self.np
+    P = np.empty(MPC_NH + 1)
+    back = (lat_delay - self.taus) / MPC_DT
+    m = back >= 0.0
+    idx = np.clip(back[m], 0.0, MPC_NBUF - 1.0)
+    P[m] = np.interp((MPC_NBUF - 1.0) - idx, np.arange(MPC_NBUF, dtype=np.float64), self.kbuf)
+    fut = None
+    if self.row is not None and self.age <= MPC_AGE_MAX and self.lane_change == 0:
+      a0 = 0.075 + MPC_DT * self.age
+      k_now = float(np.interp(lat_delay + a0, self.tg, self.row))
+      if abs(k_now - kd) * v_ego * v_ego <= MPC_ANCHOR:
+        fut = np.interp(self.taus[~m] + a0, self.tg, self.row) + (kd - k_now)
+    P[~m] = kd if fut is None else fut
+    lim = MPC_A_LIM / max(v_ego * v_ego, 1.0)
+    np.clip(P, -lim, lim, out=P)
+    return P
+
+  # ---- one active step -------------------------------------------------------------------------------------------------------------
+  def update(self, v_ego: float, kd: float, k_meas: float, lat_delay: float, steering_pressed: bool, la0: float, slope_raw: float,
+             clock=None) -> tuple[float, float]:
+    """(kappa_ref, delta): the P / I reference curvature and the feed-forward lateral-acceleration shift for this step.
+    la0: v0's unshifted feed-forward lateral acceleration (gravity-adjusted, offset removed); slope_raw: |d table / d a| at la0 in raw per
+    m/s^2 (the caller's ff table); clock: optional monotonic clock for the solve budget (None: no budget check)"""
+    np = self.np
+    v2 = v_ego * v_ego
+    v2c = v2 if v2 > 1.0 else 1.0
+    if self.fresh:
+      self.kbuf = np.full(MPC_NBUF, kd)
+      self.k_nom = k_meas
+      self.a_prev = kd * v2
+      self.u0 = self.a_prev
+      self.abuf = [self.a_prev] * (MPC_NBLK + 1)
+      self.h = 0.0
+      self.delta = 0.0
+      self.nb = 0
+      self.bad = False
+      self.fresh = False
+    self.kbuf[:-1] = self.kbuf[1:]
+    self.kbuf[-1] = kd
+    fv = _smoothstep((v_ego * 3.6 - MPC_V_OFF) / (MPC_V_ON - MPC_V_OFF))
+    ok = not steering_pressed and self.lane_change < 2 and fv > 0.0
+    if self.nb % MPC_NBLK == 0:
+      if fv > 0.0:
+        t0 = clock() if clock is not None else None
+        P = self.preview(kd, v_ego, lat_delay)
+        rows = self.rows
+        vv = min(max(v_ego, MPC_VGRID[0]), MPC_VGRID[-1])
+        i = min(int(vv - self.vgrid0), len(MPC_VGRID) - 2)
+        fr = vv - MPC_VGRID[i]
+        Kr = rows[i] + fr * (rows[i + 1] - rows[i])
+        u0 = float(Kr[0] * self.k_nom + Kr[1] * self.a_prev + Kr[2:] @ P)
+        self.bad = not math.isfinite(u0)
+        if self.bad:
+          u0 = kd * v2
+          if not math.isfinite(u0):
+            u0 = 0.0
+        al_ = MPC_A_LIM if MPC_A_LIM > abs(kd) * v2 else abs(kd) * v2
+        u0 = al_ if u0 > al_ else (-al_ if u0 < -al_ else u0)
+        self.a_prev, self.u0 = self.u0, u0
+        self.n_solve += 1
+        if t0 is not None:
+          self.overruns = self.overruns + 1 if clock() - t0 > MPC_BUDGET_S else 0
+      else:
+        self.a_prev = self.u0 = kd * v2
+    if self.overruns >= 3 or self.bad:
+      ok = False
+    s_ = (self.nb % MPC_NBLK + 1) / MPC_NBLK
+    a_cmd = self.a_prev + s_ * (self.u0 - self.a_prev)
+    self.nb += 1
+    self.abuf.append(a_cmd)
+    self.abuf.pop(0)
+    al_n = math.exp(-MPC_DT / mpc_tau(self.p, v_ego))
+    self.k_nom = al_n * self.k_nom + (1.0 - al_n) * self.abuf[0] / v2c
+    if not math.isfinite(self.k_nom):
+      self.k_nom = k_meas
+    self.h += self.al_h * ((1.0 if ok else 0.0) - self.h)
+    if self.h < 0.05:
+      self.k_nom = k_meas
+      self.a_prev = self.u0 = kd * v2
+      self.abuf = [kd * v2] * (MPC_NBLK + 1)
+    sg = (v_ego * 3.6 - MPC_V_GLO) / (MPC_V_GHI - MPC_V_GLO)
+    sg = 0.0 if sg < 0.0 else (1.0 if sg > 1.0 else sg)
+    w = (self.p['g_lo'] + (self.p['g'] - self.p['g_lo']) * sg) * self.h * fv
+    self.w = w
+    tgt = w * (a_cmd - kd * v2)
+    slope = slope_raw if slope_raw > MPC_SLOPE_MIN else MPC_SLOPE_MIN
+    d_ = tgt - self.delta
+    grow = abs(tgt) > abs(self.delta) and tgt * self.delta >= 0.0
+    lim = (MPC_RAMP_UP if grow else MPC_RAMP_DOWN) / slope
+    jl = MPC_JERK_MAX * MPC_DT
+    lim = lim if lim < jl else jl
+    self.delta += lim if d_ > lim else (-lim if d_ < -lim else d_)
+    if not math.isfinite(self.delta):
+      self.delta = 0.0
+    kref = kd + w * (self.k_nom - kd)
+    if not math.isfinite(kref):
+      kref = kd
+    return kref, self.delta
+
+
+def ff_table_slope_raw(lateral_accel: float, v_ego: float) -> float:
+  """|d ff_torque / d a| (raw per m/s^2) at lateral_accel, central difference over +-0.05 m/s^2 (the MPC's ramp conversion; the table
+  at the fixed factor F0)"""
+  return abs(ff_torque(lateral_accel + 0.05, v_ego) - ff_torque(lateral_accel - 0.05, v_ego)) / 0.1 * STEER_MAX_RAW
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------

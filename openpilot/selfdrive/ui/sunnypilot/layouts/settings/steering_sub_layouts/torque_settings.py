@@ -12,8 +12,8 @@ import pyray as rl
 
 from openpilot.common.basedir import BASEDIR
 from openpilot.selfdrive.ui.ui_state import ui_state
-from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import LATERAL_CONTROLLER_PARAM, SOFT_P_PARAM, angle_lateral_controller, \
-  is_inster
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import LATERAL_CONTROLLER_PARAM, LATERAL_PID, MPC_PARAM, SOFT_P_PARAM, \
+  angle_lateral_controller, is_inster
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.sunnypilot.lib.utils import NoElideButtonAction
@@ -146,6 +146,13 @@ class TorqueSettingsLayout(Widget):
                              "straights; at 30-80 km/h slightly closer inside but wider outside; slightly more lateral offset on " +
                              "straights and more exit overshoot. Fitted for the PID. Not validated on the car. Off by default."),
     )
+    self._inster_mpc_toggle = toggle_item_sp(
+      param=MPC_PARAM,
+      title=lambda: tr("Inster: Model Predictive Control, for the PID (experimental)"),
+      description=lambda: tr("Plans the steering 1.2 s ahead from the driving model's path and leads the PID through curves. Works " +
+                             "only with the PID and the speed feed-forward; off while you steer, during lane changes and below 15 km/h. Simulation only, " +
+                             "not validated on the car. Off by default."),
+    )
 
     items = [
       self._jerk_aware_toggle,
@@ -161,6 +168,7 @@ class TorqueSettingsLayout(Widget):
       self._inster_angle_pi_toggle,
       self._inster_angle_pi_gains,
       self._inster_soft_p_toggle,
+      self._inster_mpc_toggle,
     ]
     return items
 
@@ -182,6 +190,11 @@ class TorqueSettingsLayout(Widget):
     # option 5 (soft small-error P): under the selector, shown only while the steering-angle PI is on (same change rules)
     self._inster_soft_p_toggle.set_visible(inster and self._inster_angle_pi_toggle.action_item.get_state())
     self._inster_soft_p_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
+    # MPC: shown only while the steering-angle controller is on with the PID selected and the speed feed-forward on (same change rules)
+    self._inster_mpc_toggle.set_visible(inster and self._inster_angle_pi_toggle.action_item.get_state() and
+                                        self._inster_ff_toggle.action_item.get_state() and
+                                        angle_lateral_controller(ui_state.params) == LATERAL_PID)
+    self._inster_mpc_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
     if not ui_state.params.get_bool("LiveTorqueParamsToggle"):
       ui_state.params.remove("LiveTorqueParamsRelaxedToggle")
       self._relaxed_tune_toggle.action_item.set_state(False)

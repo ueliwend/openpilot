@@ -10,7 +10,7 @@ from unittest import mock
 
 import numpy as np
 
-from openpilot.cereal import log
+from openpilot.cereal import log, messaging
 from opendbc.car.structs import car
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.hyundai.values import CAR as HYUNDAI, INSTER_STEER_FULL_SCALE, INSTER_STEER_MAX
@@ -44,6 +44,11 @@ from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import A_NODES, 
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import CRAWL_PER_M_RELEASE, CRAWL_PLAN_RELEASE_SPEED, CRAWL_PLAN_SPEED, \
                                                                        CRAWL_STRAIGHTEN_LENGTH, CRAWL_STRAIGHTEN_PER_M, CRAWL_TURN_IN_PER_M, \
                                                                        crawl_plan_curvature
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_VERSION_MPC_BIT, MPC_PARAM, MPC_PARAMS, \
+                                                                       MPC_A_LIM, MPC_JERK_MAX, InsterMPC, ff_table_slope_raw, \
+                                                                       mpc_gain_rows, mpc_tau, ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, \
+                                                                       ANGLE_PI_MPC_KD, ANGLE_PI_MPC_D_TAU
+from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import LatControlTorque as LatControlTorqueV0
 
@@ -210,7 +215,7 @@ class TestInsterStictionFriction(OpenpilotTestCase):
 def _make_v0(car_name, on=(), after_setup=(), ctrl=None, legacy_gains=None):
   """ctrl: controller-type selector InsterLateralController (None = unset: PI, or the legacy gain-set selector legacy_gains)"""
   params = Params()
-  for key in INSTER_KEYS + (G6_KEY, O5_KEY, "LateralJerkTorqueController", "NeuralNetworkLateralControl"):
+  for key in INSTER_KEYS + (G6_KEY, O5_KEY, MPC_KEY, "LateralJerkTorqueController", "NeuralNetworkLateralControl"):
     params.put_bool(key, key in on, block=True)
   for key, value in ((CTRL_KEY, ctrl), (GAINS_KEY, legacy_gains)):
     if value is None:
@@ -374,7 +379,7 @@ class TestInsterSteerCap(OpenpilotTestCase):
     from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque as LatControlTorqueV1
     for car_name, cap in ((HYUNDAI.HYUNDAI_INSTER, CAP), (HYUNDAI.HYUNDAI_KONA_EV, 1.0)):
       params = Params()
-      for key in INSTER_KEYS + (G6_KEY, O5_KEY, "LateralJerkTorqueController", "NeuralNetworkLateralControl"):
+      for key in INSTER_KEYS + (G6_KEY, O5_KEY, MPC_KEY, "LateralJerkTorqueController", "NeuralNetworkLateralControl"):
         params.put_bool(key, False, block=True)
       CarInterface = interfaces[car_name]
       CP = CarInterface.get_non_essential_params(car_name)
@@ -1616,3 +1621,267 @@ class TestInsterFixedFactor(OpenpilotTestCase):
         outs.append(self._drive(c, VM, lambda t, f=f: f, n=400))
         assert c.torque_params.latAccelFactor == np.float32(f)
       assert outs[0] != outs[1], (car_name, on)
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+MPC_KEY = "InsterMPC"
+
+
+class _MVM:
+  """modelV2 stand-in for the MPC: frameId, orientationRate.z / velocity.x on T_IDXS for a constant plan curvature k, laneChangeState"""
+  def __init__(self, frame_id, k, v, lane_change=0):
+    self.frameId = frame_id
+    self.orientationRate = type('X', (), {})()
+    self.orientationRate.z = [k * v] * len(ModelConstants.T_IDXS)
+    self.velocity = type('X', (), {})()
+    self.velocity.x = [v] * len(ModelConstants.T_IDXS)
+    self.meta = type('X', (), {})()
+    self.meta.laneChangeState = lane_change
+    # for the jerk / NNLC extension's update_model_v2 (unused by the v0 path)
+    self.acceleration = type('X', (), {})()
+    self.acceleration.y = [0.0] * 33
+    self.orientation = type('X', (), {})()
+    self.orientation.x = [0.0] * 33
+    self.orientation.y = [0.0] * 33
+
+
+def _mpc(params=None):
+  return InsterMPC(DT_CTRL, params, model_t_idxs=ModelConstants.T_IDXS)
+
+
+def _capnp_model(frame_id, k_of_t, v, lane_change=log.LaneChangeState.off):
+  """a REAL modelV2 as SubMaster hands it to controlsd (messaging round trip -> capnp reader): plan curvature k_of_t(T) on T_IDXS"""
+  ev = messaging.new_message('modelV2')
+  m = ev.modelV2
+  m.frameId = frame_id
+  m.orientationRate.z = [k_of_t(t) * v for t in ModelConstants.T_IDXS]
+  m.velocity.x = [v] * len(ModelConstants.T_IDXS)
+  m.meta.laneChangeState = lane_change
+  return messaging.log_from_bytes(ev.to_bytes()).modelV2
+
+
+class TestInsterMPC(OpenpilotTestCase):
+  """model predictive control (InsterMPC) on top of the PID: gain rows, nominal response, switch rules, limits, fallbacks, preview"""
+
+  def test_gain_rows_steady_state(self):
+    rows = mpc_gain_rows(MPC_PARAMS)
+    for iv, v in enumerate(range(1, 46)):
+      for k in (0.0, 0.001, -0.004, 0.02):
+        u0 = rows[iv, 0] * k + rows[iv, 1] * v * v * k + rows[iv, 2:].sum() * k
+        assert abs(u0 - v * v * k) <= 1e-9 * max(1.0, v * v * abs(k)), (v, k, u0)
+
+  def test_nominal_step_response(self):
+    # plan step of 1 m/s^2 at 0.6 s ahead, re-solved every block on the nominal model: the command leads, the nominal curvature follows
+    # the plan on time with a small overshoot (as the kit's step_response)
+    p = MPC_PARAMS
+    rows = mpc_gain_rows(p)
+    for v in (8.0, 15.0, 25.0, 33.0):
+      K = np.array([np.interp(v, np.arange(1.0, 46.0), rows[:, i]) for i in range(rows.shape[1])])
+      al = math.exp(-0.05 / mpc_tau(p, v))
+      kn = ap = 0.0
+      cmd, nom = [], []
+      for b in range(60):
+        t = b * 0.05
+        P = np.array([(1.0 / v ** 2 if t + j * 0.05 >= 0.6 else 0.0) for j in range(25)])
+        u = float(K[0] * kn + K[1] * ap + K[2:] @ P)
+        cmd.append(u)
+        nom.append(kn * v * v)
+        kn = al * kn + (1 - al) * ap / v ** 2
+        ap = u
+      t50_cmd = 0.05 * next(i for i, x in enumerate(cmd) if x >= 0.5)
+      t50_nom = 0.05 * next(i for i, x in enumerate(nom) if x >= 0.5)
+      assert 0.35 <= t50_cmd <= 0.45 and 0.55 <= t50_nom <= 0.70, (v, t50_cmd, t50_nom)
+      assert max(nom) < 1.10 and abs(nom[-1] - 1.0) < 1e-3
+
+  def test_switch_rules(self):
+    # only with the steering-angle controller, the PID and the speed feed-forward (its table slope converts the shift's ramp); off,
+    # with the PI or without the feed-forward: the run equals the one without the param
+    for on in ((ANGLE_PI_KEY, "InsterSpeedFeedforward", MPC_KEY), INSTER_KEYS + (MPC_KEY,)):
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=1)
+      assert c.inster_mpc is not None
+      assert c.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | ANGLE_PI_VERSION_MPC_BIT | 256)
+    for car_name, on, ctrl in ((HYUNDAI.HYUNDAI_INSTER, INSTER_KEYS, 0), (HYUNDAI.HYUNDAI_INSTER, STEP2_KEYS, 1),
+                               (HYUNDAI.HYUNDAI_INSTER, (ANGLE_PI_KEY,), 1),
+                               (HYUNDAI.HYUNDAI_INSTER, ("InsterStictionFriction", ANGLE_PI_KEY), 1),
+                               (HYUNDAI.HYUNDAI_INSTER, INSTER_KEYS + ("NeuralNetworkLateralControl",), 1),
+                               (HYUNDAI.HYUNDAI_KONA_EV, INSTER_KEYS, 1)):
+      c, VM = _make_v0(car_name, on=on + (MPC_KEY,), ctrl=ctrl)
+      assert c.inster_mpc is None
+      assert _run(c, VM) == _run(*_make_v0(car_name, on=on, ctrl=ctrl)), (car_name, on, ctrl)
+    assert angle_pi_log_version(LATERAL_PID, True, True) == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 8 | 64 | 128 | 256)
+    assert MPC_PARAM == MPC_KEY
+    # on: runs, changes the output, stays finite and within the output limit
+    on, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
+    run_on = _run(on, VM, extension_model=lambda ay: _MVM(int(ay * 1000), 0.0, 15.0))
+    run_off = _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=1), extension_model=lambda ay: _MVM(int(ay * 1000), 0.0, 15.0))
+    assert run_on != run_off
+    assert all(math.isfinite(r[0]) and abs(r[0]) <= CAP + 1e-9 for r in run_on)
+
+  def _drive(self, m, n=600, v=lambda k: 15.0, kd=lambda k: 0.01 * math.sin(0.01 * k), pressed=lambda k: False, lc=lambda k: 0,
+             clock=None, model=True):
+    out = []
+    for k in range(n):
+      vv, kk = v(k), kd(k)
+      if model:
+        m.observe_model(_MVM(k // 5, kk, vv, lc(k)))
+      else:
+        m.observe_model(None)
+      la0 = kk * vv * vv
+      kref, delta = m.update(vv, kk, 0.9 * kk, 0.2, pressed(k), la0, ff_table_slope_raw(la0, vv), clock=clock)
+      out.append((kref, delta, m.w, m.h, m.u0))
+    return out
+
+  def test_limits(self):
+    m = _mpc()
+    out = self._drive(m, n=2000, kd=lambda k: 0.02 * math.sin(0.004 * k) + 0.01 * (k % 400 > 200))
+    d = np.array([o[1] for o in out])
+    assert np.all(np.abs(np.diff(d)) <= MPC_JERK_MAX * DT_CTRL + 1e-12)                    # jerk limit of the feed-forward part
+    assert all(abs(o[4]) <= max(MPC_A_LIM, abs(0.03) * 15.0 ** 2) + 1e-12 for o in out)   # |u0| clip
+    assert all(math.isfinite(x) for o in out for x in o)
+    assert max(abs(x) for x in d) > 0.0 and max(o[2] for o in out) > 0.4                   # it acts
+
+  def test_fallbacks(self):
+    # steeringPressed / lane change (state >= 2): weight h < 0.05 within 0.45 s; below 8 km/h: w = 0
+    for kw in ({'pressed': lambda k: k >= 300}, {'lc': lambda k: 2 if k >= 300 else 0}):
+      out = self._drive(_mpc(), **kw)
+      assert out[299][3] > 0.9 and all(o[3] < 0.05 for o in out[345:])
+    out = self._drive(_mpc(), v=lambda k: 7.0 / 3.6)
+    assert all(o[2] == 0.0 for o in out)
+    # three solves in a row over the budget: falls back; back within it: returns
+    t = [0.0]
+    def slow_clock():
+      t[0] += 0.0025                     # each solve reads the clock twice: 2.5 ms per solve (> the 2 ms budget)
+      return t[0]
+    out = self._drive(_mpc(), clock=slow_clock)
+    assert out[50][3] < 0.2 and all(o[3] < 0.05 for o in out[100:])
+    # non-finite plan: no exception, finite outputs
+    m = _mpc()
+    out = self._drive(m, n=200, kd=lambda k: float('nan') if k == 100 else 0.005)
+    assert all(math.isfinite(o[1]) for o in out)
+
+  def test_preview_and_frames(self):
+    m = _mpc()
+    for k in range(12):
+      m.observe_model(_MVM(k // 5, 0.004, 20.0))
+    assert m.age == 1 and m.frame_id == 2
+    m.observe_model(None)                                     # a step without a usable frame ages it
+    assert m.age == 2
+    m.update(20.0, 0.004, 0.004, 0.2, False, 1.6, 100.0)     # fresh start
+    P = m.preview(0.004, 20.0, 0.2)
+    assert np.allclose(P, 0.004)                              # anchored frame of the same curvature: the plan everywhere
+    m.observe_model(_MVM(99, 0.010, 20.0))                    # frame 0.01 vs plan 0.004: |0.006| x 400 = 2.4 m/s^2 > 0.15: not anchored
+    P = m.preview(0.004, 20.0, 0.2)
+    assert np.allclose(P, 0.004)                              # held plan
+    m.observe_model(_MVM(100, 0.0041, 20.0))                  # anchored (0.04 m/s^2): shifted onto the plan
+    assert np.allclose(m.preview(0.004, 20.0, 0.2), 0.004)
+    m.observe_model(_MVM(101, 0.004, 20.0, lane_change=1))    # lane change state != off: held plan
+    assert m.lane_change == 1 and np.allclose(m.preview(0.004, 20.0, 0.2), 0.004)
+    for _ in range(20):
+      m.observe_model(_MVM(101, 0.004, 20.0))
+    assert m.age > 15                                         # too old: held
+
+  def test_reset_restarts_from_the_wheel(self):
+    m = _mpc()
+    self._drive(m, n=300)
+    m.reset()
+    kref, delta = m.update(15.0, 0.01, 0.002, 0.2, False, 2.25, 100.0)
+    # first step after the reset: the nominal state restarts at the measured wheel (0.002) with h one step up from 0, so the reference
+    # is the plan moved slightly towards the wheel and the feed-forward shift starts from 0 within one jerk-limited step
+    assert m.h < 0.07 and m.w < 0.05 and 0.002 <= kref <= 0.01 and abs(kref - 0.01) <= m.w * 0.008 + 1e-12
+    assert abs(delta) <= MPC_JERK_MAX * DT_CTRL + 1e-12 and abs(m.k_nom - 0.002) < 0.001
+
+  def test_real_capnp_model(self):
+    # car review 1, change 1: controlsd hands the extension a capnp READER (laneChangeState is a capnp enum, int() of it raises).
+    # observe_model on readers, with and without a lane change
+    m = _mpc()
+    for lcs in (log.LaneChangeState.off, log.LaneChangeState.preLaneChange, log.LaneChangeState.laneChangeStarting,
+                log.LaneChangeState.laneChangeFinishing):
+      rd = _capnp_model(int(lcs) + 10, lambda t: 0.004, 20.0, lcs)
+      assert not isinstance(rd.meta.laneChangeState, int)
+      m.observe_model(rd)
+      assert m.lane_change == int(lcs) and m.age == 0 and m.row is not None
+    m.observe_model(messaging.new_message('modelV2').modelV2)    # never-received default message: empty lists -> ages, plan held
+    assert m.age == 1
+    # end to end, as controlsd: extension.update_model_v2(reader) -> LatControlTorque.update, active and inactive steps, a lane change
+    c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
+    assert c.inster_mpc is not None
+    n = [0]
+
+    def model(ay):
+      n[0] += 1
+      k = n[0]
+      lcs = log.LaneChangeState.laneChangeStarting if 200 <= k < 260 else (log.LaneChangeState.preLaneChange if 180 <= k < 200
+                                                                            else log.LaneChangeState.off)
+      return _capnp_model(k // 5, lambda t, a=ay: a / 16.0 ** 2, 16.0, lcs)
+    out = _run(c, VM, extension_model=model)
+    assert len(out) == 1200 and all(math.isfinite(r[0]) and abs(r[0]) <= CAP + 1e-9 for r in out)
+    assert c.inster_mpc.n_solve > 100
+
+  def test_gain_set(self):
+    # car review 1, change 2: the MPC variant's own PID gains and D filter, selected only when the MPC is in use. The placeholders equal
+    # PID-30Oct, so distinct values are patched in to see which set is taken.
+    assert (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD, ANGLE_PI_MPC_D_TAU) == (ANGLE_PI_PID_KP, ANGLE_PI_PID_KI, ANGLE_PI_PID_KD,
+                                                                                      ANGLE_PI_D_TAU)   # placeholders until the joint fit
+    mkp, mki, mkd, mtau = (3.0, 0.4, -0.01), (0.8, 0.3, -0.008), (0.3, 0.001, 0.0), 0.05
+    with mock.patch.multiple(latcontrol_torque_v0, ANGLE_PI_MPC_KP=mkp, ANGLE_PI_MPC_KI=mki, ANGLE_PI_MPC_KD=mkd, ANGLE_PI_MPC_D_TAU=mtau):
+      c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
+      assert c.inster_mpc is not None
+      assert (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (mkp, mki, mkd)
+      assert abs(c.inster_wheel_rate.a - (1.0 - math.exp(-DT_CTRL / mtau))) < 1e-15
+      # MPC param on but not in use (PI; no feed-forward), or off: PI-30Oct / PID-30Oct and their filter unchanged
+      for on, ctrl, gains in ((INSTER_KEYS + (MPC_KEY,), 0, (ANGLE_PI_PI_KP, ANGLE_PI_PI_KI, None)),
+                              ((ANGLE_PI_KEY, MPC_KEY), 1, (ANGLE_PI_PID_KP, ANGLE_PI_PID_KI, ANGLE_PI_PID_KD)),
+                              (INSTER_KEYS, 1, (ANGLE_PI_PID_KP, ANGLE_PI_PID_KI, ANGLE_PI_PID_KD))):
+        c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl)
+        assert c.inster_mpc is None
+        assert (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == gains, (on, ctrl)
+        if ctrl == 1:
+          assert abs(c.inster_wheel_rate.a - (1.0 - math.exp(-DT_CTRL / ANGLE_PI_D_TAU))) < 1e-15
+
+  def test_setup_failure_falls_back_to_the_pid(self):
+    # car review 1, change 3: any exception while building the MPC -> plain PID-30Oct, version without bit 128, output as without the param
+    with mock.patch.object(latcontrol_torque_v0, 'InsterMPC', side_effect=RuntimeError('gain rows')):
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
+    assert c.inster_mpc is None
+    assert c.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | 256)
+    assert (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (ANGLE_PI_PID_KP, ANGLE_PI_PID_KI, ANGLE_PI_PID_KD)
+    assert _run(c, VM) == _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=1))
+
+  def test_non_finite_latch(self):
+    # car review 1, change 4: a persistently non-finite solve holds the fallback (h -> 0) until a finite solve; it then returns
+    m = _mpc()
+    self._drive(m, n=300)
+    assert m.h > 0.9
+    good = m.rows
+    m.rows = np.full_like(good, np.nan)
+    out = self._drive(m, n=100)
+    assert all(o[3] < 0.05 for o in out[45:]) and all(math.isfinite(o[0]) and math.isfinite(o[1]) for o in out)
+    m.rows = good
+    out = self._drive(m, n=200)
+    assert out[-1][3] > 0.9
+    # a non-finite nominal curvature is resynchronised to the wheel on the same step
+    m.k_nom = float('nan')
+    kref, delta = m.update(15.0, 0.01, 0.009, 0.2, False, 2.25, 100.0)
+    assert m.k_nom == 0.009 and math.isfinite(kref) and math.isfinite(delta)
+
+  def test_preview_linear_profile(self):
+    # car review 1, change 6: a plan curvature linear in T checks the frame time offset (0.075 s + age steps) beyond lat_delay numerically
+    k0, s, v, ld, age = 0.002, 0.002, 20.0, 0.2, 3
+    m = _mpc()
+    m.observe_model(_capnp_model(1, lambda t: k0 + s * t, v))
+    for _ in range(age):
+      m.observe_model(_capnp_model(1, lambda t: k0 + s * t, v))
+    assert m.age == age
+    a0 = 0.075 + DT_CTRL * age
+    kd = k0 + s * (ld + a0)                                   # the plan now = the frame at lat_delay: anchored exactly, no shift
+    m.update(v, kd, kd, ld, False, kd * v * v, 100.0)
+    P = m.preview(kd, v, ld)
+    taus = np.arange(25) * 0.05
+    fut = taus > ld
+    # tolerance: modelV2 stores Float32 (~1e-10 here); one step of age or a wrong anchor shift would be >= s x 0.01 s = 2e-5
+    assert np.allclose(P[fut], k0 + s * (taus[fut] + a0), rtol=0, atol=1e-9)
+    assert np.allclose(P[~fut], kd, rtol=0, atol=1e-12)         # own buffer (constant plan so far)
+    # offset plan (anchored within 0.15 m/s^2): the frame shifted by kd - k_now
+    kd2 = kd + 0.1 / v ** 2
+    P2 = m.preview(kd2, v, ld)
+    assert np.allclose(P2[fut], k0 + s * (taus[fut] + a0) + (kd2 - kd), rtol=0, atol=1e-9)
