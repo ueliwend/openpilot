@@ -92,12 +92,18 @@ def max_lateral_accel_no_roll(CP, default: float) -> float:
 A_NODES = (0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 3.5)       # m/s^2
 V_NODES = tuple(x / 3.6 for x in (22.0, 32.0, 48.0, 76.0, 111.0))          # m/s
 CMD_RAW = (                                                                # rows: V_NODES, columns: A_NODES
-  (0.0, 23.0, 57.1, 142.4, 250.6, 303.8, 352.2, 409.0, 409.0, 409.0, 409.0),   # 22 km/h  (measured to 1.25 m/s^2)
-  (0.0, 23.0, 48.0, 108.6, 136.8, 190.6, 242.5, 314.7, 387.2, 409.0, 409.0),   # 32 km/h  (measured to 2.5)
+  (0.0, 23.0, 51.0, 115.0, 210.6, 303.8, 352.2, 409.0, 409.0, 409.0, 409.0),   # 22 km/h  (measured to 1.25 m/s^2)
+  (0.0, 23.0, 48.0, 97.8, 136.8, 175.2, 233.4, 314.7, 387.2, 409.0, 409.0),   # 32 km/h  (measured to 2.5)
   (0.0, 21.1, 48.0, 95.4, 121.8, 150.6, 183.0, 267.9, 328.0, 396.8, 409.0),    # 48 km/h  (measured to 3.0)
   (0.0, 19.8, 39.0, 67.9, 97.9, 130.3, 168.6, 267.9, 328.0, 396.8, 409.0),     # 76 km/h  (measured to 1.5)
   (0.0, 19.8, 38.8, 57.7, 85.2, 115.8, 154.0, 251.0, 318.6, 389.9, 409.0),     # 111 km/h (measured to 1.0)
 )
+# 30 Oct 2026, owner's rule: a cell follows the refit over all drives whenever the refit moves it by more than its uncertainty (1 sigma
+# of the node bootstrap; no per-drive support, no holds). 22-drive refit after route 000000af (t2_table409), all six cells lower:
+#   22 km/h @ 0.5 / 0.75 / 1.0 m/s^2: 57.1 / 142.4 / 250.6 -> 51.0 / 115.0 / 210.6  (sigma_BS 4.0 / 24.0 / 21.9, sigma_JK 2.1 / 11.5 / 22.4)
+#   32 km/h @ 0.75 / 1.25 / 1.5 m/s^2: 108.6 / 190.6 / 242.5 -> 97.8 / 175.2 / 233.4 (sigma_BS 6.6 / 7.2 / 7.2, sigma_JK 4.3 / 11.8 / 13.6)
+# 32@0.75 mixes crossfall points (near-straight, roll-driven, about 60 raw) and cornering points (about 110 raw). The 22 km/h row's
+# slope ratio 0.5->0.75 over 0.25->0.5 is now 2.29 (test_smooth_in_lateral_accel limit 2.5).
 # 26 Oct 2026, twenty-drive refit after route 000000a1: 32 km/h @ 1.0 m/s^2 146.2 -> 136.8; 48 km/h @ 1.0 / 1.25 / 1.5 m/s^2
 # 116.1 / 141.7 / 168.6 -> 121.8 / 150.6 / 183.0. Change 1.3-1.8 sigma by the refit's block bootstrap, about 1 sigma by leave-one-drive-out;
 # the 48 km/h move comes from that route alone (the refit without it equals the table). F0 and the clip unchanged: the filtered learned
