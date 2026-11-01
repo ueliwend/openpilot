@@ -46,7 +46,8 @@ from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import CRAWL_PER
                                                                        crawl_plan_curvature
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_VERSION_MPC_BIT, MPC_PARAM, MPC_PARAMS, \
                                                                        MPC_A_LIM, MPC_JERK_MAX, InsterMPC, ff_table_slope_raw, \
-                                                                       mpc_gain_rows, mpc_tau, ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, \
+                                                                       mpc_gain_rows, mpc_tau, mpc_fade, mpc_strength, \
+                                                                       ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, \
                                                                        ANGLE_PI_MPC_KD, ANGLE_PI_MPC_D_TAU
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
@@ -1709,6 +1710,19 @@ class TestInsterMPC(OpenpilotTestCase):
       assert c.inster_mpc is None
       assert _run(c, VM) == _run(*_make_v0(car_name, on=on, ctrl=ctrl)), (car_name, on, ctrl)
     assert angle_pi_log_version(LATERAL_PID, True, True) == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 8 | 64 | 128 | 256)
+    # owner 1 Nov 2026: Soft Small-Error P is off while the MPC runs (version without the Soft-P bit; the run equals MPC without Soft-P);
+    # without the MPC (switch off, or the MPC set-up failed) Soft-P stays as selected
+    sp_mpc, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (O5_KEY, MPC_KEY), ctrl=1)
+    assert sp_mpc.inster_mpc is not None and not sp_mpc.inster_soft_p
+    assert sp_mpc.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | ANGLE_PI_VERSION_MPC_BIT | 256)
+    def mdl(ay):
+      return _MVM(int(ay * 1000), 0.0, 15.0)
+    assert _run(sp_mpc, VM, extension_model=mdl) == _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1),
+                                                         extension_model=mdl)
+    assert _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (O5_KEY,), ctrl=1)[0].inster_soft_p
+    with mock.patch.object(latcontrol_torque_v0, "InsterMPC", side_effect=RuntimeError("set-up")):
+      failed = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (O5_KEY, MPC_KEY), ctrl=1)[0]
+    assert failed.inster_mpc is None and failed.inster_soft_p
     assert MPC_PARAM == MPC_KEY
     # on: runs, changes the output, stays finite and within the output limit
     on, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
@@ -1741,11 +1755,11 @@ class TestInsterMPC(OpenpilotTestCase):
     assert max(abs(x) for x in d) > 0.0 and max(o[2] for o in out) > 0.4                   # it acts
 
   def test_fallbacks(self):
-    # steeringPressed / lane change (state >= 2): weight h < 0.05 within 0.45 s; below 8 km/h: w = 0
+    # steeringPressed / lane change (state >= 2): weight h < 0.05 within 0.45 s; below the 1 m/s floor: w = 0
     for kw in ({'pressed': lambda k: k >= 300}, {'lc': lambda k: 2 if k >= 300 else 0}):
       out = self._drive(_mpc(), **kw)
       assert out[299][3] > 0.9 and all(o[3] < 0.05 for o in out[345:])
-    out = self._drive(_mpc(), v=lambda k: 7.0 / 3.6)
+    out = self._drive(_mpc(), v=lambda k: 3.5 / 3.6)
     assert all(o[2] == 0.0 for o in out)
     # three solves in a row over the budget: falls back; back within it: returns
     t = [0.0]
@@ -1790,6 +1804,27 @@ class TestInsterMPC(OpenpilotTestCase):
     assert m.h < 0.07 and m.w < 0.05 and 0.002 <= kref <= 0.01 and abs(kref - 0.01) <= m.w * 0.008 + 1e-12
     assert abs(delta) <= MPC_JERK_MAX * DT_CTRL + 1e-12 and abs(m.k_nom - 0.002) < 0.001
 
+  def test_low_speed(self):
+    # owner 30 Oct 13:50: no fixed low-speed limit. f_v: 0 below 1 m/s (modeld's plan floor / crawl rule), smoothstep up to the fitted
+    # v_on; strength and model lag with a knot at 5 km/h
+    p = dict(MPC_PARAMS, v_on=8.0, g_vlo=0.4, g_lo=0.2, g=0.6, tau_vlo=0.35, tau_lo=0.25, tau_hi=0.2)
+    assert mpc_fade(p, 3.5 / 3.6) == 0.0 and mpc_fade(p, 1.0) == 0.0 and mpc_fade(p, 8.5 / 3.6) == 1.0
+    assert 0.0 < mpc_fade(p, 5.0 / 3.6) < mpc_fade(p, 7.0 / 3.6) < 1.0
+    assert mpc_fade(dict(p, v_on=3.6), 3.8 / 3.6) == 1.0                    # v_on at the floor: a 0.1 km/h ramp, no division by 0
+    for kmh, g, tau in ((2.0, 0.4, 0.35), (5.0, 0.4, 0.35), (10.0, 0.3, 0.30), (15.0, 0.2, 0.25), (27.5, 0.4, None), (40.0, 0.6, None),
+                        (80.0, 0.6, None)):
+      assert abs(mpc_strength(p, kmh / 3.6) - g) < 1e-12, kmh
+      if tau is not None:
+        assert abs(mpc_tau(p, kmh / 3.6) - tau) < 1e-12, kmh
+    assert abs(mpc_tau(p, 100 / 3.6) - 0.2) < 1e-12 and abs(mpc_tau(p, 57.5 / 3.6) - 0.225) < 1e-12
+    # it acts at junction speed: full weight at 6 km/h with v_on 6 (strength 0.4 there)
+    out = self._drive(_mpc(dict(MPC_PARAMS, v_on=6.0, g_vlo=0.4, g_lo=0.4)), v=lambda k: 6.0 / 3.6, kd=lambda k: 0.1 * math.sin(0.01 * k))
+    assert abs(out[-1][2] - 0.4) < 1e-3
+    assert all(math.isfinite(x) for o in out for x in o)
+    # the car's parameters: w = g(v) f_v at 6 km/h once h has settled
+    w6 = self._drive(_mpc(), n=300, v=lambda k: 6.0 / 3.6)[-1][2]
+    assert abs(w6 - mpc_strength(MPC_PARAMS, 6.0 / 3.6) * mpc_fade(MPC_PARAMS, 6.0 / 3.6)) < 1e-3
+
   def test_real_capnp_model(self):
     # car review 1, change 1: controlsd hands the extension a capnp READER (laneChangeState is a capnp enum, int() of it raises).
     # observe_model on readers, with and without a lane change
@@ -1818,10 +1853,20 @@ class TestInsterMPC(OpenpilotTestCase):
     assert c.inster_mpc.n_solve > 100
 
   def test_gain_set(self):
-    # car review 1, change 2: the MPC variant's own PID gains and D filter, selected only when the MPC is in use. The placeholders equal
-    # PID-30Oct, so distinct values are patched in to see which set is taken.
-    assert (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD, ANGLE_PI_MPC_D_TAU) == (ANGLE_PI_PID_KP, ANGLE_PI_PID_KI, ANGLE_PI_PID_KD,
-                                                                                      ANGLE_PI_D_TAU)   # placeholders until the joint fit
+    # car review 1, change 2: the MPC variant's own PID gains and D filter, selected only when the MPC is in use. Parameter set MPC-A-1Nov
+    # (the joint fit's stage A best, owner 1 Nov 2026) is pinned here; it differs from PID-30Oct. Unpatched: the MPC uses it.
+    assert (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD, ANGLE_PI_MPC_D_TAU) == (
+      (3.5764071138435822, 0.6069106280769496, -0.012246468442705995), (0.9499077965973175, 0.5756575528452839, -0.012698840210045881),
+      (0.40843082897221394, -0.005210476271808798, 5.5853227561167726e-05), 0.028949830059251083)
+    assert MPC_PARAMS == {'g': 0.5080179165341798, 'g_lo': 0.24986981708158032, 'g_vlo': 0.2471479072946154, 'wy': 0.10350976407555024,
+                          'wpsi': 3.9946207179544757, 'wdu': -0.3973076603177539, 'wu': -0.8223798403038565, 'tau_vlo': 0.2590635309240658,
+                          'tau_lo': 0.2568733526712028, 'tau_hi': 0.19604909401053905, 'v_on': 15.102862785501967}
+    assert (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD) != (ANGLE_PI_PID_KP, ANGLE_PI_PID_KI, ANGLE_PI_PID_KD)
+    c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
+    assert c.inster_mpc is not None and c.inster_mpc.p == MPC_PARAMS
+    assert (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD)
+    assert abs(c.inster_wheel_rate.a - (1.0 - math.exp(-DT_CTRL / ANGLE_PI_MPC_D_TAU))) < 1e-15
+    # distinct values patched in to see which set is taken
     mkp, mki, mkd, mtau = (3.0, 0.4, -0.01), (0.8, 0.3, -0.008), (0.3, 0.001, 0.0), 0.05
     with mock.patch.multiple(latcontrol_torque_v0, ANGLE_PI_MPC_KP=mkp, ANGLE_PI_MPC_KI=mki, ANGLE_PI_MPC_KD=mkd, ANGLE_PI_MPC_D_TAU=mtau):
       c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)

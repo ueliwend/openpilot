@@ -525,7 +525,9 @@ class InsterWheelRateFilter:
 #   solve (the plan is re-anchored at the car; no plan reaction is assumed); cost sum q_y y^2 + q_psi psi^2 + q_a v^4 (kappa_n - kappa_p)^2
 #   + r_d du^2 + r_u (u - v^2 kappa_p(j + 1))^2; optimum u0 = K(v) . [kappa_n, a_prev, kappa_p(0 .. 24)] with K precomputed per speed
 #   (1 m/s grid, linear in v) once at start-up (mpc_gain_rows, ~0.1 s here, ~0.7 s EST on the device).
-#   Outputs, blended with w = g(v) h f_v (g: g_lo at 15 km/h, linear to g at 40 km/h; f_v: smoothstep 8 -> 15 km/h; h: fallback weight):
+#   Outputs, blended with w = g(v) h f_v (g: g_vlo at 5, g_lo at 15, g at 40 km/h, linear between; f_v: smoothstep from 1 m/s to the
+#   fitted full-strength speed v_on (no fixed low-speed limit; below 1 m/s the plan is floored by modeld / rewritten by the crawl rule);
+#   h: fallback weight):
 #     feed-forward  delta added to v0's gravity-adjusted feed-forward lateral acceleration (before the table), rate-limited to the car's
 #                   ramp in raw-equivalent units (3 raw / step growing, 5 shrinking; table slope floor 30 raw per m/s^2) and to 5 m/s^3;
 #     reference     kappa_ref = kappa_des + w (kappa_nom - kappa_des) for the angle error of P and I (and the integrator-freeze direction);
@@ -538,25 +540,29 @@ class InsterWheelRateFilter:
 #   change (state >= 2), non-finite numbers (held until the next finite solve), three solves in a row over MPC_BUDGET_S.
 #   On the car the controller state is reset whenever lateral control is inactive (as the kit at a stretch start); missed model frames
 #   only age the preview (hold beyond 15 steps) and never reset the feed-forward part.
-# torqueState.version: + 1000 x ANGLE_PI_VERSION_MPC_BIT (128). Parameters: MPC_PARAMS (the kit's start point until the fit replaces it).
+# torqueState.version: + 1000 x ANGLE_PI_VERSION_MPC_BIT (128). Parameters: MPC_PARAMS (set MPC-A-1Nov, fit stage A; to be replaced by stage B).
 MPC_PARAM = "InsterMPC"
 ANGLE_PI_VERSION_MPC_BIT = 128
-MPC_PARAMS = {'g': 0.5, 'g_lo': 0.25, 'wy': 0.0, 'wpsi': 4.0, 'wdu': -0.5, 'wu': -1.0, 'tau_lo': 0.25,   # NOT FITTED: kit start point
-              'tau_hi': 0.20}
-# the PID's gain set when the MPC is in use (selected only then; PI-30Oct / PID-30Oct unchanged otherwise). PLACEHOLDER = PID-30Oct
-# until the joint fit (MPC + PID gains + D filter tau) replaces it.
-ANGLE_PI_MPC_KP = ANGLE_PI_PID_KP
-ANGLE_PI_MPC_KI = ANGLE_PI_PID_KI
-ANGLE_PI_MPC_KD = ANGLE_PI_PID_KD
-ANGLE_PI_MPC_D_TAU = ANGLE_PI_D_TAU
+# Parameter set MPC-A-1Nov (owner 1 Nov 2026: 'commit it with the values from the end of stage A, update later'): the joint fit's
+# stage A best (failure-weighted objective v7r6fws-a30738-81888d-df91320c, 180 evaluations on one simulator member, NOT converged;
+# the stage B polish on four members follows and will replace these values). SIM only, not validated on the car.
+MPC_PARAMS = {'g': 0.5080179165341798, 'g_lo': 0.24986981708158032, 'g_vlo': 0.2471479072946154, 'wy': 0.10350976407555024,
+              'wpsi': 3.9946207179544757, 'wdu': -0.3973076603177539, 'wu': -0.8223798403038565, 'tau_vlo': 0.2590635309240658,
+              'tau_lo': 0.2568733526712028, 'tau_hi': 0.19604909401053905, 'v_on': 15.102862785501967}
+# the PID's gain set and D filter when the MPC is in use (selected only then; PI-30Oct / PID-30Oct unchanged otherwise): fitted jointly
+# with MPC_PARAMS (same parameter set MPC-A-1Nov), coefficients in m/s as PID-30Oct
+ANGLE_PI_MPC_KP = (3.5764071138435822, 0.6069106280769496, -0.012246468442705995)
+ANGLE_PI_MPC_KI = (0.9499077965973175, 0.5756575528452839, -0.012698840210045881)
+ANGLE_PI_MPC_KD = (0.40843082897221394, -0.005210476271808798, 5.5853227561167726e-05)
+ANGLE_PI_MPC_D_TAU = 0.028949830059251083
 MPC_WA = -1.0                      # log10 q_a (fixed)
 MPC_NBLK = 5                       # control steps per block / solve (20 Hz at dt 0.01)
 MPC_NH = 24                        # horizon blocks (1.2 s)
 MPC_DT = 0.01                      # the kit's step; the car's controlsd step DT_CTRL (checked in __init__)
 MPC_DTB = MPC_DT * MPC_NBLK
-MPC_V_OFF, MPC_V_ON = 8.0, 15.0    # km/h: f_v fade-in
-MPC_V_TLO, MPC_V_THI = 15.0, 100.0  # km/h: tau_lo / tau_hi nodes
-MPC_V_GLO, MPC_V_GHI = 15.0, 40.0  # km/h: g_lo / g nodes
+MPC_V_FLOOR = 3.6                  # km/h (1 m/s): f_v = 0 below; full strength at MPC_PARAMS['v_on'] (fitted)
+MPC_V_TVLO, MPC_V_TLO, MPC_V_THI = 5.0, 15.0, 100.0   # km/h: tau_vlo / tau_lo / tau_hi knots
+MPC_V_GVLO, MPC_V_GLO, MPC_V_GHI = 5.0, 15.0, 40.0    # km/h: g_vlo / g_lo / g knots
 MPC_TAU_H = 0.15                   # s: fallback weight low-pass
 MPC_ANCHOR = 0.15                  # m/s^2: frame preview anchored to the desired curvature within this
 MPC_AGE_MAX = 15                   # steps: oldest usable model frame
@@ -576,11 +582,30 @@ def _smoothstep(x: float) -> float:
   return x * x * (3.0 - 2.0 * x)
 
 
+def _mpc_pwl(x: float, xs: tuple, ys: tuple) -> float:
+  """piecewise linear through (xs, ys), flat outside (the same arithmetic as the kit's pwl)"""
+  if x <= xs[0]:
+    return float(ys[0])
+  for i in range(1, len(xs)):
+    if x <= xs[i]:
+      return float(ys[i - 1]) + (float(ys[i]) - float(ys[i - 1])) * (x - xs[i - 1]) / (xs[i] - xs[i - 1])
+  return float(ys[-1])
+
+
 def mpc_tau(p: dict, v_ego: float) -> float:
-  """nominal model lag (s): tau_lo at 15 km/h, linear to tau_hi at 100 km/h, flat outside"""
-  s = (v_ego * 3.6 - MPC_V_TLO) / (MPC_V_THI - MPC_V_TLO)
-  s = 0.0 if s < 0.0 else (1.0 if s > 1.0 else s)
-  return p['tau_lo'] + (p['tau_hi'] - p['tau_lo']) * s
+  """nominal model lag (s): tau_vlo at 5 km/h, tau_lo at 15 km/h, tau_hi at 100 km/h, linear in between, flat outside"""
+  return _mpc_pwl(v_ego * 3.6, (MPC_V_TVLO, MPC_V_TLO, MPC_V_THI), (p['tau_vlo'], p['tau_lo'], p['tau_hi']))
+
+
+def mpc_fade(p: dict, v_ego: float) -> float:
+  """f_v: smoothstep from MPC_V_FLOOR to the fitted full-strength speed p['v_on'] (km/h)"""
+  w = float(p['v_on']) - MPC_V_FLOOR
+  return _smoothstep((v_ego * 3.6 - MPC_V_FLOOR) / (w if w > 0.1 else 0.1))
+
+
+def mpc_strength(p: dict, v_ego: float) -> float:
+  """g(v): g_vlo at 5 km/h, g_lo at 15 km/h, g at 40 km/h, linear in between, flat outside"""
+  return _mpc_pwl(v_ego * 3.6, (MPC_V_GVLO, MPC_V_GLO, MPC_V_GHI), (p['g_vlo'], p['g_lo'], p['g']))
 
 
 def mpc_gain_rows(p: dict):
@@ -750,7 +775,7 @@ class InsterMPC:
       self.fresh = False
     self.kbuf[:-1] = self.kbuf[1:]
     self.kbuf[-1] = kd
-    fv = _smoothstep((v_ego * 3.6 - MPC_V_OFF) / (MPC_V_ON - MPC_V_OFF))
+    fv = mpc_fade(self.p, v_ego)
     ok = not steering_pressed and self.lane_change < 2 and fv > 0.0
     if self.nb % MPC_NBLK == 0:
       if fv > 0.0:
@@ -791,9 +816,7 @@ class InsterMPC:
       self.k_nom = k_meas
       self.a_prev = self.u0 = kd * v2
       self.abuf = [kd * v2] * (MPC_NBLK + 1)
-    sg = (v_ego * 3.6 - MPC_V_GLO) / (MPC_V_GHI - MPC_V_GLO)
-    sg = 0.0 if sg < 0.0 else (1.0 if sg > 1.0 else sg)
-    w = (self.p['g_lo'] + (self.p['g'] - self.p['g_lo']) * sg) * self.h * fv
+    w = mpc_strength(self.p, v_ego) * self.h * fv
     self.w = w
     tgt = w * (a_cmd - kd * v2)
     slope = slope_raw if slope_raw > MPC_SLOPE_MIN else MPC_SLOPE_MIN

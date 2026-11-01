@@ -139,6 +139,11 @@ class LatControlTorque(LatControl):
           cloudlog.exception("InsterMPC set-up failed: running the plain PID")
           self.inster_mpc = None
           mpc = False
+      if mpc and self.inster_soft_p:
+        # owner 1 Nov 2026: Soft Small-Error P is off while the MPC runs (the MPC and its PID gains were fitted without it; the combination
+        # is not simulated). If the MPC set-up failed above, the plain PID keeps Soft-P as selected.
+        cloudlog.warning("InsterSoftSmallErrorP is off while InsterMPC runs (the MPC was fitted without it)")
+        self.inster_soft_p = False
       self.inster_angle_pi_version = angle_pi_log_version(controller, self.inster_soft_p, mpc)
       if self.inster_soft_p and controller != LATERAL_PID:
         cloudlog.info("InsterSoftSmallErrorP: its parameters were fitted with the PID, not the PI selected")
