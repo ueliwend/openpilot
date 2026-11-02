@@ -27,6 +27,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.system.statsd import statlog
 from openpilot.system.hardware.power_monitoring import PowerMonitoring
 from openpilot.system.hardware.fan_controller import FanController
+from openpilot.system.hardware.stats_reader import CallTimer, NetworkContext, PeriodicReader, wait_first_samples
 from openpilot.system.hardware.chestnut.monitoring import chestnut_state_thread
 from openpilot.system.hardware.chestnut.status import ChestnutStatus
 from openpilot.common.version import terms_version, training_version, get_build_metadata, terms_version_sp
@@ -39,6 +40,32 @@ TEMP_TAU = 5.   # 5s time constant
 DISCONNECT_TIMEOUT = 5.  # wait 5 seconds before going offroad after disconnect so you get an alert
 PANDA_STATES_TIMEOUT = round(1000 / SERVICE_LIST['pandaStates'].frequency * 1.5)  # 1.5x the expected pandaState frequency
 ONROAD_CYCLE_TIME = 1  # seconds to wait offroad after requesting an onroad cycle
+
+# How long a read may stall before its reader is stale (exact definition: stats_reader.PeriodicReader). While a read is
+# stalled for up to the limit, deviceState goes out with the last sample (data at most limit + DT_HW old); beyond it,
+# deviceState is invalid and startup is blocked, see hardware_thread().
+#
+# Thermal, 5 s. Bands (tici/tizi): ok -> overheated above 96 C, -> critical above 107 C, back below 94 / 88 C (mici:
+# 100 / 107, 98 / 92), on the max temperature through a TEMP_TAU = 5 s filter. Holding the last sample delays the
+# filter input by at most 5.5 s, so a band transition comes at most 5.5 s later, i.e. 5.5 * s C for a temperature rising
+# at s C/s. The filter itself already lags a ramp by TEMP_TAU * s = 5 * s, so the hold at most doubles that lag; a spike
+# shorter than the hold, which the hold could miss, is reduced by the filter to about its duration / 5.5 s anyway.
+# Logged drives peaked at 69-77 C (thermal status ok throughout); no slew is measured in our logs. Assuming a worst
+# case of 1 C/s sustained, the error is <= 5.5 C: half the 11 C from overheated (96 C) to critical (107 C), and far
+# below the 19 C from 77 C to 96 C. 10 s would put it (11 C) at the overheated -> critical gap.
+# The longest stall in these reads seen so far, 2 Nov (4.24 s in the old 'stats' step, 4.6 s deviceState gap), fits.
+THERMAL_STALL_LIMIT = 5.  # s
+# Memory, 5 s, a reader of its own (one /proc/meminfo read). memoryUsagePercent feeds selfdrived's lowMemory (> 90 %,
+# soft disable), so it gets the same bound as the temperatures. Before, a stuck meminfo read stopped deviceState and
+# selfdrived alerted within a few seconds; memory pressure (reclaim, writeback) is also a likely cause of such stalls.
+# Its own reader keeps a stuck procfs read from holding up the temperatures (which would force the fan) and vice versa.
+MEMORY_STALL_LIMIT = 5.  # s
+# Stats (cpu, free space, GPU, brightness), 30 s; none of them feeds a disengagement. Consumers: free space ->
+# selfdrived outOfSpace (< 7 %; permanent + no-entry alert only) and the free_space startup condition (> 2 %);
+# brightness -> power save (offroad only, ignition always wins); cpu/GPU -> statlog only. Free space: the deleter keeps
+# >= 10 % and recording writes a few MB/s, so 30 s move it well under 1 % (assumed rates). 30 s also covers the storage
+# stalls seen in October (statvfs on a slow /data, pauses of up to ~8 s).
+STATS_STALL_LIMIT = 30.  # s
 
 class Chestnut:
   # flash before going onroad, modeld ignores chestnut until the product string matches
@@ -91,6 +118,11 @@ class Chestnut:
 ThermalBand = namedtuple("ThermalBand", ['min_temp', 'max_temp'])
 HardwareState = namedtuple("HardwareState", ['network_type', 'network_info', 'network_strength', 'network_stats',
                                              'network_metered', 'modem_temps', 'usb_state'])
+# read by the stats reader thread, see read_system_stats()
+SystemStats = namedtuple("SystemStats", ['cpu_usage', 'free_space', 'gpu_usage', 'screen_brightness'])
+# before the first stats sample: the values the reads themselves fall back to on failure
+NO_SYSTEM_STATS = SystemStats(cpu_usage=[], free_space=100.0, gpu_usage=0., screen_brightness=0)
+NETWORK_TYPE_NAMES = {v: k for k, v in NetworkType.schema.enumerants.items()}
 
 # List of thermal bands. We will stay within this region as long as we are within the bounds.
 # When exiting the bounds, we'll jump to the lower or higher band. Bands are ordered in the dict.
@@ -155,35 +187,44 @@ def touch_thread(end_event):
       time.sleep(DT_HW)
 
 
-def hw_state_thread(end_event, hw_queue):
+def hw_state_thread(end_event, hw_queue, network=None):
   """Handles non critical hardware state, and sends over queue"""
   count = 0
   prev_hw_state = None
   prev_usb_topology = set()
+  # diagnostics only: logs each call below that takes longer than SLOW_CALL_THRESHOLD
+  timer = CallTimer("hw_state", network)
+
+  def get_network_type():
+    # updates the network context before the timer logs, so a slow get_network_type shows the type before and after
+    network_type = HARDWARE.get_network_type()
+    if network is not None:
+      network.update(NETWORK_TYPE_NAMES.get(network_type, str(network_type)))
+    return network_type
 
   while not end_event.is_set():
-    usb_topology = get_usb_topology()
+    usb_topology = timer.call("get_usb_topology", get_usb_topology)
     usb_changed = usb_topology != prev_usb_topology
 
     # these are expensive calls. update every 10s or when USB devices change
     if (count % int(10. / DT_HW)) == 0 or usb_changed:
       prev_usb_topology = usb_topology
       try:
-        network_type = HARDWARE.get_network_type()
-        modem_temps = HARDWARE.get_modem_temperatures()
+        network_type = timer.call("get_network_type", get_network_type)
+        modem_temps = timer.call("get_modem_temperatures", HARDWARE.get_modem_temperatures)
         if len(modem_temps) == 0 and prev_hw_state is not None:
           modem_temps = prev_hw_state.modem_temps
 
-        tx, rx = HARDWARE.get_modem_data_usage()
+        tx, rx = timer.call("get_modem_data_usage", HARDWARE.get_modem_data_usage)
 
         hw_state = HardwareState(
           network_type=network_type,
-          network_info=HARDWARE.get_network_info(),
-          network_strength=HARDWARE.get_network_strength(network_type),
+          network_info=timer.call("get_network_info", HARDWARE.get_network_info),
+          network_strength=timer.call("get_network_strength", HARDWARE.get_network_strength, network_type),
           network_stats={'wwanTx': tx, 'wwanRx': rx},
-          network_metered=HARDWARE.get_network_metered(network_type),
+          network_metered=timer.call("get_network_metered", HARDWARE.get_network_metered, network_type),
           modem_temps=modem_temps,
-          usb_state=get_usb_state(),
+          usb_state=timer.call("get_usb_state", get_usb_state),
         )
 
         try:
@@ -247,7 +288,22 @@ class LoopTimer:
       pass
 
 
-def hardware_thread(end_event, hw_queue) -> None:
+def read_memory_usage(system_stats: LinuxSystemStats | None, timer: CallTimer) -> float:
+  # runs in the memory reader thread (/proc/meminfo)
+  return timer.call("memory_usage_percent", system_stats.memory_usage_percent) if system_stats is not None else 0.
+
+
+def read_system_stats(system_stats: LinuxSystemStats | None, timer: CallTimer) -> SystemStats:
+  # runs in the stats reader thread: each of these reads procfs, statvfs or sysfs and can block
+  return SystemStats(
+    cpu_usage=timer.call("cpu_usage_percent", system_stats.cpu_usage_percent) if system_stats is not None else [],
+    free_space=timer.call("get_available_percent", get_available_percent, default=100.0),
+    gpu_usage=timer.call("get_gpu_usage_percent", HARDWARE.get_gpu_usage_percent),
+    screen_brightness=timer.call("get_screen_brightness", HARDWARE.get_screen_brightness),
+  )
+
+
+def hardware_thread(end_event, hw_queue, network: NetworkContext | None = None) -> None:
   system_stats = LinuxSystemStats() if sys.platform == "linux" else None
   pm = messaging.PubMaster(['deviceState'])
   sm = messaging.SubMaster(["peripheralState", "gpsLocationExternal", "selfdriveState", "pandaStates", "chestnutState"], poll="pandaStates")
@@ -305,6 +361,19 @@ def hardware_thread(end_event, hw_queue) -> None:
   is_unsupported_combo = COMMA_HARDWARE and HARDWARE.get_device_type() == "tici" and build_metadata.channel_type != "tici"
   loop_timer = LoopTimer()
 
+  # The reads that can block (2 Nov: 4.24 s in them stopped deviceState for 4.6 s) run in their own threads; this loop
+  # only takes their latest samples. Temperatures get a reader of their own, so a stalled procfs/statvfs read can't
+  # make them stale. Stall limits: THERMAL_STALL_LIMIT / MEMORY_STALL_LIMIT / STATS_STALL_LIMIT above.
+  thermal_reader = PeriodicReader("thermal", lambda timer: thermal_config.get_msg(timer.call), DT_HW, THERMAL_STALL_LIMIT, network)
+  memory_reader = PeriodicReader("memory", lambda timer: read_memory_usage(system_stats, timer), DT_HW, MEMORY_STALL_LIMIT, network)
+  stats_reader = PeriodicReader("stats", lambda timer: read_system_stats(system_stats, timer), DT_HW, STATS_STALL_LIMIT, network)
+  readers = (thermal_reader, memory_reader, stats_reader)
+  for reader in readers:
+    reader.start(end_event)
+  # the first samples normally take milliseconds; don't publish the first deviceState without them unless they're stuck
+  # (a reader is stale until its first sample)
+  wait_first_samples(readers, THERMAL_STALL_LIMIT, end_event)
+
   while not end_event.is_set():
     wait_start = time.monotonic()
     sm.update(PANDA_STATES_TIMEOUT)
@@ -339,8 +408,23 @@ def hardware_thread(end_event, hw_queue) -> None:
       continue
     loop_timer.mark("panda")
 
-    msg = messaging.new_message('deviceState', valid=True)
-    msg.deviceState = thermal_config.get_msg()
+    # A transient stall of a reader no longer holds up deviceState: it goes out with the latest samples. Once a read
+    # has stalled for longer than its reader's limit, deviceState is marked invalid (selfdrived raises its existing
+    # commIssue alert, manager stops kicking the power watchdog, as when hardwared itself stalled before), startup is
+    # blocked, and stale temperatures are kept away from the thermal logic below.
+    now = time.monotonic()
+    thermal_fresh = thermal_reader.fresh(now)
+    memory_fresh = memory_reader.fresh(now)
+    stats_fresh = stats_reader.fresh(now)
+    readings_fresh = thermal_fresh and memory_fresh and stats_fresh
+    thermal_sample = thermal_reader.latest
+    memory_sample = memory_reader.latest
+    stats_sample = stats_reader.latest
+    stats = stats_sample.data if stats_sample is not None else NO_SYSTEM_STATS
+
+    msg = messaging.new_message('deviceState', valid=readings_fresh)
+    if thermal_sample is not None:
+      msg.deviceState = thermal_sample.data
     msg.deviceState.deviceType = HARDWARE.get_device_type()
 
     try:
@@ -348,12 +432,12 @@ def hardware_thread(end_event, hw_queue) -> None:
     except queue.Empty:
       pass
 
-    memory_usage = system_stats.memory_usage_percent() if system_stats is not None else 0.
-    cpu_usage = system_stats.cpu_usage_percent() if system_stats is not None else []
+    memory_usage = memory_sample.data if memory_sample is not None else 0.
+    cpu_usage = stats.cpu_usage
 
-    msg.deviceState.freeSpacePercent = get_available_percent(default=100.0)
+    msg.deviceState.freeSpacePercent = stats.free_space
     msg.deviceState.memoryUsagePercent = int(round(memory_usage))
-    msg.deviceState.gpuUsagePercent = int(round(HARDWARE.get_gpu_usage_percent()))
+    msg.deviceState.gpuUsagePercent = int(round(stats.gpu_usage))
     online_cpu_usage = [int(round(n)) for n in cpu_usage]
     offline_cpu_usage = [0., ] * (len(msg.deviceState.cpuTempC) - len(online_cpu_usage))
     msg.deviceState.cpuUsagePercent = online_cpu_usage + offline_cpu_usage
@@ -367,7 +451,7 @@ def hardware_thread(end_event, hw_queue) -> None:
 
     msg.deviceState.modemTempC = last_hw_state.modem_temps
 
-    msg.deviceState.screenBrightnessPercent = HARDWARE.get_screen_brightness()
+    msg.deviceState.screenBrightnessPercent = stats.screen_brightness
     loop_timer.mark("stats")
 
     set_usb_state(msg.deviceState, last_hw_state.usb_state)
@@ -378,23 +462,31 @@ def hardware_thread(end_event, hw_queue) -> None:
                            params.get_bool("ChestnutLoading"), params.get("ChestnutActive"),
                            chestnut_state if chestnut_valid else None, set_offroad_alert_if_changed)
     loop_timer.mark("chestnut")
-    # this subset is only used for offroad
-    temp_sources = [
-      msg.deviceState.memoryTempC,
-      max(msg.deviceState.cpuTempC, default=0.),
-      max(msg.deviceState.gpuTempC, default=0.),
-    ]
-    offroad_comp_temp = offroad_temp_filter.update(max(temp_sources))
+    if thermal_fresh:
+      # this subset is only used for offroad
+      temp_sources = [
+        msg.deviceState.memoryTempC,
+        max(msg.deviceState.cpuTempC, default=0.),
+        max(msg.deviceState.gpuTempC, default=0.),
+      ]
+      offroad_comp_temp = offroad_temp_filter.update(max(temp_sources))
 
-    # this drives the thermal status while onroad
-    temp_sources.append(max(msg.deviceState.pmicTempC, default=0.))
-    all_comp_temp = all_temp_filter.update(max(temp_sources))
+      # this drives the thermal status while onroad
+      temp_sources.append(max(msg.deviceState.pmicTempC, default=0.))
+      all_comp_temp = all_temp_filter.update(max(temp_sources))
+    else:
+      # stale temperatures (thermal read stuck > THERMAL_STALL_LIMIT): don't feed them to the filters, the fan controller or
+      # the thermal bands. Keep the filtered values and the thermal status as they were, which is what happened while
+      # the whole loop stalled before, and run the fan at full speed until fresh readings are back.
+      offroad_comp_temp, all_comp_temp = offroad_temp_filter.x, all_temp_filter.x
     msg.deviceState.maxTempC = all_comp_temp
 
-    msg.deviceState.fanSpeedPercentDesired = fan_controller.update(all_comp_temp, onroad_conditions["ignition"])
+    msg.deviceState.fanSpeedPercentDesired = fan_controller.update(all_comp_temp, onroad_conditions["ignition"]) if thermal_fresh else 100
 
     is_offroad_for_5_min = (started_ts is None) and ((not started_seen) or (off_ts is None) or (time.monotonic() - off_ts > 60 * 5))
-    if is_offroad_for_5_min and offroad_comp_temp > OFFROAD_DANGER_TEMP:
+    if not thermal_fresh:
+      pass  # keep the last thermal status, see above
+    elif is_offroad_for_5_min and offroad_comp_temp > OFFROAD_DANGER_TEMP:
       # if device is offroad and already hot without the extra onroad load,
       # we want to cool down first before increasing load
       thermal_status = ThermalStatus.critical
@@ -424,6 +516,9 @@ def hardware_thread(end_event, hw_queue) -> None:
     startup_conditions["device_temp_engageable"] = thermal_status < ThermalStatus.overheated
 
     startup_conditions["not_flashing_chestnut"] = not chestnut.flashing
+
+    # temperatures and system stats must be current to go onroad (a stuck read used to stall this whole loop instead)
+    startup_conditions["device_readings_fresh"] = readings_fresh
 
     # ensure device is fully booted
     startup_conditions["device_booted"] = startup_conditions.get("device_booted", False) or HARDWARE.booted()
@@ -477,7 +572,8 @@ def hardware_thread(end_event, hw_queue) -> None:
         pass
     loop_timer.mark("engage")
 
-    should_pwrsave = not onroad_conditions["ignition"] and msg.deviceState.screenBrightnessPercent < 1e-3
+    # with stale (or no) stats the brightness is unknown: don't switch power save on it, but ignition always ends it
+    should_pwrsave = not onroad_conditions["ignition"] and (msg.deviceState.screenBrightnessPercent < 1e-3 if stats_fresh else pwrsave)
     if should_pwrsave != pwrsave or (count == 0):
       HARDWARE.set_power_save(should_pwrsave)
     pwrsave = should_pwrsave
@@ -597,10 +693,11 @@ def hardware_thread(end_event, hw_queue) -> None:
 def main():
   hw_queue = queue.Queue(maxsize=1)
   end_event = threading.Event()
+  network = NetworkContext()  # diagnostics only, shared so every slow-call log shows the network type
 
   threads = [
-    threading.Thread(target=hw_state_thread, args=(end_event, hw_queue)),
-    threading.Thread(target=hardware_thread, args=(end_event, hw_queue)),
+    threading.Thread(target=hw_state_thread, args=(end_event, hw_queue, network)),
+    threading.Thread(target=hardware_thread, args=(end_event, hw_queue, network)),
   ]
 
   if COMMA_HARDWARE:

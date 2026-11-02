@@ -1,6 +1,8 @@
 import os
 from abc import abstractmethod, ABC
+from collections.abc import Callable
 from dataclasses import dataclass, fields
+from typing import Any
 
 from openpilot.cereal import log
 from openpilot.common.esim.base import LPABase
@@ -43,15 +45,19 @@ class ThermalConfig:
   gnss: ThermalZone | None = None
   bottomSoc: ThermalZone | None = None
 
-  def get_msg(self):
-    ret = {}
+  def get_msg(self, call: Callable[..., Any] | None = None):
+    # call(name, fn): optional wrapper around each zone read, hardwared passes CallTimer.call to time them one by one
+    def read(zone: ThermalZone) -> float:
+      return zone.read() if call is None else call(f"thermal:{zone.name}", zone.read)
+
+    ret: dict[str, float | list[float]] = {}
     for f in fields(ThermalConfig):
       v = getattr(self, f.name)
       if v is not None:
         if isinstance(v, list):
-          ret[f.name + "TempC"] = [x.read() for x in v]
+          ret[f.name + "TempC"] = [read(x) for x in v]
         else:
-          ret[f.name + "TempC"] = v.read()
+          ret[f.name + "TempC"] = read(v)
     return ret
 
 class HardwareBase(ABC):
