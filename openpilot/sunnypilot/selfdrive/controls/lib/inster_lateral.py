@@ -540,21 +540,23 @@ class InsterWheelRateFilter:
 #   change (state >= 2), non-finite numbers (held until the next finite solve), three solves in a row over MPC_BUDGET_S.
 #   On the car the controller state is reset whenever lateral control is inactive (as the kit at a stretch start); missed model frames
 #   only age the preview (hold beyond 15 steps) and never reset the feed-forward part.
-# torqueState.version: + 1000 x ANGLE_PI_VERSION_MPC_BIT (128). Parameters: MPC_PARAMS (set MPC-A-1Nov, fit stage A; to be replaced by stage B).
+# torqueState.version: + 1000 x ANGLE_PI_VERSION_MPC_BIT (128). Parameters: MPC_PARAMS (set MPC-B8-2Nov, fit stage B8; replaces MPC-A-1Nov).
 MPC_PARAM = "InsterMPC"
 ANGLE_PI_VERSION_MPC_BIT = 128
-# Parameter set MPC-A-1Nov (owner 1 Nov 2026: 'commit it with the values from the end of stage A, update later'): the joint fit's
-# stage A best (failure-weighted objective v7r6fws-a30738-81888d-df91320c, 180 evaluations on one simulator member, NOT converged;
-# the stage B polish on four members follows and will replace these values). SIM only, not validated on the car.
-MPC_PARAMS = {'g': 0.5080179165341798, 'g_lo': 0.24986981708158032, 'g_vlo': 0.2471479072946154, 'wy': 0.10350976407555024,
-              'wpsi': 3.9946207179544757, 'wdu': -0.3973076603177539, 'wu': -0.8223798403038565, 'tau_vlo': 0.2590635309240658,
-              'tau_lo': 0.2568733526712028, 'tau_hi': 0.19604909401053905, 'v_on': 15.102862785501967}
+# Parameter set MPC-B8-2Nov (owner 2 Nov 2026: 'Finish the 8 variant search, it does not seem to improve anymore. Use the currently
+# best one to continue'): the joint fit's stage B8 best (failure-weighted objective v7r6fws-a30738-81888d-df91320c; Nelder-Mead from
+# stage B's simplex on 8 simulator members, cal + tab57 on both plant files, both seeds; best = evaluation 41 of 59, J -0.16949, from the
+# shrink step of iteration 2; stopped on owner request after 14 of the 20 planned iterations, no improvement in the 18 evaluations after
+# the best, not converged). Replaces MPC-A-1Nov (stage A best). SIM only, not validated on the car.
+MPC_PARAMS = {'g': 0.516004032237491, 'g_lo': 0.2509169414089893, 'g_vlo': 0.24872269606239938, 'wy': 0.16216597558236678,
+              'wpsi': 3.440291014920346, 'wdu': -0.2695298090647622, 'wu': -0.7447736767735691, 'tau_vlo': 0.26989442205007247,
+              'tau_lo': 0.26190069952788264, 'tau_hi': 0.20555257169747945, 'v_on': 15.298800683368409}
 # the PID's gain set and D filter when the MPC is in use (selected only then; PI-30Oct / PID-30Oct unchanged otherwise): fitted jointly
-# with MPC_PARAMS (same parameter set MPC-A-1Nov), coefficients in m/s as PID-30Oct
-ANGLE_PI_MPC_KP = (3.5764071138435822, 0.6069106280769496, -0.012246468442705995)
-ANGLE_PI_MPC_KI = (0.9499077965973175, 0.5756575528452839, -0.012698840210045881)
-ANGLE_PI_MPC_KD = (0.40843082897221394, -0.005210476271808798, 5.5853227561167726e-05)
-ANGLE_PI_MPC_D_TAU = 0.028949830059251083
+# with MPC_PARAMS (same parameter set MPC-B8-2Nov), coefficients in m/s as PID-30Oct
+ANGLE_PI_MPC_KP = (3.4926686850274637, 0.6035744537213804, -0.012235463544551784)
+ANGLE_PI_MPC_KI = (0.9802520908817325, 0.5965274508286101, -0.013223577520185263)
+ANGLE_PI_MPC_KD = (0.41586416115660463, -0.005544640847684392, 6.079808947520639e-05)
+ANGLE_PI_MPC_D_TAU = 0.02771989356702608
 MPC_WA = -1.0                      # log10 q_a (fixed)
 MPC_NBLK = 5                       # control steps per block / solve (20 Hz at dt 0.01)
 MPC_NH = 24                        # horizon blocks (1.2 s)

@@ -1853,14 +1853,14 @@ class TestInsterMPC(OpenpilotTestCase):
     assert c.inster_mpc.n_solve > 100
 
   def test_gain_set(self):
-    # car review 1, change 2: the MPC variant's own PID gains and D filter, selected only when the MPC is in use. Parameter set MPC-A-1Nov
-    # (the joint fit's stage A best, owner 1 Nov 2026) is pinned here; it differs from PID-30Oct. Unpatched: the MPC uses it.
+    # car review 1, change 2: the MPC variant's own PID gains and D filter, selected only when the MPC is in use. Parameter set MPC-B8-2Nov
+    # (the joint fit's stage B8 best, owner 2 Nov 2026) is pinned here; it differs from PID-30Oct. Unpatched: the MPC uses it.
     assert (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD, ANGLE_PI_MPC_D_TAU) == (
-      (3.5764071138435822, 0.6069106280769496, -0.012246468442705995), (0.9499077965973175, 0.5756575528452839, -0.012698840210045881),
-      (0.40843082897221394, -0.005210476271808798, 5.5853227561167726e-05), 0.028949830059251083)
-    assert MPC_PARAMS == {'g': 0.5080179165341798, 'g_lo': 0.24986981708158032, 'g_vlo': 0.2471479072946154, 'wy': 0.10350976407555024,
-                          'wpsi': 3.9946207179544757, 'wdu': -0.3973076603177539, 'wu': -0.8223798403038565, 'tau_vlo': 0.2590635309240658,
-                          'tau_lo': 0.2568733526712028, 'tau_hi': 0.19604909401053905, 'v_on': 15.102862785501967}
+      (3.4926686850274637, 0.6035744537213804, -0.012235463544551784), (0.9802520908817325, 0.5965274508286101, -0.013223577520185263),
+      (0.41586416115660463, -0.005544640847684392, 6.079808947520639e-05), 0.02771989356702608)
+    assert MPC_PARAMS == {'g': 0.516004032237491, 'g_lo': 0.2509169414089893, 'g_vlo': 0.24872269606239938, 'wy': 0.16216597558236678,
+                          'wpsi': 3.440291014920346, 'wdu': -0.2695298090647622, 'wu': -0.7447736767735691, 'tau_vlo': 0.26989442205007247,
+                          'tau_lo': 0.26190069952788264, 'tau_hi': 0.20555257169747945, 'v_on': 15.298800683368409}
     assert (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD) != (ANGLE_PI_PID_KP, ANGLE_PI_PID_KI, ANGLE_PI_PID_KD)
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
     assert c.inster_mpc is not None and c.inster_mpc.p == MPC_PARAMS
