@@ -1673,7 +1673,9 @@ class TestInsterMPC(OpenpilotTestCase):
 
   def test_nominal_step_response(self):
     # plan step of 1 m/s^2 at 0.6 s ahead, re-solved every block on the nominal model: the command leads, the nominal curvature follows
-    # the plan on time with a small overshoot (as the kit's step_response)
+    # the plan on time with a small overshoot (as the kit's step_response). How far the command leads depends on the fitted model lag
+    # (mpc_tau: MPC 3 Nov models ~1 s at low speed and leads by ~0.5 s, the start parameters ~0.25 s and ~0.2 s), so the command is
+    # checked to lead the nominal response and to stay bounded, not against a fixed window
     p = MPC_PARAMS
     rows = mpc_gain_rows(p)
     for v in (8.0, 15.0, 25.0, 33.0):
@@ -1691,8 +1693,8 @@ class TestInsterMPC(OpenpilotTestCase):
         ap = u
       t50_cmd = 0.05 * next(i for i, x in enumerate(cmd) if x >= 0.5)
       t50_nom = 0.05 * next(i for i, x in enumerate(nom) if x >= 0.5)
-      assert 0.35 <= t50_cmd <= 0.45 and 0.55 <= t50_nom <= 0.70, (v, t50_cmd, t50_nom)
-      assert max(nom) < 1.10 and abs(nom[-1] - 1.0) < 1e-3
+      assert 0.0 < t50_cmd < t50_nom and 0.55 <= t50_nom <= 0.70, (v, t50_cmd, t50_nom)
+      assert max(nom) < 1.10 and abs(nom[-1] - 1.0) < 1e-3 and max(cmd) < 3.0, (v, max(nom), max(cmd))
 
   def test_switch_rules(self):
     # only with the steering-angle controller, the PID and the speed feed-forward (its table slope converts the shift's ramp); off,
@@ -1853,14 +1855,14 @@ class TestInsterMPC(OpenpilotTestCase):
     assert c.inster_mpc.n_solve > 100
 
   def test_gain_set(self):
-    # car review 1, change 2: the MPC variant's own PID gains and D filter, selected only when the MPC is in use. Parameter set MPC-B8-2Nov
-    # (the joint fit's stage B8 best, owner 2 Nov 2026) is pinned here; it differs from PID-30Oct. Unpatched: the MPC uses it.
+    # car review 1, change 2: the MPC variant's own PID gains and D filter, selected only when the MPC is in use. Parameter set MPC 3 Nov
+    # (the optimisation round of 3 Nov, owner 2 Nov 2026 objective) is pinned here; it differs from PID-30Oct. Unpatched: the MPC uses it.
     assert (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD, ANGLE_PI_MPC_D_TAU) == (
-      (3.4926686850274637, 0.6035744537213804, -0.012235463544551784), (0.9802520908817325, 0.5965274508286101, -0.013223577520185263),
-      (0.41586416115660463, -0.005544640847684392, 6.079808947520639e-05), 0.02771989356702608)
-    assert MPC_PARAMS == {'g': 0.516004032237491, 'g_lo': 0.2509169414089893, 'g_vlo': 0.24872269606239938, 'wy': 0.16216597558236678,
-                          'wpsi': 3.440291014920346, 'wdu': -0.2695298090647622, 'wu': -0.7447736767735691, 'tau_vlo': 0.26989442205007247,
-                          'tau_lo': 0.26190069952788264, 'tau_hi': 0.20555257169747945, 'v_on': 15.298800683368409}
+      (5.082811481547475, -0.3739474489531882, 0.009399937792403586), (1.9901045676133289, 1.4401972382525865, -0.03247332744707864),
+      (-0.14247036955974607, 0.053364736785125794, -0.0007471453477021938), 0.14900191737454482)
+    assert MPC_PARAMS == {'g': 0.6096944194240149, 'g_lo': 0.5297315697466747, 'g_vlo': 0.8446727128331192, 'wy': 6.314122608110802,
+                          'wpsi': -2.9930497797769178, 'wdu': 5.082953326542878, 'wu': -6.149124945743781, 'tau_vlo': 0.6637008622307352,
+                          'tau_lo': 1.123619727393841, 'tau_hi': 0.28508444892441326, 'v_on': 8.551856627516123}
     assert (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD) != (ANGLE_PI_PID_KP, ANGLE_PI_PID_KI, ANGLE_PI_PID_KD)
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
     assert c.inster_mpc is not None and c.inster_mpc.p == MPC_PARAMS

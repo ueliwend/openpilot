@@ -540,23 +540,25 @@ class InsterWheelRateFilter:
 #   change (state >= 2), non-finite numbers (held until the next finite solve), three solves in a row over MPC_BUDGET_S.
 #   On the car the controller state is reset whenever lateral control is inactive (as the kit at a stretch start); missed model frames
 #   only age the preview (hold beyond 15 steps) and never reset the feed-forward part.
-# torqueState.version: + 1000 x ANGLE_PI_VERSION_MPC_BIT (128). Parameters: MPC_PARAMS (set MPC-B8-2Nov, fit stage B8; replaces MPC-A-1Nov).
+# torqueState.version: + 1000 x ANGLE_PI_VERSION_MPC_BIT (128). Parameters: MPC_PARAMS (set MPC 3 Nov; replaces MPC 2 Nov).
 MPC_PARAM = "InsterMPC"
 ANGLE_PI_VERSION_MPC_BIT = 128
-# Parameter set MPC-B8-2Nov (owner 2 Nov 2026: 'Finish the 8 variant search, it does not seem to improve anymore. Use the currently
-# best one to continue'): the joint fit's stage B8 best (failure-weighted objective v7r6fws-a30738-81888d-df91320c; Nelder-Mead from
-# stage B's simplex on 8 simulator members, cal + tab57 on both plant files, both seeds; best = evaluation 41 of 59, J -0.16949, from the
-# shrink step of iteration 2; stopped on owner request after 14 of the 20 planned iterations, no improvement in the 18 evaluations after
-# the best, not converged). Replaces MPC-A-1Nov (stage A best). SIM only, not validated on the car.
-MPC_PARAMS = {'g': 0.516004032237491, 'g_lo': 0.2509169414089893, 'g_vlo': 0.24872269606239938, 'wy': 0.16216597558236678,
-              'wpsi': 3.440291014920346, 'wdu': -0.2695298090647622, 'wu': -0.7447736767735691, 'tau_vlo': 0.26989442205007247,
-              'tau_lo': 0.26190069952788264, 'tau_hi': 0.20555257169747945, 'v_on': 15.298800683368409}
+# Parameter set MPC 3 Nov (owner 2 Nov 2026: new objective, absolute errors against an ideal zero-error controller, 10 km/h bands
+# 0-160 km/h weighted 4, 4, 3, 2, 2, 2, then 1; per-step variant from 6 km/h, stability weight 10): the optimisation round of 3 Nov
+# (coarse differential evolution for new starting points, full-fidelity re-score, Nelder-Mead scouts on 4 simulator members, the best
+# two continued on 8 members to convergence). Converged after 291 iterations on 8 members (cal + tab57 on both plant files, both
+# seeds). Replaces MPC 2 Nov (the previous best). SIM only, not validated on the car.
+MPC_PARAMS = {'g': 0.6096944194240149, 'g_lo': 0.5297315697466747, 'g_vlo': 0.8446727128331192, 'wy': 6.314122608110802,
+              'wpsi': -2.9930497797769178, 'wdu': 5.082953326542878, 'wu': -6.149124945743781, 'tau_vlo': 0.6637008622307352,
+              'tau_lo': 1.123619727393841, 'tau_hi': 0.28508444892441326, 'v_on': 8.551856627516123}
 # the PID's gain set and D filter when the MPC is in use (selected only then; PI-30Oct / PID-30Oct unchanged otherwise): fitted jointly
-# with MPC_PARAMS (same parameter set MPC-B8-2Nov), coefficients in m/s as PID-30Oct
-ANGLE_PI_MPC_KP = (3.4926686850274637, 0.6035744537213804, -0.012235463544551784)
-ANGLE_PI_MPC_KI = (0.9802520908817325, 0.5965274508286101, -0.013223577520185263)
-ANGLE_PI_MPC_KD = (0.41586416115660463, -0.005544640847684392, 6.079808947520639e-05)
-ANGLE_PI_MPC_D_TAU = 0.02771989356702608
+# with MPC_PARAMS (same parameter set MPC 3 Nov), coefficients in m/s as PID-30Oct; each gain is clipped at >= 0 (angle_pi_gain). The D
+# gain was fitted as values at anchor speeds; its 10 km/h anchor is at the lower bound 0, so the quadratic is negative below 10 km/h
+# and D is 0 there on the car as in the fit (keep the fitted coefficients: setting kd[0] = 0 would raise D by 0.142 at every speed)
+ANGLE_PI_MPC_KP = (5.082811481547475, -0.3739474489531882, 0.009399937792403586)
+ANGLE_PI_MPC_KI = (1.9901045676133289, 1.4401972382525865, -0.03247332744707864)
+ANGLE_PI_MPC_KD = (-0.14247036955974607, 0.053364736785125794, -0.0007471453477021938)
+ANGLE_PI_MPC_D_TAU = 0.14900191737454482
 MPC_WA = -1.0                      # log10 q_a (fixed)
 MPC_NBLK = 5                       # control steps per block / solve (20 Hz at dt 0.01)
 MPC_NH = 24                        # horizon blocks (1.2 s)
