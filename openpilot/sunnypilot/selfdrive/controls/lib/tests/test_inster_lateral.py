@@ -1712,7 +1712,7 @@ class TestInsterMPC(OpenpilotTestCase):
     # plan step of 1 m/s^2 at 0.6 s ahead, re-solved every block on the nominal model (as the kit's step_response): the command is never
     # later than the plan, the nominal curvature is never later than with the plan passed straight through as the command (u = plan one
     # block ahead, the same nominal model), it overshoots at most 10 % and settles, and the command stays below 3x the step. How far the
-    # command leads depends on the fitted weights and model lag: MPC 3 Nov leads by ~0.5 s and its nominal response is on time; MPC 6 Nov
+    # command leads depends on the fitted weights and model lag: MPC 3 Nov leads by ~0.5 s and its nominal response is on time; MPC 7 Nov
     # (its tracking weights r_d, r_u ~1e7.5-1e7.9 dominate) passes the plan through with the model's lag (~0.53 s at 8-33 m/s), the ramp-aware
     # turn-in doing the anticipation; so no fixed window
     p = MPC_PARAMS
@@ -1739,7 +1739,7 @@ class TestInsterMPC(OpenpilotTestCase):
       assert max(nom) < 1.10 and abs(nom[-1] - 1.0) < 1e-3 and max(cmd) < 3.0, (v, max(nom), max(cmd))
     # the shipped controller (these rows with the ramp-aware path, MPC_RAMP_PARAMS) leads the plan step: its feed-forward command
     # reaches 10 % of the step at least 0.15 s before the plan passed straight through (a pure pass-through fails here), and settles
-    # within 3x the step; at 18-54 km/h, where the fitted turn-in anticipation is strong (it fades to 0 at 109.6 km/h)
+    # within 3x the step; at 18-54 km/h, where the fitted turn-in anticipation is strong (it fades to 0 at 109.5 km/h)
     for v in (5.0, 8.0, 15.0):
       out = _plan_step_command(InsterMPC(DT_CTRL, p, model_t_idxs=ModelConstants.T_IDXS, ramp_aware=MPC_RAMP_PARAMS), v)
       assert _t_reach(out, 0.1) <= 3.0 - 0.2 - 0.15 + 1e-9, (v, _t_reach(out, 0.1))
@@ -1905,23 +1905,24 @@ class TestInsterMPC(OpenpilotTestCase):
     assert c.inster_mpc.n_solve > 100
 
   def test_gain_set(self):
-    # car review 1, change 2: the MPC variant's own PID gains and D filter, selected only when the MPC is in use. Parameter set MPC 6 Nov
-    # (the optimisation round of 6 Nov, fitted at ramp 3 / 6 with the ramp-aware MPC on) is pinned here, its ramp-aware parameters
+    # car review 1, change 2: the MPC variant's own PID gains and D filter, selected only when the MPC is in use. Parameter set MPC 7 Nov
+    # (fitted at ramp 3 / 6 with the ramp-aware MPC on, on the 26-drive feed-forward table) is pinned here, its ramp-aware parameters
     # included; it differs from PID-30Oct. Unpatched: the MPC uses it.
     assert (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD, ANGLE_PI_MPC_D_TAU) == (
-      (2.2573333277084955, 0.35641912164901807, -0.0022513517948379988), (-0.16209349543599338, 1.3392518638139044, -0.03369950438792011),
-      (0.10625143904808268, 0.015547554161706488, 0.00010085039626516662), 0.833281080752706)
-    assert MPC_PARAMS == {'g': 0.2531054598947694, 'g_lo': 0.2207621439507277, 'g_vlo': 0.02750853516602676, 'wy': 0.26804876173652126,
-                          'wpsi': 1.7177835659194365, 'wdu': 7.455952997933473, 'wu': 7.850649941731319, 'tau_vlo': 1.509470469622787,
-                          'tau_lo': 0.5353329320976858, 'tau_hi': 0.5153084581704873, 'v_on': 42.90897226026003}
-    assert MPC_RAMP_PARAMS == {'ra_in_lo': 0.6521463706693205, 'ra_in': 0.8164262299304392, 'ra_v0': 109.57055767855056, 'ra_out_lo': 0.0,
-                               'ra_out': 0.0, 'ra_v0_out': 160.0, 'ra_st': 0.0, 'ra_lead': 0.0, 'ra_pd': 0.0, 'ra_pd_t': 0.05}
+      (2.3291265229498572, 0.3493828389681169, -0.0022509794785350334), (-0.14385429318612764, 1.6813322693441184, -0.04253866028664136),
+      (0.09485120379508169, 0.016987681460720737, 7.511713014005203e-05), 0.8510167207818206)
+    assert MPC_PARAMS == {'g': 0.2565493476760934, 'g_lo': 0.22377120305459947, 'g_vlo': 0.026576882070846172, 'wy': 0.31739420191845724,
+                          'wpsi': 1.7052763121821215, 'wdu': 7.518239192951498, 'wu': 7.91666564387851, 'tau_vlo': 1.5072973847589601,
+                          'tau_lo': 0.5347320633541794, 'tau_hi': 0.5198521809253115, 'v_on': 43.08959807828134}
+    assert MPC_RAMP_PARAMS == {'ra_in_lo': 0.654851178336799, 'ra_in': 0.8191807789445549, 'ra_v0': 109.45649599343251,
+                               'ra_out_lo': 0.002499870105593264, 'ra_out': 0.0025705281741539594, 'ra_v0_out': 160.0,
+                               'ra_st': 0.0004975832927271756, 'ra_lead': 0.0, 'ra_pd': 0.003011002037188249, 'ra_pd_t': 0.05}
     assert (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD) != (ANGLE_PI_PID_KP, ANGLE_PI_PID_KI, ANGLE_PI_PID_KD)
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
     assert c.inster_mpc is not None and c.inster_mpc.p == MPC_PARAMS
     assert (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD)
     assert abs(c.inster_wheel_rate.a - (1.0 - math.exp(-DT_CTRL / ANGLE_PI_MPC_D_TAU))) < 1e-15
-    # the fitted controller: the same set with the ramp-aware sub-option on, its shipped parameters active (turn-in only)
+    # the fitted controller: the same set with the ramp-aware sub-option on, its shipped parameters active (turn-in, small release weights)
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY, MPC_RAMP_KEY), ctrl=1)
     assert c.inster_mpc is not None and c.inster_mpc.p == MPC_PARAMS and c.inster_mpc.ra == MPC_RAMP_PARAMS
     assert (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD)
@@ -2080,7 +2081,7 @@ class TestInsterMPCRampAware(OpenpilotTestCase):
                                                                  ctrl=ctrl), extension_model=mdl)
     c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
     assert c.inster_mpc.ra is None and _run(c, VM, extension_model=mdl) == base
-    # every weight on and the stiction prediction (the shipped set leaves the release side off; this checks that the whole path acts)
+    # every weight on and the stiction prediction (the shipped release weights are small; this checks that the whole path acts)
     strong = {'ra_in_lo': 1.0, 'ra_in': 1.0, 'ra_v0': 160.0, 'ra_out_lo': 1.0, 'ra_out': 1.0, 'ra_v0_out': 160.0, 'ra_st': 1.0, 'ra_lead': 0.2,
               'ra_pd': 0.5, 'ra_pd_t': 0.15}
     with mock.patch.object(latcontrol_torque_v0, 'MPC_RAMP_PARAMS', strong):
@@ -2095,7 +2096,8 @@ class TestInsterMPCRampAware(OpenpilotTestCase):
     assert MPC_RAMP_PARAM == MPC_RAMP_KEY
 
   def test_all_zero_weights_is_the_plain_mpc(self):
-    zero = dict(MPC_RAMP_PARAMS, ra_in_lo=0.0, ra_in=0.0, ra_out_lo=0.0, ra_out=0.0, ra_st=0.7, ra_lead=0.2)
+    # every weight 0 (turn-in, release anticipation, pre-drop; the shipped set's own weights are not all 0), the step / lead inert
+    zero = dict(MPC_RAMP_PARAMS, ra_in_lo=0.0, ra_in=0.0, ra_out_lo=0.0, ra_out=0.0, ra_pd=0.0, ra_st=0.7, ra_lead=0.2)
     m0, m1 = _mpc(), InsterMPC(DT_CTRL, model_t_idxs=ModelConstants.T_IDXS, ramp_aware=zero)
     assert m1.ra is None
     assert TestInsterMPC._drive(None, m0, n=800) == TestInsterMPC._drive(None, m1, n=800)
@@ -2127,8 +2129,8 @@ class TestInsterMPCRampAware(OpenpilotTestCase):
       assert (s1 < 0.0) == acts, (over, s0, s1)
 
   def test_turns_in_earlier_than_the_plain_mpc(self):
-    # the shipped set (MPC 6 Nov): its plain LQ passes the plan through, so the whole lead comes from the ramp-aware turn-in; with
-    # the switch on the feed-forward command reaches 10 % of a plan step at least 0.15 s earlier than the plain MPC (0.23-0.40 s at
+    # the shipped set (MPC 7 Nov): its plain LQ passes the plan through, so the whole lead comes from the ramp-aware turn-in; with
+    # the switch on the feed-forward command reaches 10 % of a plan step at least 0.15 s earlier than the plain MPC (0.23-0.38 s at
     # 18-54 km/h), and the plain MPC has no lead (within one block of the pass-through)
     for v in (5.0, 8.0, 15.0):
       ra = _plan_step_command(InsterMPC(DT_CTRL, model_t_idxs=ModelConstants.T_IDXS, ramp_aware=MPC_RAMP_PARAMS), v)

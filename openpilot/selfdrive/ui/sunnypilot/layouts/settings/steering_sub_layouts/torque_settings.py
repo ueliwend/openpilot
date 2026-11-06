@@ -161,7 +161,8 @@ class TorqueSettingsLayout(Widget):
       param=MPC_RAMP_PARAM,
       title=lambda: tr("Inster: Ramp-Aware MPC (experimental)"),
       description=lambda: tr("With the MPC on: plans around the car's steering-torque rate limit and starts turn-in earlier, so the " +
-                             "rate-limited command reaches the plan on time; the limit itself is unchanged. The MPC's settings were " +
+                             "rate-limited command reaches the plan on time; the limit itself is unchanged. Its fitted release-side " +
+                             "terms are very small. The MPC's settings were " +
                              "fitted with this switch on; off gives the plain MPC with those settings, a combination that was not " +
                              "fitted (for comparison only). Acts only with the MPC on. Simulation only, not validated on the car. " +
                              "On by default."),
