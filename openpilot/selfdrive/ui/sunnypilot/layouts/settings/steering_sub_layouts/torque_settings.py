@@ -12,8 +12,8 @@ import pyray as rl
 
 from openpilot.common.basedir import BASEDIR
 from openpilot.selfdrive.ui.ui_state import ui_state
-from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import LATERAL_CONTROLLER_PARAM, LATERAL_PID, MPC_PARAM, SOFT_P_PARAM, \
-  angle_lateral_controller, is_inster
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import LATERAL_CONTROLLER_PARAM, LATERAL_PID, MPC_PARAM, MPC_RAMP_PARAM, \
+  SOFT_P_PARAM, angle_lateral_controller, is_inster
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.sunnypilot.lib.utils import NoElideButtonAction
@@ -149,10 +149,22 @@ class TorqueSettingsLayout(Widget):
     self._inster_mpc_toggle = toggle_item_sp(
       param=MPC_PARAM,
       title=lambda: tr("Inster: Model Predictive Control, for the PID (experimental)"),
-      description=lambda: tr("Plans the steering 1.2 s ahead from the driving model's path and leads the PID through curves. Works " +
-                             "only with the PID and the speed feed-forward; off while you steer, during lane changes and at walking " +
-                             "pace (below 3.6 km/h), fading in up to a fitted speed. Soft Small-Error P is not used while it runs. Simulation only, " +
-                             "not validated on the car. Off by default."),
+      description=lambda: tr("Plans the steering 1.2 s ahead from the driving model's path for the PID. With Ramp-Aware MPC on (the " +
+                             "default) it starts turn-in earlier, so the rate-limited steering reaches the plan on time; with it off " +
+                             "the plan is followed without that lead (not fitted). Works only with the PID and the speed " +
+                             "feed-forward; off while you steer, during lane changes and at walking pace (below 3.6 km/h), fading in " +
+                             "up to a fitted speed. Soft Small-Error P is not used while it runs. Simulation only, not validated on " +
+                             "the car. Off by default."),
+    )
+
+    self._inster_mpc_ramp_toggle = toggle_item_sp(
+      param=MPC_RAMP_PARAM,
+      title=lambda: tr("Inster: Ramp-Aware MPC (experimental)"),
+      description=lambda: tr("With the MPC on: plans around the car's steering-torque rate limit and starts turn-in earlier, so the " +
+                             "rate-limited command reaches the plan on time; the limit itself is unchanged. The MPC's settings were " +
+                             "fitted with this switch on; off gives the plain MPC with those settings, a combination that was not " +
+                             "fitted (for comparison only). Acts only with the MPC on. Simulation only, not validated on the car. " +
+                             "On by default."),
     )
 
     items = [
@@ -170,6 +182,7 @@ class TorqueSettingsLayout(Widget):
       self._inster_angle_pi_gains,
       self._inster_soft_p_toggle,
       self._inster_mpc_toggle,
+      self._inster_mpc_ramp_toggle,
     ]
     return items
 
@@ -196,6 +209,9 @@ class TorqueSettingsLayout(Widget):
                                         self._inster_ff_toggle.action_item.get_state() and
                                         angle_lateral_controller(ui_state.params) == LATERAL_PID)
     self._inster_mpc_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
+    # ramp-aware MPC: under the MPC, shown only while the MPC switch is shown and on (same change rules)
+    self._inster_mpc_ramp_toggle.set_visible(self._inster_mpc_toggle.is_visible and self._inster_mpc_toggle.action_item.get_state())
+    self._inster_mpc_ramp_toggle.action_item.set_enabled(ui_state.is_offroad() and not nnlc_enabled)
     if not ui_state.params.get_bool("LiveTorqueParamsToggle"):
       ui_state.params.remove("LiveTorqueParamsRelaxedToggle")
       self._relaxed_tune_toggle.action_item.set_state(False)

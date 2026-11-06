@@ -49,6 +49,11 @@ from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_
                                                                        mpc_gain_rows, mpc_tau, mpc_fade, mpc_strength, \
                                                                        ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, \
                                                                        ANGLE_PI_MPC_KD, ANGLE_PI_MPC_D_TAU
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_VERSION_MPC_RAMP_BIT, MPC_RAMP_PARAM, MPC_RAMP_PARAMS, \
+                                                                       MPC_RAMP_RANGES, MPC_RAMP_UP, MPC_RAMP_DOWN, MPC_NBLK, \
+                                                                       CarControllerParams, ff_table_inverse, mpc_gain_matrix, \
+                                                                       mpc_ramp_anticipation, mpc_ramp_envelope, stiction_predicted, \
+                                                                       ff_table_top, MPC_NH, MPC_DTB
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import LatControlTorque as LatControlTorqueV0
@@ -213,11 +218,15 @@ class TestInsterStictionFriction(OpenpilotTestCase):
     assert fr.update(15.0, 6.0, 4.0, 3.5, 0.2, 5.0, 80.0) == first
 
 
-def _make_v0(car_name, on=(), after_setup=(), ctrl=None, legacy_gains=None):
-  """ctrl: controller-type selector InsterLateralController (None = unset: PI, or the legacy gain-set selector legacy_gains)"""
+def _make_v0(car_name, on=(), after_setup=(), ctrl=None, legacy_gains=None, defaults=()):
+  """ctrl: controller-type selector InsterLateralController (None = unset: PI, or the legacy gain-set selector legacy_gains);
+  defaults: switches left at their params default (the value the manager writes for an unset key) instead of on / off by `on`"""
   params = Params()
-  for key in INSTER_KEYS + (G6_KEY, O5_KEY, MPC_KEY, "LateralJerkTorqueController", "NeuralNetworkLateralControl"):
-    params.put_bool(key, key in on, block=True)
+  for key in INSTER_KEYS + (G6_KEY, O5_KEY, MPC_KEY, MPC_RAMP_KEY, "LateralJerkTorqueController", "NeuralNetworkLateralControl"):
+    if key in defaults:
+      params.put(key, params.get_default_value(key), block=True)
+    else:
+      params.put_bool(key, key in on, block=True)
   for key, value in ((CTRL_KEY, ctrl), (GAINS_KEY, legacy_gains)):
     if value is None:
       params.remove(key)
@@ -380,7 +389,7 @@ class TestInsterSteerCap(OpenpilotTestCase):
     from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque as LatControlTorqueV1
     for car_name, cap in ((HYUNDAI.HYUNDAI_INSTER, CAP), (HYUNDAI.HYUNDAI_KONA_EV, 1.0)):
       params = Params()
-      for key in INSTER_KEYS + (G6_KEY, O5_KEY, MPC_KEY, "LateralJerkTorqueController", "NeuralNetworkLateralControl"):
+      for key in INSTER_KEYS + (G6_KEY, O5_KEY, MPC_KEY, MPC_RAMP_KEY, "LateralJerkTorqueController", "NeuralNetworkLateralControl"):
         params.put_bool(key, False, block=True)
       CarInterface = interfaces[car_name]
       CP = CarInterface.get_non_essential_params(car_name)
@@ -1274,7 +1283,8 @@ class TestInsterSoftSmallErrorP(OpenpilotTestCase):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on + (O5_KEY,), ctrl=ctrl)
       ref, VM_ref = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl)
       # the same limit directions for both: the car-side ramp sees different outputs (P differs), so the real observer would freeze
-      # them on different steps (at the fixed factor F0 this drive touches the 3 raw / step ramp)
+      # them on different steps (at the fixed factor F0 the real observer holds back 56-100 of this drive's 2500 steps, the same steps
+      # with a 5 or 6 raw / step release: the 3 raw / step rise is what binds)
       for x in (c, ref):
         x.inster_limit_observer = _ScriptedLimit(lambda n: (0, 0, 1, 0, 0, -1, 0)[n % 7])
       VM.update_params(1.0, 14.0)
@@ -1470,12 +1480,12 @@ class TestInsterIntegratorFreeze(OpenpilotTestCase):
   re-run on the controller's own requests (same frame, no carOutput lag), frozen only in the limited direction or while pressed"""
 
   def test_observer_is_the_car_side_limiter(self):
-    # same command as the Hyundai carcontroller for random request / driver-torque sequences (cap 409, ramp 3 / 5, driver rule)
+    # same command as the Hyundai carcontroller for random request / driver-torque sequences (cap 409, ramp 3 / 6, driver rule)
     from opendbc.car.hyundai.values import CarControllerParams
     from opendbc.car.lateral import apply_driver_steer_torque_limits
     CP = _car_params(HYUNDAI.HYUNDAI_INSTER)
     ccp = CarControllerParams(CP)
-    assert (ccp.STEER_MAX, ccp.STEER_FULL_SCALE, ccp.STEER_DELTA_UP, ccp.STEER_DELTA_DOWN) == (INSTER_STEER_MAX, INSTER_STEER_FULL_SCALE, 3, 5)
+    assert (ccp.STEER_MAX, ccp.STEER_FULL_SCALE, ccp.STEER_DELTA_UP, ccp.STEER_DELTA_DOWN) == (INSTER_STEER_MAX, INSTER_STEER_FULL_SCALE, 3, 6)
     obs = InsterSteerLimitObserver.for_car(CP)
     rng = random.Random(11)
     last = 0
@@ -1498,10 +1508,10 @@ class TestInsterIntegratorFreeze(OpenpilotTestCase):
     # a request moving at <= 3 raw per step (inside the ramp) is never limited, however long it moves; controlsd's flag (request vs a
     # carOutput 2 frames older) read such a request as limited once it moved by more than ~2 raw per step
     obs = InsterSteerLimitObserver.for_car(_car_params(HYUNDAI.HYUNDAI_INSTER))
-    for k in range(120):                                            # 0 -> 360 raw at 3 raw / step, then back at 5 raw / step
+    for k in range(120):                                            # 0 -> 357 raw at 3 raw / step, then back at 6 raw / step
       assert obs.update(3.0 * k / INSTER_STEER_FULL_SCALE, 0.0) == 0
-    for k in range(72):
-      assert obs.update((357.0 - 5.0 * k) / INSTER_STEER_FULL_SCALE, 0.0) == 0
+    for k in range(60):
+      assert obs.update((357.0 - 6.0 * k) / INSTER_STEER_FULL_SCALE, 0.0) == 0
     assert obs.update(400.0 / INSTER_STEER_FULL_SCALE, 0.0) == 1    # a jump the ramp holds back: limited towards +
     assert obs.update(500.0 / INSTER_STEER_FULL_SCALE, 0.0) == 1    # beyond the 409 cap: limited towards +
     obs.reset()
@@ -1547,10 +1557,10 @@ class TestInsterIntegratorFreeze(OpenpilotTestCase):
     last = obs.apply_torque_last
     for bad in (float('nan'), float('inf'), -float('inf')):
       obs.update(bad, 0.0)
-      assert obs.apply_torque_last == last - 5 and obs.direction == -1     # towards 0 at the 5 raw / step release ramp
+      assert obs.apply_torque_last == last - 6 and obs.direction == -1     # towards 0 at the 6 raw / step release ramp
       last = obs.apply_torque_last
     obs.update(0.0, float('nan'))                                          # a non-finite driver torque reading: treated as 0
-    assert obs.apply_torque_last == last - 5
+    assert obs.apply_torque_last == last - 6
     # and through update(): a non-finite desired curvature reaches the controller output without raising
     c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=1)
     c.update(True, _cs(20.0, 1.0), VM, _vp(), False, float('nan'), None, False, 0.2)
@@ -1626,6 +1636,7 @@ class TestInsterFixedFactor(OpenpilotTestCase):
 
 # ---------------------------------------------------------------------------------------------------------------------------------
 MPC_KEY = "InsterMPC"
+MPC_RAMP_KEY = "InsterMPCRampAware"
 
 
 class _MVM:
@@ -1646,8 +1657,34 @@ class _MVM:
     self.orientation.y = [0.0] * 33
 
 
+class _MVMProfile(_MVM):
+  """_MVM with a plan curvature profile k_of_t(T) on T_IDXS"""
+  def __init__(self, frame_id, k_of_t, v, lane_change=0):
+    super().__init__(frame_id, 0.0, v, lane_change)
+    self.orientationRate.z = [k_of_t(t) * v for t in ModelConstants.T_IDXS]
+
+
 def _mpc(params=None):
   return InsterMPC(DT_CTRL, params, model_t_idxs=ModelConstants.T_IDXS)
+
+
+def _plan_step_command(m, v, a=1.0, t_step=3.0, lat_delay=0.2, n=500):
+  """a plan step of a m/s^2 at t_step, seen ahead in the model frames (a new frame every 5 steps): per step the feed-forward
+  lateral acceleration the MPC hands on (la0 + its shift); the plan passed straight through steps at t_step - lat_delay"""
+  k_step = a / v ** 2
+  out = []
+  for k in range(n):
+    t = k * DT_CTRL
+    m.observe_model(_MVMProfile(k // 5, lambda T, t=t: k_step if t + T >= t_step else 0.0, v))
+    kd = k_step if t + lat_delay >= t_step else 0.0
+    la0 = kd * v * v
+    _, delta = m.update(v, kd, kd, lat_delay, False, la0, ff_table_slope_raw(la0, v), steer_deg_per_curvature=600.0)
+    out.append(la0 + delta)
+  return out
+
+
+def _t_reach(out, x):
+  return DT_CTRL * next(k for k, y in enumerate(out) if y >= x)
 
 
 def _capnp_model(frame_id, k_of_t, v, lane_change=log.LaneChangeState.off):
@@ -1672,29 +1709,41 @@ class TestInsterMPC(OpenpilotTestCase):
         assert abs(u0 - v * v * k) <= 1e-9 * max(1.0, v * v * abs(k)), (v, k, u0)
 
   def test_nominal_step_response(self):
-    # plan step of 1 m/s^2 at 0.6 s ahead, re-solved every block on the nominal model: the command leads, the nominal curvature follows
-    # the plan on time with a small overshoot (as the kit's step_response). How far the command leads depends on the fitted model lag
-    # (mpc_tau: MPC 3 Nov models ~1 s at low speed and leads by ~0.5 s, the start parameters ~0.25 s and ~0.2 s), so the command is
-    # checked to lead the nominal response and to stay bounded, not against a fixed window
+    # plan step of 1 m/s^2 at 0.6 s ahead, re-solved every block on the nominal model (as the kit's step_response): the command is never
+    # later than the plan, the nominal curvature is never later than with the plan passed straight through as the command (u = plan one
+    # block ahead, the same nominal model), it overshoots at most 10 % and settles, and the command stays below 3x the step. How far the
+    # command leads depends on the fitted weights and model lag: MPC 3 Nov leads by ~0.5 s and its nominal response is on time; MPC 6 Nov
+    # (its tracking weights r_d, r_u ~1e7.5-1e7.9 dominate) passes the plan through with the model's lag (~0.53 s at 8-33 m/s), the ramp-aware
+    # turn-in doing the anticipation; so no fixed window
     p = MPC_PARAMS
     rows = mpc_gain_rows(p)
-    for v in (8.0, 15.0, 25.0, 33.0):
-      K = np.array([np.interp(v, np.arange(1.0, 46.0), rows[:, i]) for i in range(rows.shape[1])])
+
+    def response(v, K):                    # K: the LQ row at v; None: the plan passed through (u = plan one block ahead)
       al = math.exp(-0.05 / mpc_tau(p, v))
       kn = ap = 0.0
       cmd, nom = [], []
-      for b in range(60):
+      for b in range(120):
         t = b * 0.05
         P = np.array([(1.0 / v ** 2 if t + j * 0.05 >= 0.6 else 0.0) for j in range(25)])
-        u = float(K[0] * kn + K[1] * ap + K[2:] @ P)
+        u = float(P[1] * v * v) if K is None else float(K[0] * kn + K[1] * ap + K[2:] @ P)
         cmd.append(u)
         nom.append(kn * v * v)
         kn = al * kn + (1 - al) * ap / v ** 2
         ap = u
-      t50_cmd = 0.05 * next(i for i, x in enumerate(cmd) if x >= 0.5)
-      t50_nom = 0.05 * next(i for i, x in enumerate(nom) if x >= 0.5)
-      assert 0.0 < t50_cmd < t50_nom and 0.55 <= t50_nom <= 0.70, (v, t50_cmd, t50_nom)
+      return cmd, nom, 0.05 * next(i for i, x in enumerate(cmd) if x >= 0.5), 0.05 * next(i for i, x in enumerate(nom) if x >= 0.5)
+    for v in (8.0, 15.0, 25.0, 33.0):
+      K = np.array([np.interp(v, np.arange(1.0, 46.0), rows[:, i]) for i in range(rows.shape[1])])
+      cmd, nom, t50_cmd, t50_nom = response(v, K)
+      _, _, _, t50_pass = response(v, None)
+      assert 0.0 < t50_cmd <= 0.55 and t50_cmd < t50_nom <= t50_pass + 1e-9, (v, t50_cmd, t50_nom, t50_pass)
       assert max(nom) < 1.10 and abs(nom[-1] - 1.0) < 1e-3 and max(cmd) < 3.0, (v, max(nom), max(cmd))
+    # the shipped controller (these rows with the ramp-aware path, MPC_RAMP_PARAMS) leads the plan step: its feed-forward command
+    # reaches 10 % of the step at least 0.15 s before the plan passed straight through (a pure pass-through fails here), and settles
+    # within 3x the step; at 18-54 km/h, where the fitted turn-in anticipation is strong (it fades to 0 at 109.6 km/h)
+    for v in (5.0, 8.0, 15.0):
+      out = _plan_step_command(InsterMPC(DT_CTRL, p, model_t_idxs=ModelConstants.T_IDXS, ramp_aware=MPC_RAMP_PARAMS), v)
+      assert _t_reach(out, 0.1) <= 3.0 - 0.2 - 0.15 + 1e-9, (v, _t_reach(out, 0.1))
+      assert max(out) < 3.0 and abs(out[-1] - 1.0) < 0.02, (v, max(out), out[-1])
 
   def test_switch_rules(self):
     # only with the steering-angle controller, the PID and the speed feed-forward (its table slope converts the shift's ramp); off,
@@ -1754,7 +1803,8 @@ class TestInsterMPC(OpenpilotTestCase):
     assert np.all(np.abs(np.diff(d)) <= MPC_JERK_MAX * DT_CTRL + 1e-12)                    # jerk limit of the feed-forward part
     assert all(abs(o[4]) <= max(MPC_A_LIM, abs(0.03) * 15.0 ** 2) + 1e-12 for o in out)   # |u0| clip
     assert all(math.isfinite(x) for o in out for x in o)
-    assert max(abs(x) for x in d) > 0.0 and max(o[2] for o in out) > 0.4                   # it acts
+    assert max(abs(x) for x in d) > 0.0                                                    # it acts, at the fitted strength
+    assert max(o[2] for o in out) > 0.9 * mpc_strength(m.p, 15.0) * mpc_fade(m.p, 15.0) > 0.0
 
   def test_fallbacks(self):
     # steeringPressed / lane change (state >= 2): weight h < 0.05 within 0.45 s; below the 1 m/s floor: w = 0
@@ -1855,19 +1905,36 @@ class TestInsterMPC(OpenpilotTestCase):
     assert c.inster_mpc.n_solve > 100
 
   def test_gain_set(self):
-    # car review 1, change 2: the MPC variant's own PID gains and D filter, selected only when the MPC is in use. Parameter set MPC 3 Nov
-    # (the optimisation round of 3 Nov, owner 2 Nov 2026 objective) is pinned here; it differs from PID-30Oct. Unpatched: the MPC uses it.
+    # car review 1, change 2: the MPC variant's own PID gains and D filter, selected only when the MPC is in use. Parameter set MPC 6 Nov
+    # (the optimisation round of 6 Nov, fitted at ramp 3 / 6 with the ramp-aware MPC on) is pinned here, its ramp-aware parameters
+    # included; it differs from PID-30Oct. Unpatched: the MPC uses it.
     assert (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD, ANGLE_PI_MPC_D_TAU) == (
-      (5.082811481547475, -0.3739474489531882, 0.009399937792403586), (1.9901045676133289, 1.4401972382525865, -0.03247332744707864),
-      (-0.14247036955974607, 0.053364736785125794, -0.0007471453477021938), 0.14900191737454482)
-    assert MPC_PARAMS == {'g': 0.6096944194240149, 'g_lo': 0.5297315697466747, 'g_vlo': 0.8446727128331192, 'wy': 6.314122608110802,
-                          'wpsi': -2.9930497797769178, 'wdu': 5.082953326542878, 'wu': -6.149124945743781, 'tau_vlo': 0.6637008622307352,
-                          'tau_lo': 1.123619727393841, 'tau_hi': 0.28508444892441326, 'v_on': 8.551856627516123}
+      (2.2573333277084955, 0.35641912164901807, -0.0022513517948379988), (-0.16209349543599338, 1.3392518638139044, -0.03369950438792011),
+      (0.10625143904808268, 0.015547554161706488, 0.00010085039626516662), 0.833281080752706)
+    assert MPC_PARAMS == {'g': 0.2531054598947694, 'g_lo': 0.2207621439507277, 'g_vlo': 0.02750853516602676, 'wy': 0.26804876173652126,
+                          'wpsi': 1.7177835659194365, 'wdu': 7.455952997933473, 'wu': 7.850649941731319, 'tau_vlo': 1.509470469622787,
+                          'tau_lo': 0.5353329320976858, 'tau_hi': 0.5153084581704873, 'v_on': 42.90897226026003}
+    assert MPC_RAMP_PARAMS == {'ra_in_lo': 0.6521463706693205, 'ra_in': 0.8164262299304392, 'ra_v0': 109.57055767855056, 'ra_out_lo': 0.0,
+                               'ra_out': 0.0, 'ra_v0_out': 160.0, 'ra_st': 0.0, 'ra_lead': 0.0, 'ra_pd': 0.0, 'ra_pd_t': 0.05}
     assert (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD) != (ANGLE_PI_PID_KP, ANGLE_PI_PID_KI, ANGLE_PI_PID_KD)
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
     assert c.inster_mpc is not None and c.inster_mpc.p == MPC_PARAMS
     assert (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD)
     assert abs(c.inster_wheel_rate.a - (1.0 - math.exp(-DT_CTRL / ANGLE_PI_MPC_D_TAU))) < 1e-15
+    # the fitted controller: the same set with the ramp-aware sub-option on, its shipped parameters active (turn-in only)
+    c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY, MPC_RAMP_KEY), ctrl=1)
+    assert c.inster_mpc is not None and c.inster_mpc.p == MPC_PARAMS and c.inster_mpc.ra == MPC_RAMP_PARAMS
+    assert (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD)
+    assert c.inster_angle_pi_version == 976106
+    # the default configuration (6 Nov 2026): InsterMPCRampAware defaults to on, so turning on InsterMPC alone gives the fitted
+    # controller; off stays as an A/B option (the plain MPC with these settings, not fitted)
+    assert Params().get_default_value(MPC_RAMP_KEY) is True
+    c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1, defaults=(MPC_RAMP_KEY,))
+    assert c.inster_mpc is not None and c.inster_mpc.ra == MPC_RAMP_PARAMS and c.inster_angle_pi_version == 976106
+    c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=1, defaults=(MPC_RAMP_KEY,))
+    assert c.inster_mpc is None                                       # without InsterMPC the default-on sub-switch does nothing
+    c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
+    assert c.inster_mpc is not None and c.inster_mpc.ra is None and c.inster_angle_pi_version == 464106
     # distinct values patched in to see which set is taken
     mkp, mki, mkd, mtau = (3.0, 0.4, -0.01), (0.8, 0.3, -0.008), (0.3, 0.001, 0.0), 0.05
     with mock.patch.multiple(latcontrol_torque_v0, ANGLE_PI_MPC_KP=mkp, ANGLE_PI_MPC_KI=mki, ANGLE_PI_MPC_KD=mkd, ANGLE_PI_MPC_D_TAU=mtau):
@@ -1932,3 +1999,203 @@ class TestInsterMPC(OpenpilotTestCase):
     kd2 = kd + 0.1 / v ** 2
     P2 = m.preview(kd2, v, ld)
     assert np.allclose(P2[fut], k0 + s * (taus[fut] + a0) + (kd2 - kd), rtol=0, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+class TestInsterMPCRampAware(OpenpilotTestCase):
+  """ramp-aware sub-option of the MPC (InsterMPCRampAware): the single car-ramp constant, the envelope, the inverse table, the
+  stiction prediction, the switch rules (off = the plain MPC bit for bit) and limits"""
+
+  def test_single_ramp_constant(self):
+    # the MPC's car-ramp model is the car's own limiter pair: opendbc's Inster values = CarControllerParams = the observer's limiter
+    CP = interfaces[HYUNDAI.HYUNDAI_INSTER].get_non_essential_params(HYUNDAI.HYUNDAI_INSTER)
+    ccp = CarControllerParams(CP)
+    assert (MPC_RAMP_UP, MPC_RAMP_DOWN) == (float(ccp.STEER_DELTA_UP), float(ccp.STEER_DELTA_DOWN)) == (3.0, 6.0)
+    c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY, MPC_RAMP_KEY), ctrl=1)
+    assert c.inster_mpc is not None and c.inster_mpc.ra is not None
+    assert (c.inster_mpc.ramp_up, c.inster_mpc.ramp_down) == (float(c.inster_limit_observer.ccp.STEER_DELTA_UP),
+                                                              float(c.inster_limit_observer.ccp.STEER_DELTA_DOWN))
+
+  def test_gain_matrix_row0(self):
+    full = mpc_gain_matrix(MPC_PARAMS)
+    assert full.shape == (45, 24, 27)
+    assert np.array_equal(full[:, 0, :], mpc_gain_rows(MPC_PARAMS))       # the plain MPC's rows, bit for bit
+
+  def test_envelope(self):
+    rng = random.Random(7)
+    U, D = MPC_RAMP_UP * MPC_NBLK, MPC_RAMP_DOWN * MPC_NBLK
+
+    def reach(x, y):                       # y reachable from x in one block (growing |.| at most U, shrinking at most D, crossing zero)
+      if x * y >= 0.0:
+        return (abs(y) - abs(x) <= U + 1e-9) if abs(y) >= abs(x) else (abs(x) - abs(y) <= D + 1e-9)
+      return abs(x) / D + abs(y) / U <= 1.0 + 1e-9
+    for _ in range(300):
+      T = [rng.uniform(-409, 409) if rng.random() < 0.3 else 0.0 for _ in range(25)]
+      for j in range(1, 25):
+        if rng.random() < 0.6:
+          T[j] = T[j - 1]
+      E = mpc_ramp_envelope(T, U, D)
+      assert E[-1] == T[-1] and all(abs(e) <= 409.0 + 1e-9 for e in E)
+      assert all(reach(E[j], E[j + 1]) for j in range(24)), T          # ramp-feasible by construction
+      assert mpc_ramp_envelope(E, U, D) == E                            # a feasible trajectory is its own envelope
+    T = [0.0] * 10 + [100.0] * 15                                       # a step: started early (7 blocks), on time at the step
+    E = mpc_ramp_envelope(T, U, D)
+    assert E[10] == 100.0 and abs(E[9] - (100.0 - U)) < 1e-9 and abs(E[4] - (100.0 - 6 * U)) < 1e-9 and E[3] == 0.0 and E[0] == 0.0
+
+  def test_anticipation_continuous(self):
+    for lam_in, lam_out in ((0.0, 0.0), (1.0, 0.0), (0.3, 0.7), (1.0, 1.0)):
+      assert mpc_ramp_anticipation(10.0, 10.0, lam_in, lam_out) == 0.0
+      assert abs(mpc_ramp_anticipation(1e-12, 40.0, lam_in, lam_out) - mpc_ramp_anticipation(-1e-12, 40.0, lam_in, lam_out)) < 1e-9
+      assert abs(mpc_ramp_anticipation(40.0, 1e-12, lam_in, lam_out) - mpc_ramp_anticipation(40.0, -1e-12, lam_in, lam_out)) < 1e-9
+      assert abs(mpc_ramp_anticipation(10.0, 20.0, lam_in, lam_out) - lam_in * 10.0) < 1e-12
+      assert abs(mpc_ramp_anticipation(20.0, 10.0, lam_in, lam_out) - lam_out * -10.0) < 1e-12
+
+  def test_table_inverse(self):
+    for v in SPEEDS[::4]:
+      for a in np.linspace(0.01, 3.4, 40):
+        raw = ff_torque(float(a), v) * STEER_MAX_RAW
+        if raw < 408.9:                                                  # below the 409 plateau the inverse is exact
+          assert abs(ff_table_inverse(raw, v) - a) < 1e-9, (v, a)
+          assert abs(ff_table_inverse(-raw, v) + a) < 1e-9
+      assert ff_table_inverse(0.0, v) == 0.0
+
+  def test_stiction_prediction_matches_the_term(self):
+    # the plan-predicted term = InsterStictionFriction settled on the same intended rate and held torque with the wheel at rest
+    for v, x, h in ((5.0, 12.0, 150.0), (12.0, -8.0, 200.0), (20.0, 3.0, -80.0), (30.0, -20.0, -300.0)):
+      f = InsterStictionFriction(DT_CTRL)
+      out = 0.0
+      for _ in range(800):
+        out = f.update(v, x * 0.2, 0.0, 0.0, 0.2, 0.0, h)               # x = (future - now) / lat_delay, no error part
+      assert abs(out - stiction_predicted(x, h, v)) < 1e-6, (v, x, h)
+
+  def test_switch_rules(self):
+    # off (param off, or the MPC not in use): the run equals the one without the param; on: own version bit, finite, inside the cap
+    def mdl(ay):
+      return _MVM(int(ay * 1000), 0.0, 15.0)
+    base = _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1), extension_model=mdl)
+    for on, ctrl in ((INSTER_KEYS + (MPC_RAMP_KEY,), 1), (INSTER_KEYS + (MPC_KEY, MPC_RAMP_KEY), 0), (INSTER_KEYS + (MPC_RAMP_KEY,), 0)):
+      c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl)
+      assert c.inster_mpc is None or c.inster_mpc.ra is None
+      assert _run(c, VM, extension_model=mdl) == _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER, on=tuple(k for k in on if k != MPC_RAMP_KEY),
+                                                                 ctrl=ctrl), extension_model=mdl)
+    c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
+    assert c.inster_mpc.ra is None and _run(c, VM, extension_model=mdl) == base
+    # every weight on and the stiction prediction (the shipped set leaves the release side off; this checks that the whole path acts)
+    strong = {'ra_in_lo': 1.0, 'ra_in': 1.0, 'ra_v0': 160.0, 'ra_out_lo': 1.0, 'ra_out': 1.0, 'ra_v0_out': 160.0, 'ra_st': 1.0, 'ra_lead': 0.2,
+              'ra_pd': 0.5, 'ra_pd_t': 0.15}
+    with mock.patch.object(latcontrol_torque_v0, 'MPC_RAMP_PARAMS', strong):
+      on, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY, MPC_RAMP_KEY), ctrl=1)
+    assert on.inster_mpc.ra == strong
+    assert on.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | ANGLE_PI_VERSION_MPC_BIT | 256 |
+                                                                             ANGLE_PI_VERSION_MPC_RAMP_BIT) == 976106
+    assert angle_pi_log_version(LATERAL_PID, False, False, True) == angle_pi_log_version(LATERAL_PID, False)   # only with the MPC
+    run_on = _run(on, VM, extension_model=mdl)
+    assert run_on != base
+    assert all(math.isfinite(r[0]) and abs(r[0]) <= CAP + 1e-9 for r in run_on)
+    assert MPC_RAMP_PARAM == MPC_RAMP_KEY
+
+  def test_all_zero_weights_is_the_plain_mpc(self):
+    zero = dict(MPC_RAMP_PARAMS, ra_in_lo=0.0, ra_in=0.0, ra_out_lo=0.0, ra_out=0.0, ra_st=0.7, ra_lead=0.2)
+    m0, m1 = _mpc(), InsterMPC(DT_CTRL, model_t_idxs=ModelConstants.T_IDXS, ramp_aware=zero)
+    assert m1.ra is None
+    assert TestInsterMPC._drive(None, m0, n=800) == TestInsterMPC._drive(None, m1, n=800)
+
+  def test_table_inverse_top(self):
+    # beyond the table's top the inverse is the top's (no jump to the last node)
+    for v in (3.0, 5.0, 12.0, 25.0):
+      top = max(ff_torque(a, v) for a in A_NODES) * 384.0
+      assert ff_table_top(top, v) and not ff_table_top(top - 5.0, v)
+      assert ff_table_inverse(top + 50.0, v) == ff_table_inverse(top, v)
+      assert ff_table_inverse(-(top + 50.0), v) == -ff_table_inverse(top, v)
+
+  def test_release_parts_never_into_the_curve(self):
+    # a held curve on the table's top whose plan releases 0.3 s ahead: with the release step / pre-drop only, the shift never points
+    # into the curve and acts; with the turn-in side only, the flat plateau gives no shift
+    v = 4.6
+    kd = 0.4
+    P = np.array([kd if j * MPC_DTB < 0.3 else kd * max(0.0, 1.0 - 2.0 * (j * MPC_DTB - 0.3)) for j in range(MPC_NH + 1)])
+    U = np.full(MPC_NH, kd * v * v)
+    la0 = kd * v * v
+    assert ff_table_top(ff_torque(la0, v) * 384.0, v)
+    base = dict(MPC_RAMP_PARAMS, ra_in_lo=0.0, ra_in=0.0, ra_out_lo=0.0, ra_out=0.0, ra_st=0.0, ra_pd=0.0)
+    for over, acts in (({'ra_in_lo': 1.0, 'ra_in': 1.0}, False), ({'ra_out_lo': 1.0, 'ra_out': 1.0, 'ra_st': 1.0}, True),
+                       ({'ra_pd': 1.0}, True),
+                       ({'ra_in_lo': 1.0, 'ra_in': 1.0, 'ra_out_lo': 1.0, 'ra_out': 1.0, 'ra_st': 1.0, 'ra_pd': 1.0}, True)):
+      m = InsterMPC(DT_CTRL, model_t_idxs=ModelConstants.T_IDXS, ramp_aware=dict(base, **over))
+      s0, s1 = m._ramp_shift((P, 0.2, kd * v * v, U), v, kd, la0, 1.0, 600.0)
+      assert s0 <= 0.0 and s1 <= 0.0, (over, s0, s1)
+      assert (s1 < 0.0) == acts, (over, s0, s1)
+
+  def test_turns_in_earlier_than_the_plain_mpc(self):
+    # the shipped set (MPC 6 Nov): its plain LQ passes the plan through, so the whole lead comes from the ramp-aware turn-in; with
+    # the switch on the feed-forward command reaches 10 % of a plan step at least 0.15 s earlier than the plain MPC (0.23-0.40 s at
+    # 18-54 km/h), and the plain MPC has no lead (within one block of the pass-through)
+    for v in (5.0, 8.0, 15.0):
+      ra = _plan_step_command(InsterMPC(DT_CTRL, model_t_idxs=ModelConstants.T_IDXS, ramp_aware=MPC_RAMP_PARAMS), v)
+      plain = _plan_step_command(_mpc(), v)
+      assert _t_reach(ra, 0.1) <= _t_reach(plain, 0.1) - 0.15 + 1e-9, (v, _t_reach(ra, 0.1), _t_reach(plain, 0.1))
+      assert abs(_t_reach(plain, 0.1) - (3.0 - 0.2)) <= MPC_DTB + 1e-9, (v, _t_reach(plain, 0.1))
+
+  def test_budget_includes_the_ramp_shift(self):
+    # the 2 ms solve budget covers the ramp-aware shift too: a shift that alone takes 2.5 ms per solve falls back like a slow solve
+    # (the shift is still computed, unused, in the fallback, so the budget keeps seeing it), and returns once it is fast again
+    t = [0.0]
+    m = InsterMPC(DT_CTRL, model_t_idxs=ModelConstants.T_IDXS, ramp_aware=MPC_RAMP_PARAMS)
+    shift0 = m._ramp_shift
+
+    def slow_shift(*a):
+      t[0] += 0.0025
+      return shift0(*a)
+    m._ramp_shift = slow_shift
+    out = TestInsterMPC._drive(None, m, clock=lambda: t[0])
+    assert m.overruns >= 3 and out[50][3] < 0.2 and all(o[3] < 0.05 for o in out[100:])
+    m._ramp_shift = shift0
+    out = TestInsterMPC._drive(None, m, n=200, clock=lambda: t[0])
+    assert m.overruns == 0 and out[-1][3] > 0.9
+
+  def test_non_finite_solve_zeroes_the_shift(self):
+    # a non-finite solve: no ramp-aware shift while the fallback fades the MPC out (not the last block's values), finite outputs;
+    # the next finite solve brings it back
+    m = InsterMPC(DT_CTRL, model_t_idxs=ModelConstants.T_IDXS, ramp_aware=MPC_RAMP_PARAMS)
+    v, k_step = 8.0, 1.0 / 64.0
+    def step(k):
+      t = k * DT_CTRL
+      m.observe_model(_MVMProfile(k // 5, lambda T: k_step if t + T >= 3.0 else 0.0, v))
+      kd = k_step if t + 0.2 >= 3.0 else 0.0
+      la0 = kd * v * v
+      return m.update(v, kd, kd, 0.2, False, la0, ff_table_slope_raw(la0, v), steer_deg_per_curvature=600.0)
+    for k in range(250):                                      # 2.5 s: the plan step 0.5 s ahead, the anticipation acts
+      step(k)
+    assert m.h > 0.9 and abs(m.ra_ant) > 0.05 and (m.ra_s0, m.ra_s1) != (0.0, 0.0)
+    good = m.rows
+    m.rows = np.full_like(good, np.nan)
+    for k in range(250, 300):
+      out = step(k)
+      assert all(math.isfinite(x) for x in out)
+      if m.bad:
+        assert (m.ra_s0, m.ra_s1) == (0.0, 0.0) and m.ra_ant == 0.0
+    assert m.bad and m.h < 0.05
+    m.rows = good
+    for k in range(300, 500):
+      step(k)
+    assert not m.bad and m.h > 0.9
+
+  def test_ranges_and_limits(self):
+    for k, (lo, hi) in MPC_RAMP_RANGES.items():
+      for bad in (lo - 0.01, hi + 0.01, float('nan')):
+        with self.assertRaises(ValueError):
+          InsterMPC(DT_CTRL, model_t_idxs=ModelConstants.T_IDXS, ramp_aware=dict(MPC_RAMP_PARAMS, **{'ra_in': 0.5, k: bad}))
+    full = {'ra_in_lo': 1.0, 'ra_in': 1.0, 'ra_v0': 160.0, 'ra_out_lo': 1.0, 'ra_out': 1.0, 'ra_v0_out': 160.0, 'ra_st': 1.0, 'ra_lead': 0.5,
+            'ra_pd': 1.0, 'ra_pd_t': 0.5}
+    m = InsterMPC(DT_CTRL, model_t_idxs=ModelConstants.T_IDXS, ramp_aware=full)
+    out = []
+    for k in range(3000):
+      kd = 0.03 * math.sin(0.004 * k) + 0.02 * (k % 700 > 350)
+      m.observe_model(_MVM(k // 5, kd, 8.0))
+      la0 = kd * 64.0
+      kref, delta = m.update(8.0, kd, 0.9 * kd, 0.2, False, la0, ff_table_slope_raw(la0, 8.0), steer_deg_per_curvature=600.0)
+      out.append((kref, delta, m.ra_ant))
+    d = np.array([o[1] for o in out])
+    assert np.all(np.abs(np.diff(d)) <= MPC_JERK_MAX * DT_CTRL + 1e-12)                 # the shift's jerk limit still holds
+    assert all(math.isfinite(x) for o in out for x in o)
+    assert max(abs(o[2]) for o in out) > 0.0                                              # it acts

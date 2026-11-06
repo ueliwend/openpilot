@@ -35,7 +35,8 @@ Nothing here is validated on the car.
 """
 import math
 
-from opendbc.car.hyundai.values import CAR, INSTER_STEER_FULL_SCALE, INSTER_STEER_MAX, CarControllerParams
+from opendbc.car.hyundai.values import CAR, INSTER_STEER_DELTA_DOWN, INSTER_STEER_DELTA_UP, INSTER_STEER_FULL_SCALE, INSTER_STEER_MAX, \
+                                        CarControllerParams
 from opendbc.car.lateral import apply_driver_steer_torque_limits
 from openpilot.common.pid import PIDController
 
@@ -271,7 +272,7 @@ class InsterStictionFriction:
 #        R(v) = VM.get_steer_from_curvature(1.0, v, 0.0) (rad per 1/m) and v0's roll-compensated measured curvature (angle_error()).
 #   p  = kp(v) e,   i += ki(v) e dt   (v = vEgo in m/s; p and i in v0's lateral-acceleration units, m/s^2; kp, ki quadratic in v,
 #   clipped at >= 0, no speed hold above 130 km/h (owner's choice))
-# The integrator runs from standstill; it freezes while steeringPressed or when the car-side limiter (cap, 3 / 5 raw ramp, driver rule)
+# The integrator runs from standstill; it freezes while steeringPressed or when the car-side limiter (cap, 3 / 6 raw ramp, driver rule)
 # held the last request back in the direction of this step's update (since 29 Oct 2026, see freeze_angle_integrator below; before:
 # controlsd's steer_limited_by_safety flag in both directions), and it is reset whenever lateral control is inactive (v0 keeps its own
 # integrator, but F's can be wound at low speed, which v0's cannot: without the reset it would come back as a command towards the old
@@ -354,10 +355,10 @@ SOFT_P_R_MIN = math.radians(1.0)
 ANGLE_PI_VERSION_SOFT_P_BIT = 8
 
 
-def angle_pi_log_version(controller: int, soft_p: bool, mpc: bool = False) -> int:
+def angle_pi_log_version(controller: int, soft_p: bool, mpc: bool = False, mpc_ramp: bool = False) -> int:
   """torqueState.version with F on: the controller type's base + 1000 x mask (D bit with the PID, option-5 bit, freeze-rule bit 64,
-  fixed-factor bit 256, MPC bit 128). Since 30 Oct 2026 (gain sets PI-30Oct / PID-30Oct, fixed factor): PI 320105, PID 336106, with option 5
-  328105 / 344106."""
+  fixed-factor bit 256, MPC bit 128, ramp-aware MPC bit 512 (only with the MPC)). Since 30 Oct 2026 (gain sets PI-30Oct / PID-30Oct, fixed
+  factor): PI 320105, PID 336106, with option 5 328105 / 344106; PID + MPC 464106, + ramp-aware 976106."""
   if controller == LATERAL_PID:
     base, mask = ANGLE_PI_PID_BASE_VERSION, ANGLE_PI_VERSION_D_BIT
   else:
@@ -366,6 +367,8 @@ def angle_pi_log_version(controller: int, soft_p: bool, mpc: bool = False) -> in
     mask |= ANGLE_PI_VERSION_SOFT_P_BIT
   if mpc:
     mask |= ANGLE_PI_VERSION_MPC_BIT
+    if mpc_ramp:
+      mask |= ANGLE_PI_VERSION_MPC_RAMP_BIT
   return base + 1000 * (mask | ANGLE_PI_VERSION_FREEZE_DIR_BIT | ANGLE_PI_VERSION_FIXED_FACTOR_BIT)
 
 
@@ -377,7 +380,7 @@ def angle_pi_log_version(controller: int, soft_p: bool, mpc: bool = False) -> in
 # moves by more than ~2 raw per frame read as "limited" although no limiter acted; and it froze the integrator in both directions.
 # LOG (kit steps of 000000aa / a1 / 97): integrator frozen 56-67 % of active time (curves 78-82 %), ~20 points of it the lag alone.
 # Now: InsterSteerLimitObserver re-runs the car-side limiter (opendbc apply_driver_steer_torque_limits with the Inster's
-# CarControllerParams: 409 cap, ramp 3 up / 5 down, driver-torque rule) on this controller's own requests, so the limiting of a request
+# CarControllerParams: 409 cap, ramp 3 up / 6 down, driver-torque rule) on this controller's own requests, so the limiting of a request
 # is known in the same frame; the integrator is frozen while the driver steers, or when the previous request was held back by more than
 # LIMIT_TOL_RAW and this step's integrator update would push the output further in that direction. Unwinding is always allowed (the
 # conditional integration form of anti-windup; common/pid.py's clip against the output limit stays). controlsd's flag still drives
@@ -529,7 +532,7 @@ class InsterWheelRateFilter:
 #   fitted full-strength speed v_on (no fixed low-speed limit; below 1 m/s the plan is floored by modeld / rewritten by the crawl rule);
 #   h: fallback weight):
 #     feed-forward  delta added to v0's gravity-adjusted feed-forward lateral acceleration (before the table), rate-limited to the car's
-#                   ramp in raw-equivalent units (3 raw / step growing, 5 shrinking; table slope floor 30 raw per m/s^2) and to 5 m/s^3;
+#                   ramp in raw-equivalent units (3 raw / step growing, 6 shrinking; table slope floor 30 raw per m/s^2) and to 5 m/s^3;
 #     reference     kappa_ref = kappa_des + w (kappa_nom - kappa_des) for the angle error of P and I (and the integrator-freeze direction);
 #                   kappa_nom = the nominal model driven by the command (dead time 5 steps), not reset to the measurement.
 #   The stiction term, option 5's plan inputs and D keep the unshifted plan / the measurement.
@@ -540,25 +543,27 @@ class InsterWheelRateFilter:
 #   change (state >= 2), non-finite numbers (held until the next finite solve), three solves in a row over MPC_BUDGET_S.
 #   On the car the controller state is reset whenever lateral control is inactive (as the kit at a stretch start); missed model frames
 #   only age the preview (hold beyond 15 steps) and never reset the feed-forward part.
-# torqueState.version: + 1000 x ANGLE_PI_VERSION_MPC_BIT (128). Parameters: MPC_PARAMS (set MPC 3 Nov; replaces MPC 2 Nov).
+# torqueState.version: + 1000 x ANGLE_PI_VERSION_MPC_BIT (128). Parameters: MPC_PARAMS (set MPC 6 Nov, fitted at ramp 3 / 6 with the
+# ramp-aware turn-in below; replaces MPC 3 Nov).
 MPC_PARAM = "InsterMPC"
 ANGLE_PI_VERSION_MPC_BIT = 128
-# Parameter set MPC 3 Nov (owner 2 Nov 2026: new objective, absolute errors against an ideal zero-error controller, 10 km/h bands
-# 0-160 km/h weighted 4, 4, 3, 2, 2, 2, then 1; per-step variant from 6 km/h, stability weight 10): the optimisation round of 3 Nov
-# (coarse differential evolution for new starting points, full-fidelity re-score, Nelder-Mead scouts on 4 simulator members, the best
-# two continued on 8 members to convergence). Converged after 291 iterations on 8 members (cal + tab57 on both plant files, both
-# seeds). Replaces MPC 2 Nov (the previous best). SIM only, not validated on the car.
-MPC_PARAMS = {'g': 0.6096944194240149, 'g_lo': 0.5297315697466747, 'g_vlo': 0.8446727128331192, 'wy': 6.314122608110802,
-              'wpsi': -2.9930497797769178, 'wdu': 5.082953326542878, 'wu': -6.149124945743781, 'tau_vlo': 0.6637008622307352,
-              'tau_lo': 1.123619727393841, 'tau_hi': 0.28508444892441326, 'v_on': 8.551856627516123}
+# Parameter set MPC 6 Nov, fitted at ramp 3 / 6 (owner 5 Nov 2026: car ramp 3 / 6 together with a parameter set fitted at it): the
+# optimisation round of 6 Nov on the simulator with the car-side ramp at 3 up / 6 down and the ramp-aware MPC below (all MPC, PID and
+# ra_* parameters fitted jointly; objective: the per-step variant of the ideal-controller objective of MPC 3 Nov, from 6 km/h,
+# stability weight 10, plus a low-frequency oscillation term (0.15-0.35 Hz, straight and gentle curves, weight 3.5); simulator with the
+# plan-loop and vehicle layers). Nelder-Mead from the previous round's best point with the release parameters off, converged after 99
+# iterations on 8 members (cal + tab57 on both plant files, both seeds); the release parameters are at their neutral (off) values.
+# Replaces MPC 3 Nov (fitted for ramp 3 / 5). SIM only, not validated on the car.
+MPC_PARAMS = {'g': 0.2531054598947694, 'g_lo': 0.2207621439507277, 'g_vlo': 0.02750853516602676, 'wy': 0.26804876173652126,
+              'wpsi': 1.7177835659194365, 'wdu': 7.455952997933473, 'wu': 7.850649941731319, 'tau_vlo': 1.509470469622787,
+              'tau_lo': 0.5353329320976858, 'tau_hi': 0.5153084581704873, 'v_on': 42.90897226026003}
 # the PID's gain set and D filter when the MPC is in use (selected only then; PI-30Oct / PID-30Oct unchanged otherwise): fitted jointly
-# with MPC_PARAMS (same parameter set MPC 3 Nov), coefficients in m/s as PID-30Oct; each gain is clipped at >= 0 (angle_pi_gain). The D
-# gain was fitted as values at anchor speeds; its 10 km/h anchor is at the lower bound 0, so the quadratic is negative below 10 km/h
-# and D is 0 there on the car as in the fit (keep the fitted coefficients: setting kd[0] = 0 would raise D by 0.142 at every speed)
-ANGLE_PI_MPC_KP = (5.082811481547475, -0.3739474489531882, 0.009399937792403586)
-ANGLE_PI_MPC_KI = (1.9901045676133289, 1.4401972382525865, -0.03247332744707864)
-ANGLE_PI_MPC_KD = (-0.14247036955974607, 0.053364736785125794, -0.0007471453477021938)
-ANGLE_PI_MPC_D_TAU = 0.14900191737454482
+# with MPC_PARAMS (same parameter set MPC 6 Nov), coefficients in m/s as PID-30Oct; each gain is clipped at >= 0 (angle_pi_gain; with
+# MPC 6 Nov only the I gain: 0 below 0.12 m/s and above 39.6 m/s (142.6 km/h), in the fit as on the car)
+ANGLE_PI_MPC_KP = (2.2573333277084955, 0.35641912164901807, -0.0022513517948379988)
+ANGLE_PI_MPC_KI = (-0.16209349543599338, 1.3392518638139044, -0.03369950438792011)
+ANGLE_PI_MPC_KD = (0.10625143904808268, 0.015547554161706488, 0.00010085039626516662)
+ANGLE_PI_MPC_D_TAU = 0.833281080752706
 MPC_WA = -1.0                      # log10 q_a (fixed)
 MPC_NBLK = 5                       # control steps per block / solve (20 Hz at dt 0.01)
 MPC_NH = 24                        # horizon blocks (1.2 s)
@@ -571,11 +576,55 @@ MPC_TAU_H = 0.15                   # s: fallback weight low-pass
 MPC_ANCHOR = 0.15                  # m/s^2: frame preview anchored to the desired curvature within this
 MPC_AGE_MAX = 15                   # steps: oldest usable model frame
 MPC_A_LIM = 3.3                    # m/s^2: preview / command clip
-MPC_RAMP_UP, MPC_RAMP_DOWN = 3.0, 5.0   # raw per step (the Inster's ramp)
+# the car-side ramp (raw per step, |command| growing / shrinking): opendbc's Inster values, the numbers CarControllerParams and the panda
+# use (3 / 6 since 5 Nov 2026; 3 / 5 before). The default of InsterMPC's car-ramp model; latcontrol_torque_v0 passes
+# CarControllerParams(CP).STEER_DELTA_UP / DOWN.
+MPC_RAMP_UP, MPC_RAMP_DOWN = float(INSTER_STEER_DELTA_UP), float(INSTER_STEER_DELTA_DOWN)
 MPC_SLOPE_MIN = 30.0               # raw per m/s^2: floor of the table slope for the ramp conversion
 MPC_JERK_MAX = 5.0                 # m/s^3: jerk limit of the feed-forward part
-MPC_BUDGET_S = 0.002               # s per solve; three solves in a row over it -> fallback
+MPC_BUDGET_S = 0.002               # s per solve (with the ramp-aware shift); three solves in a row over it -> fallback
 MPC_NBUF = 101                     # own desired-curvature buffer (1 s)
+
+# Ramp-aware MPC (sub-option of InsterMPC, switch InsterMPCRampAware, default on, acts only with InsterMPC; owner 3 Nov 2026 "change the
+# controller, not the limit", "the earlier release too"; SIM only, NOT validated on the car; simulator kit
+# agents/ramp/r6kit/candidates_mpc_ra.py, this code reproduces it step for step). The car-side ramp (MPC_RAMP_UP / DOWN, the car's
+# CarControllerParams) is not in the LQ model; at each solve, with feed-forward quantities only (no measured state):
+#   1. the planned command over the horizon u_j = K_j(v) . c (the full gain matrix of mpc_gain_matrix, the same c as u_0);
+#   2. the planned feed-forward lateral acceleration F_j = la0 + v^2 (kd_j - kd) + w (a_j - v^2 kd_j) at t_j = j x 50 ms (a_0 = the block's
+#      start command, a_j = u_(j-1), kd_j = preview at lat_delay + t_j), its table torque T_j (raw);
+#   3. the release cause, a latched step: where the plan's own wheel rate x_j = R(v) (kappa_p(lat_delay + t_j + lead) - kappa_p(t_j +
+#      lead)) / lat_delay opposes the torque held now (x_j T_0 < 0, T_j still on T_0's side),
+#      the magnitude M_j of InsterStictionFriction's term (held torque T_j, wheel at rest); G_j = max_{i <= j} M_i (a plateau: the
+#      prediction never returns, so it never asks for a re-growth); predicted request R_j = clip(T_j - sign(T_0) ra_st G_j), pre-drop
+#      request D_j = clip(T_j - sign(T_0) ra_pd f(v) G_j)
+#      (+-409 raw; f = 1 at <= 40 km/h, 0 at >= v0_out);
+#   4. backward passes with exactly the car ramp (block rates UP x 5 / DOWN x 5, growing / shrinking |x|): E for T, E^R for R, E^D for D,
+#      the ramp-feasible trajectories never later than them (mpc_ramp_envelope);
+#   5. anticipation at j = 0 and 1: A = lam_in(v) x (growing part of T -> E) + lam_out(v) x (shrinking part)     (the table plan's ramp)
+#        + lam_out(v) x ((E^R - R) - (E - T))   (the release step's lead; the step itself stays with the runtime stiction term)
+#        + (E^D - E)                             (the release pre-drop, the step included; it ends ra_pd_t after the predicted flip
+#                                                  reaches now, removed at the down rate: no double drop with the runtime term)
+#      the two release parts only in the release direction, lam_in never on them; lam(v) = lam_lo at <= 15 km/h, lam at 40 km/h, 0 at
+#      >= v0 (linear between);
+#   6. shift s_j = finv(T_j + A_j) - F_j (finv: exact inverse of the table, ff_table_inverse; F_j itself where T_j is on the table's top,
+#      finv(T_j) otherwise), first-order hold over the block, x h f_v, added to the feed-forward shift target BEFORE its car-ramp + jerk
+#      limiter (so the MPC part stays inside the ramp);
+#   7. the P / I reference follows it: kappa_ref += k_a, the nominal model's (dead time + lag) response to the shift.
+# Parameters MPC_RAMP_PARAMS (ra_* as in the kit; all weights 0 = the plain InsterMPC). torqueState.version + 1000 x 512.
+# MPC_PARAMS and ANGLE_PI_MPC_* (MPC 6 Nov) were fitted with this option ON, hence its default on (6 Nov 2026): turning on InsterMPC
+# gives the fitted controller. InsterMPCRampAware off stays as an A/B option: the car then runs them without the turn-in anticipation,
+# a combination that was not fitted or scored.
+MPC_RAMP_PARAM = "InsterMPCRampAware"
+ANGLE_PI_VERSION_MPC_RAMP_BIT = 512
+# fitted jointly with MPC_PARAMS (parameter set MPC 6 Nov, ramp 3 / 6): turn-in anticipation lam_in 0.652 at <= 15 km/h, 0.816 at
+# 40 km/h, 0 from 109.6 km/h; the release side (ra_out_lo, ra_out, ra_v0_out, ra_st, ra_lead, ra_pd, ra_pd_t) at its neutral values
+# (off): the fit drove its weights to ~3e-5 and the off values score at least as well
+MPC_RAMP_PARAMS = {'ra_in_lo': 0.6521463706693205, 'ra_in': 0.8164262299304392, 'ra_v0': 109.57055767855056, 'ra_out_lo': 0.0,
+                   'ra_out': 0.0, 'ra_v0_out': 160.0, 'ra_st': 0.0, 'ra_lead': 0.0, 'ra_pd': 0.0, 'ra_pd_t': 0.05}
+MPC_RAMP_RANGES = {'ra_in_lo': (0.0, 1.0), 'ra_in': (0.0, 1.0), 'ra_v0': (45.0, 160.0), 'ra_out_lo': (0.0, 1.0), 'ra_out': (0.0, 1.0),
+                   'ra_v0_out': (45.0, 160.0), 'ra_st': (0.0, 1.0), 'ra_lead': (0.0, 0.5), 'ra_pd': (0.0, 1.0),
+                   'ra_pd_t': (0.05, 0.5)}
+MPC_RAMP_CAP = float(INSTER_STEER_MAX)    # raw: the predicted request is clipped to the cap
 
 
 def _smoothstep(x: float) -> float:
@@ -614,11 +663,17 @@ def mpc_strength(p: dict, v_ego: float) -> float:
 
 def mpc_gain_rows(p: dict):
   """K rows (len(MPC_VGRID) x (2 + MPC_NH + 1)): u0 = K . [kappa_n, a_prev, kappa_p(0 .. NH)] (least squares; as the kit's lq_rows)"""
+  return mpc_gain_matrix(p)[:, 0, :].copy()
+
+
+def mpc_gain_matrix(p: dict):
+  """the full gain matrix (len(MPC_VGRID) x MPC_NH x (2 + MPC_NH + 1)): u_j = K_j . [kappa_n, a_prev, kappa_p(0 .. NH)], j = 0 .. NH - 1
+  (row 0 = mpc_gain_rows)"""
   import numpy as np
   qy, qp, rd, ru = (10.0 ** float(p[k]) for k in ('wy', 'wpsi', 'wdu', 'wu'))
   qa = 10.0 ** MPC_WA
   nc = 4 + MPC_NH + 1
-  rows = np.zeros((len(MPC_VGRID), 2 + MPC_NH + 1))
+  rows = np.zeros((len(MPC_VGRID), MPC_NH, 2 + MPC_NH + 1))
   for iv, v in enumerate(MPC_VGRID):
     v2 = v * v
     al = math.exp(-MPC_DTB / mpc_tau(p, v))
@@ -669,8 +724,100 @@ def mpc_gain_rows(p: dict):
     Rc = np.array(Rc)
     Ru = np.array(Ru)
     K = -np.linalg.solve(Ru.T @ Ru, Ru.T @ Rc)
-    rows[iv] = K[0, 2:]
+    rows[iv] = K[:, 2:]
   return rows
+
+
+def ff_table_inverse(raw: float, v_ego: float) -> float:
+  """exact inverse of ff_torque (raw units in, signed lateral acceleration out, m/s^2): the acceleration whose table torque is raw; on
+  the 409 plateau the first acceleration that reaches it; beyond the table's top the same as the top"""
+  if raw == 0.0:
+    return 0.0
+  r = abs(raw) / STEER_MAX_RAW
+  vn = V_NODES
+  if v_ego <= vn[0]:
+    j, w = 0, 0.0
+  elif v_ego >= vn[-1]:
+    j, w = len(vn) - 2, 1.0
+  else:
+    j = 0
+    while v_ego >= vn[j + 1]:
+      j += 1
+    w = (v_ego - vn[j]) / (vn[j + 1] - vn[j])
+  t0, t1 = _TAB[j], _TAB[j + 1]
+  top = (1.0 - w) * t0[-1] + w * t1[-1]
+  if r > top:
+    r = top
+  an = A_NODES
+  a = an[-1]
+  for i in range(len(an) - 1):
+    c0 = (1.0 - w) * t0[i] + w * t1[i]
+    c1 = (1.0 - w) * t0[i + 1] + w * t1[i + 1]
+    if c1 >= r:
+      a = an[i] + (r - c0) * (an[i + 1] - an[i]) / (c1 - c0)
+      break
+  return a if raw > 0.0 else -a
+
+
+def ff_table_top(raw: float, v_ego: float) -> bool:
+  """|raw| at or above the table's top at v_ego (the plateau, where ff_table_inverse answers the knee)"""
+  vn = V_NODES
+  if v_ego <= vn[0]:
+    j, w = 0, 0.0
+  elif v_ego >= vn[-1]:
+    j, w = len(vn) - 2, 1.0
+  else:
+    j = 0
+    while v_ego >= vn[j + 1]:
+      j += 1
+    w = (v_ego - vn[j]) / (vn[j + 1] - vn[j])
+  return abs(raw) / STEER_MAX_RAW >= (1.0 - w) * _TAB[j][-1] + w * _TAB[j + 1][-1]
+
+
+def mpc_ramp_envelope(T: list, up_block: float, down_block: float) -> list:
+  """backward pass: the trajectory closest to T that the ramp can follow (per block at most up_block more |x|, down_block less, crossing
+  zero = shrink to 0 then grow) and that is never later than T"""
+  E = list(T)
+  for j in range(len(T) - 2, -1, -1):
+    y = E[j + 1]
+    if y >= 0.0:
+      hi = y + down_block
+      lo = y - up_block if y >= up_block else -down_block * (1.0 - y / up_block)
+    else:
+      lo = y - down_block
+      hi = y + up_block if -y >= up_block else down_block * (1.0 + y / up_block)
+    t = T[j]
+    E[j] = lo if t < lo else (hi if t > hi else t)
+  return E
+
+
+def mpc_ramp_anticipation(t: float, e: float, lam_in: float, lam_out: float) -> float:
+  """lam_in x the growing part of t -> e + lam_out x the shrinking part (crossing zero: shrink to 0, then grow); continuous"""
+  if t * e >= 0.0:
+    return (lam_in if abs(e) >= abs(t) else lam_out) * (e - t)
+  return lam_out * (-t) + lam_in * e
+
+
+def stiction_predicted(x: float, held_raw: float, v_ego: float) -> float:
+  """InsterStictionFriction's term (raw, v0-internal sign) for an intended wheel rate x (deg/s) and held torque held_raw, wheel at rest
+  (no fade): the plan-predicted value the ramp-aware MPC uses"""
+  if x == 0.0:
+    return 0.0
+  if v_ego >= SHAPE_W_BP[1]:
+    w = SHAPE_W
+  elif v_ego <= SHAPE_W_BP[0]:
+    w = SHAPE_W_LOW
+  else:
+    w = SHAPE_W_LOW + (SHAPE_W - SHAPE_W_LOW) * (v_ego - SHAPE_W_BP[0]) / (SHAPE_W_BP[1] - SHAPE_W_BP[0])
+  q = x / w
+  s = 1.0 - math.exp(-q * q)
+  if x < 0.0:
+    s = -s
+  hs = math.sqrt(held_raw * held_raw + HELD_H0 * HELD_H0) - HELD_H0
+  amplitude = FRICTION_A + (FRICTION_B_IN if x * held_raw > 0.0 else FRICTION_B_OUT) * hs
+  if amplitude > FRICTION_MAX:
+    amplitude = FRICTION_MAX
+  return amplitude * s
 
 
 MPC_VGRID = tuple(float(v) for v in range(1, 46))                    # m/s
@@ -682,13 +829,31 @@ class InsterMPC:
   """The MPC on top of the PID (see above). observe_model() every controlsd step (active or not), update() on active steps, reset()
   while lateral control is inactive. Signs: v0-internal curvatures (desired and measured curvature as v0 uses them)."""
 
-  def __init__(self, dt: float, params: dict | None = None, model_t_idxs=None):
+  def __init__(self, dt: float, params: dict | None = None, model_t_idxs=None, ramp_aware: dict | None = None,
+               ramp: tuple[float, float] = (MPC_RAMP_UP, MPC_RAMP_DOWN)):
+    """ramp_aware: the ramp-aware sub-option's parameters (MPC_RAMP_PARAMS; None = off); ramp: the car-side ramp (raw per step, |command|
+    growing / shrinking): latcontrol_torque_v0 passes the car's CarControllerParams STEER_DELTA_UP / DOWN"""
     import numpy as np
     if abs(dt - MPC_DT) > 1e-9:
       raise ValueError(f'InsterMPC is built for dt {MPC_DT} (blocks of {MPC_NBLK} steps), got {dt}')
     self.np = np
     self.p = dict(MPC_PARAMS if params is None else params)
-    self.rows = mpc_gain_rows(self.p)        # start-up: never in the control loop
+    self.ramp_up, self.ramp_down = float(ramp[0]), float(ramp[1])
+    if not (self.ramp_up > 0.0 and self.ramp_down > 0.0):
+      raise ValueError(f'InsterMPC: ramp {ramp}')
+    self.ra = None
+    if ramp_aware is not None:
+      ra = {k: float(ramp_aware[k]) for k in MPC_RAMP_RANGES}
+      for k, (lo, hi) in MPC_RAMP_RANGES.items():
+        if not (math.isfinite(ra[k]) and lo <= ra[k] <= hi):
+          raise ValueError(f'InsterMPC ramp-aware: {k} = {ra[k]} outside {lo} .. {hi}')
+      if any(ra[k] != 0.0 for k in ('ra_in_lo', 'ra_in', 'ra_out_lo', 'ra_out', 'ra_pd')):
+        self.ra = ra
+    if self.ra is not None:
+      self.full = mpc_gain_matrix(self.p)    # start-up: never in the control loop
+      self.rows = self.full[:, 0, :].copy()
+    else:
+      self.rows = mpc_gain_rows(self.p)      # start-up: never in the control loop
     self.vgrid0 = MPC_VGRID[0]
     self.al_h = 1.0 - math.exp(-dt / MPC_TAU_H)
     self.taus = np.array(MPC_TAUS)
@@ -707,6 +872,11 @@ class InsterMPC:
 
   def reset(self) -> None:
     self.fresh = True
+    self.ra_s0 = self.ra_s1 = 0.0            # ramp-aware: the shift at the block's start / end
+    self.ra_ka = 0.0                         # ramp-aware: the nominal response to the shift (reference-follow)
+    self.ra_abuf = [0.0] * (MPC_NBLK + 1)
+    self.ra_ant = 0.0
+    self.ra_pdn = 0                          # ramp-aware: solves in a row with the predicted release flip at now (the pre-drop's end)
 
   # ---- model frames ---------------------------------------------------------------------------------------------------------------
   def frame_row(self, yaw_rate, v_x):
@@ -759,10 +929,11 @@ class InsterMPC:
 
   # ---- one active step -------------------------------------------------------------------------------------------------------------
   def update(self, v_ego: float, kd: float, k_meas: float, lat_delay: float, steering_pressed: bool, la0: float, slope_raw: float,
-             clock=None) -> tuple[float, float]:
+             clock=None, steer_deg_per_curvature: float = 0.0) -> tuple[float, float]:
     """(kappa_ref, delta): the P / I reference curvature and the feed-forward lateral-acceleration shift for this step.
     la0: v0's unshifted feed-forward lateral acceleration (gravity-adjusted, offset removed); slope_raw: |d table / d a| at la0 in raw per
-    m/s^2 (the caller's ff table); clock: optional monotonic clock for the solve budget (None: no budget check)"""
+    m/s^2 (the caller's ff table); clock: optional monotonic clock for the solve budget (None: no budget check);
+    steer_deg_per_curvature: R(v) (deg of steering wheel per 1/m, the vehicle model's; the ramp-aware stiction prediction)"""
     np = self.np
     v2 = v_ego * v_ego
     v2c = v2 if v2 > 1.0 else 1.0
@@ -777,10 +948,16 @@ class InsterMPC:
       self.nb = 0
       self.bad = False
       self.fresh = False
+      self.ra_s0 = self.ra_s1 = 0.0
+      self.ra_pdn = 0
+      self.ra_ka = 0.0
+      self.ra_abuf = [0.0] * (MPC_NBLK + 1)
     self.kbuf[:-1] = self.kbuf[1:]
     self.kbuf[-1] = kd
     fv = mpc_fade(self.p, v_ego)
     ok = not steering_pressed and self.lane_change < 2 and fv > 0.0
+    plan = None
+    t0 = None                                # solve-budget clock: from the solve's start to the end of the ramp-aware shift
     if self.nb % MPC_NBLK == 0:
       if fv > 0.0:
         t0 = clock() if clock is not None else None
@@ -798,12 +975,23 @@ class InsterMPC:
             u0 = 0.0
         al_ = MPC_A_LIM if MPC_A_LIM > abs(kd) * v2 else abs(kd) * v2
         u0 = al_ if u0 > al_ else (-al_ if u0 < -al_ else u0)
+        if self.ra is not None and not self.bad:
+          # ramp-aware: the planned command over the horizon, the same c as u0
+          Kf = self.full[i] + fr * (self.full[i + 1] - self.full[i])
+          U = Kf[:, 0] * self.k_nom + Kf[:, 1] * self.a_prev + Kf[:, 2:] @ P
+          U = np.clip(U, -al_, al_)
+          U[0] = u0
+          plan = (P, lat_delay, self.u0, U)
+        elif self.bad:
+          # non-finite solve: no ramp-aware shift (not the last block's values) while the fallback fades the MPC out
+          self.ra_s0 = self.ra_s1 = 0.0
+          self.ra_pdn = 0
         self.a_prev, self.u0 = self.u0, u0
         self.n_solve += 1
-        if t0 is not None:
-          self.overruns = self.overruns + 1 if clock() - t0 > MPC_BUDGET_S else 0
       else:
         self.a_prev = self.u0 = kd * v2
+        self.ra_s0 = self.ra_s1 = 0.0
+        self.ra_pdn = 0
     if self.overruns >= 3 or self.bad:
       ok = False
     s_ = (self.nb % MPC_NBLK + 1) / MPC_NBLK
@@ -816,26 +1004,124 @@ class InsterMPC:
     if not math.isfinite(self.k_nom):
       self.k_nom = k_meas
     self.h += self.al_h * ((1.0 if ok else 0.0) - self.h)
-    if self.h < 0.05:
+    fallback = self.h < 0.05
+    if fallback:
       self.k_nom = k_meas
       self.a_prev = self.u0 = kd * v2
       self.abuf = [kd * v2] * (MPC_NBLK + 1)
+      if self.ra is not None:
+        self.ra_s0 = self.ra_s1 = 0.0
+        self.ra_pdn = 0
+        self.ra_ka = 0.0
+        self.ra_abuf = [0.0] * (MPC_NBLK + 1)
     w = mpc_strength(self.p, v_ego) * self.h * fv
     self.w = w
     tgt = w * (a_cmd - kd * v2)
+    if self.ra is not None:
+      if plan is not None:
+        s0, s1 = self._ramp_shift(plan, v_ego, kd, la0, w, steer_deg_per_curvature)
+        if fallback:
+          # computed (so the solve budget sees its cost and can recover) but not used: no shift in the fallback
+          self.ra_pdn = 0
+        else:
+          self.ra_s0, self.ra_s1 = s0, s1
+      ant = self.h * fv * (self.ra_s0 + s_ * (self.ra_s1 - self.ra_s0))
+      self.ra_ant = ant
+      tgt += ant
+      self.ra_abuf.append(ant)
+      self.ra_abuf.pop(0)
+      self.ra_ka = al_n * self.ra_ka + (1.0 - al_n) * self.ra_abuf[0] / v2c
+      if not math.isfinite(self.ra_ka):
+        self.ra_ka = 0.0
+    if t0 is not None:
+      # the budget covers the solve and the ramp-aware shift; three solves in a row over it -> fallback from the next step
+      self.overruns = self.overruns + 1 if clock() - t0 > MPC_BUDGET_S else 0
     slope = slope_raw if slope_raw > MPC_SLOPE_MIN else MPC_SLOPE_MIN
     d_ = tgt - self.delta
     grow = abs(tgt) > abs(self.delta) and tgt * self.delta >= 0.0
-    lim = (MPC_RAMP_UP if grow else MPC_RAMP_DOWN) / slope
+    lim = (self.ramp_up if grow else self.ramp_down) / slope
     jl = MPC_JERK_MAX * MPC_DT
     lim = lim if lim < jl else jl
     self.delta += lim if d_ > lim else (-lim if d_ < -lim else d_)
     if not math.isfinite(self.delta):
       self.delta = 0.0
     kref = kd + w * (self.k_nom - kd)
+    if self.ra is not None:
+      kref += self.ra_ka
     if not math.isfinite(kref):
       kref = kd
     return kref, self.delta
+
+  def _ramp_shift(self, plan, v_ego: float, kd: float, la0: float, w: float, r_deg: float) -> tuple[float, float]:
+    """the ramp-aware shift (m/s^2) at the block's start and end (steps 2 - 6 above), feed-forward quantities only"""
+    np = self.np
+    P, ld, ap, U = plan
+    ra = self.ra
+    v2 = v_ego * v_ego
+    ldc = ld if ld > MPC_DT else MPC_DT
+    kmh = v_ego * 3.6
+    st_on = ra['ra_st'] != 0.0 or ra['ra_pd'] != 0.0
+    fpd = ra['ra_pd'] * _mpc_pwl(kmh, (MPC_V_GLO, MPC_V_GHI, ra['ra_v0_out']), (1.0, 1.0, 0.0))
+    cap = MPC_RAMP_CAP
+    T, Rq, PD, F01 = [], [], [], []
+    t0s, gmax, jf = 0.0, 0.0, -1
+    dn_b = self.ramp_down * MPC_NBLK
+    for j in range(MPC_NH + 1):
+      tj = j * MPC_DTB
+      kdj = kd if j == 0 else float(np.interp(ld + tj, self.taus, P))
+      aj = ap if j == 0 else float(U[j - 1])
+      Fj = la0 + v2 * (kdj - kd) + w * (aj - v2 * kdj)
+      Tj = ff_torque(Fj, v_ego) * STEER_MAX_RAW
+      if j < 2:
+        F01.append(Fj)
+      if j == 0:
+        t0s = 1.0 if Tj > 0.0 else (-1.0 if Tj < 0.0 else 0.0)
+      Rj = Tj
+      if st_on and t0s != 0.0:
+        # beyond the preview's reach (lat_delay + t + lead > the last preview offset) the plan's wheel rate is held at its last valid value
+        tx = MPC_TAUS[-1] - ld - ra['ra_lead']
+        tx = tj if tj < tx else (tx if tx > 0.0 else 0.0)
+        xj = r_deg * (float(np.interp(ld + tx + ra['ra_lead'], self.taus, P)) - float(np.interp(tx + ra['ra_lead'], self.taus, P))) / ldc
+        if xj * t0s < 0.0 and Tj * t0s > 0.0:      # the plan unwinds against the torque held now: the gap, latched
+          m = abs(stiction_predicted(xj, Tj, v_ego))
+          if m > gmax:
+            gmax = m
+        Rj = Tj - t0s * ra['ra_st'] * gmax
+        if jf < 0 and gmax > 0.0:
+          jf = j
+      if j == 0:
+        self.ra_pdn = self.ra_pdn + 1 if jf == 0 else 0
+      # the pre-drop ends ra_pd_t after the predicted flip reaches now, removed at the down rate (plan only)
+      dec = 0.0
+      if jf >= 0:
+        e = (j - jf + (self.ra_pdn - 1 if jf == 0 else 0)) * MPC_DTB - ra['ra_pd_t']
+        if e > 0.0:
+          dec = e * (dn_b / MPC_DTB)
+      g = fpd * gmax - dec
+      dj = Tj - t0s * (g if g > 0.0 else 0.0)
+      T.append(cap if Tj > cap else (-cap if Tj < -cap else Tj))
+      Rq.append(cap if Rj > cap else (-cap if Rj < -cap else Rj))
+      PD.append(cap if dj > cap else (-cap if dj < -cap else dj))
+    up_b = self.ramp_up * MPC_NBLK
+    E = mpc_ramp_envelope(T, up_b, dn_b)
+    ER = mpc_ramp_envelope(Rq, up_b, dn_b) if gmax > 0.0 and ra['ra_st'] != 0.0 else None
+    ED = mpc_ramp_envelope(PD, up_b, dn_b) if gmax > 0.0 and fpd != 0.0 else None
+    lam_in = _mpc_pwl(kmh, (MPC_V_GLO, MPC_V_GHI, ra['ra_v0']), (ra['ra_in_lo'], ra['ra_in'], 0.0))
+    lam_out = _mpc_pwl(kmh, (MPC_V_GLO, MPC_V_GHI, ra['ra_v0_out']), (ra['ra_out_lo'], ra['ra_out'], 0.0))
+    s = []
+    for j in (0, 1):
+      A = mpc_ramp_anticipation(T[j], E[j], lam_in, lam_out)
+      if ER is not None:
+        ar = lam_out * ((ER[j] - Rq[j]) - (E[j] - T[j]))
+        A += 0.0 if ar * t0s > 0.0 else ar
+      if ED is not None:
+        ap_ = ED[j] - E[j]
+        A += 0.0 if ap_ * t0s > 0.0 else ap_
+      base = F01[j] if ff_table_top(T[j], v_ego) else ff_table_inverse(T[j], v_ego)
+      s.append(ff_table_inverse(T[j] + A, v_ego) - base if A != 0.0 else 0.0)
+    if not (math.isfinite(s[0]) and math.isfinite(s[1])):
+      return 0.0, 0.0
+    return s[0], s[1]
 
 
 def ff_table_slope_raw(lateral_accel: float, v_ego: float) -> float:

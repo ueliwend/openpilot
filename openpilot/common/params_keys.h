@@ -299,6 +299,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"InsterAngleErrorPIGains", {PERSISTENT | BACKUP, INT}},  // legacy (0 G2, 1 G6, 2 P6), migrated to InsterLateralController; no default
     {"InsterLateralController", {PERSISTENT | BACKUP, INT, "0"}},  // 0 = PI (gains PI-30Oct), 1 = PID (gains PID-30Oct); G6 / P6 until 30 Oct 2026
     {"InsterMPC", {PERSISTENT | BACKUP, BOOL, "0"}},  // model predictive control on top of the PID (SIM only)
+    {"InsterMPCRampAware", {PERSISTENT | BACKUP, BOOL, "1"}},  // ramp-aware sub-option of InsterMPC, acts only with it (SIM only)
     {"InsterSoftSmallErrorP", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"InsterSpeedFeedforward", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"InsterStictionFriction", {PERSISTENT | BACKUP, BOOL, "0"}},

@@ -15,7 +15,8 @@ from openpilot.common.pid import PIDController
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_PI_KI, ANGLE_PI_PI_KP, ANGLE_PI_PI_BASE_VERSION, \
                                                                        ANGLE_PI_PID_KD, ANGLE_PI_PID_KI, ANGLE_PI_PID_KP, LATERAL_PID, \
                                                                        INSTER_FIXED_FACTOR, SOFT_P_PARAM, InsterAnglePI, InsterSteerLimitObserver, \
-                                                                       MPC_PARAM, InsterMPC, ff_table_slope_raw, ANGLE_PI_MPC_D_TAU, \
+                                                                       MPC_PARAM, MPC_RAMP_PARAM, MPC_RAMP_PARAMS, CarControllerParams, \
+                                                                       InsterMPC, ff_table_slope_raw, ANGLE_PI_MPC_D_TAU, \
                                                                        ANGLE_PI_MPC_KD, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KP, \
                                                                        InsterStictionFriction, InsterWheelRateFilter, STEER_MAX_RAW, \
                                                                        angle_error, angle_lateral_controller, angle_pi_log_version, \
@@ -134,7 +135,12 @@ class LatControlTorque(LatControl):
       if mpc:
         try:
           from openpilot.selfdrive.modeld.constants import ModelConstants
-          self.inster_mpc = InsterMPC(self.dt, model_t_idxs=ModelConstants.T_IDXS)
+          # ramp-aware sub-option (InsterMPCRampAware): the MPC plans around the car-side ramp, which it reads from the car's own
+          # CarControllerParams (the numbers the car-side limiter and the panda use)
+          ramp_aware = params.get_bool(MPC_RAMP_PARAM)
+          ccp = CarControllerParams(CP)
+          self.inster_mpc = InsterMPC(self.dt, model_t_idxs=ModelConstants.T_IDXS, ramp_aware=MPC_RAMP_PARAMS if ramp_aware else None,
+                                      ramp=(ccp.STEER_DELTA_UP, ccp.STEER_DELTA_DOWN))
         except Exception:
           cloudlog.exception("InsterMPC set-up failed: running the plain PID")
           self.inster_mpc = None
@@ -144,7 +150,8 @@ class LatControlTorque(LatControl):
         # is not simulated). If the MPC set-up failed above, the plain PID keeps Soft-P as selected.
         cloudlog.warning("InsterSoftSmallErrorP is off while InsterMPC runs (the MPC was fitted without it)")
         self.inster_soft_p = False
-      self.inster_angle_pi_version = angle_pi_log_version(controller, self.inster_soft_p, mpc)
+      self.inster_angle_pi_version = angle_pi_log_version(controller, self.inster_soft_p, mpc,
+                                                          mpc and self.inster_mpc is not None and self.inster_mpc.ra is not None)
       if self.inster_soft_p and controller != LATERAL_PID:
         cloudlog.info("InsterSoftSmallErrorP: its parameters were fitted with the PID, not the PI selected")
       if controller == LATERAL_PID and mpc:
@@ -238,7 +245,8 @@ class LatControlTorque(LatControl):
         # MPC (on top of the PID): reference curvature for P / I and a rate-limited shift of the feed-forward lateral acceleration
         inster_kappa_ref, mpc_delta = self.inster_mpc.update(
           CS.vEgo, desired_curvature, measured_curvature, lat_delay, CS.steeringPressed, ff,
-          ff_table_slope_raw(ff, CS.vEgo), clock=time.monotonic)
+          ff_table_slope_raw(ff, CS.vEgo), clock=time.monotonic,
+          steer_deg_per_curvature=math.degrees(VM.get_steer_from_curvature(1.0, CS.vEgo, 0.0)))
         ff += mpc_delta
         self.inster_mpc_delta = mpc_delta
         self._inster_mpc_log_overrun()
