@@ -85,6 +85,8 @@ class SelfdriveD:
     self.big_model_active = False
     self.big_model_failed = False
     self.big_model_ready_t = 0.
+    # (ChestnutLoading, ChestnutActive): modeld's big-model load / failure flags, refreshed by the params thread (10 Hz)
+    self.chestnut_params = self.read_chestnut_params()
 
     # Setup sockets
     self.pm = messaging.PubMaster(['selfdriveState', 'onroadEvents'] + ['selfdriveStateSP', 'onroadEventsSP'])
@@ -190,7 +192,7 @@ class SelfdriveD:
       self.events.add(EventName.joystickDebug)
       self.startup_event = None
 
-    loading = self.params.get_bool("ChestnutLoading")
+    loading, big_active = self.chestnut_params
     if self.big_model_loading and not loading:
       self.big_model_ready_t = time.monotonic()
       self.events_sp.add(custom.OnroadEventSP.EventName.bigModelReady)
@@ -198,7 +200,6 @@ class SelfdriveD:
     if self.big_model_loading:
       self.events.add(EventName.bigModelLoading)
 
-    big_active = self.params.get("ChestnutActive")
     chestnut_present = self.sm['deviceState'].chestnutPresent
     model_unavailable = big_active is True and self.sm.seen['modelV2'] and not self.sm.alive['modelV2']
     big_failed = big_active is False or model_unavailable or (self.big_model_active and not chestnut_present)
@@ -654,8 +655,12 @@ class SelfdriveD:
 
     self.CS_prev = CS
 
+  def read_chestnut_params(self) -> tuple[bool, bool | None]:
+    return self.params.get_bool("ChestnutLoading"), self.params.get("ChestnutActive")
+
   def params_thread(self, evt):
     while not evt.is_set():
+      self.chestnut_params = self.read_chestnut_params()   # one assignment: update_events always sees a pair read together
       self.is_metric = self.params.get_bool("IsMetric")
       self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
       self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
