@@ -83,6 +83,10 @@ class Car:
 
     self.last_actuators_output = structs.CarControl.Actuators()
 
+    # carControlSP as the car interface takes it, and the serialized content it was converted from
+    self.CC_SP = structs.CarControlSP()
+    self.CC_SP_bytes: bytes | None = None
+
     self.params = Params()
 
     self.can_callbacks = can_comm_callbacks(self.can_sock, self.pm.sock['sendcan'])
@@ -274,7 +278,13 @@ class Car:
     if self.sm.all_alive(['carControl']):
       # send car controls over can
       now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)
-      self.last_actuators_output, can_sends = self.CI.apply(CC, convert_carControlSP(CC_SP), now_nanos)
+      # carControlSP keeps its content in most cycles (its lead data changes at the 20 Hz of radarState): convert it only when its
+      # serialized content changed. The car interface only reads it, so the previous conversion is reused as is.
+      CC_SP_bytes = CC_SP.as_builder().to_bytes()
+      if CC_SP_bytes != self.CC_SP_bytes:
+        self.CC_SP = convert_carControlSP(CC_SP)
+        self.CC_SP_bytes = CC_SP_bytes
+      self.last_actuators_output, can_sends = self.CI.apply(CC, self.CC_SP, now_nanos)
       self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan', valid=CS.canValid))
 
       self.CC_prev = CC
