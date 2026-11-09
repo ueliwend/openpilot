@@ -43,7 +43,9 @@ class LatControlTorqueExt(NeuralNetworkLateralControl, LatControlTorqueExtOverri
     if self._inster:
       self.update_limits()   # torque-space limits (+-steer_max) for the extensions' PID from the first step (no-op when neither runs)
 
-    self.update_calculations(CS, VM, desired_lateral_accel)
+    # the look-ahead / lateral jerk values are inputs of the jerk-aware and NNLC extensions only: computed when one of them runs this step
+    if self._jerk_aware_enabled or self._nnlc_enabled:
+      self.update_calculations(CS, VM, desired_lateral_accel)
     self.update_jerk_aware_torque_control(CS, roll_compensation, gravity_adjusted_lateral_accel)
     self.update_neural_network_feedforward(CS, params, calibrated_pose)
 
