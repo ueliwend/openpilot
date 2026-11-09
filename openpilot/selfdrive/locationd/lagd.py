@@ -13,6 +13,7 @@ from openpilot.common.constants import CV
 from openpilot.common.params import Params
 from openpilot.common.realtime import config_realtime_process
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.car.helpers import is_mock_car
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose, fft_next_good_size, parabolic_peak_interp
 from openpilot.sunnypilot.livedelay.lagd_toggle import LagdToggle
 
@@ -363,6 +364,11 @@ class LateralLagEstimator:
 
 
 def retrieve_initial_lag(params: Params, CP: car.CarParams):
+  if is_mock_car(CP):
+    # car not recognised: start from the default and keep the saved estimate for the next recognised route
+    cloudlog.warning("lagd: car not recognised, not restoring or saving the lag estimate")
+    return None
+
   last_lag_data = params.get("LiveDelay")
   last_carparams_data = params.get("CarParamsPrevRoute")
 
@@ -396,6 +402,7 @@ def main():
   params = Params()
   CP = messaging.log_from_bytes(params.get("CarParams", block=True), car.CarParams)
 
+  save_cache = not is_mock_car(CP)  # car not recognised (mock): don't overwrite the saved values
   lag_learner = LateralLagEstimator(CP, 1. / SERVICE_LIST['deviceMotion'].frequency)
   if (initial_lag_params := retrieve_initial_lag(params, CP)) is not None:
     lag, valid_blocks = initial_lag_params
@@ -419,8 +426,8 @@ def main():
       lag_msg_dat = lag_msg.to_bytes()
       pm.send('lateralDelay', lag_msg_dat)
 
-      if sm.frame % 1200 == 0: # cache every 60 seconds
+      if sm.frame % 1200 == 0 and save_cache: # cache every 60 seconds
         params.put("LiveDelay", lag_msg_dat)
 
-      if sm.frame % 60 == 0:  # read from and write to params every 3 seconds
+      if sm.frame % 60 == 0 and save_cache:  # read from and write to params every 3 seconds
         lagd_toggle.update(lag_msg)

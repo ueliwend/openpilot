@@ -8,6 +8,7 @@ from openpilot.cereal import log
 from opendbc.car.structs import car
 from openpilot.common.params import Params
 from openpilot.common.realtime import config_realtime_process, DT_MDL
+from openpilot.selfdrive.car.helpers import is_mock_car
 from openpilot.selfdrive.locationd.models.car_kf import CarKalman, ObservationKind, States
 from openpilot.selfdrive.locationd.models.constants import GENERATED_DIR
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
@@ -200,6 +201,11 @@ def check_valid_with_hysteresis(current_valid: bool, val: float, threshold: floa
 
 
 def retrieve_initial_vehicle_params(params: Params, CP: car.CarParams, replay: bool, debug: bool):
+  if is_mock_car(CP):
+    # car not recognised: start from the defaults and keep the saved values for the next recognised route
+    cloudlog.warning("paramsd: car not recognised, not restoring or saving the vehicle parameters")
+    return CP.steerRatio, 1.0, 0.0, None
+
   last_parameters_data = params.get("LiveParametersV2")
   last_carparams_data = params.get("CarParamsPrevRoute")
 
@@ -253,6 +259,7 @@ def main():
   params = Params()
   CP = messaging.log_from_bytes(params.get("CarParams", block=True), car.CarParams)
 
+  save_cache = not is_mock_car(CP)  # car not recognised (mock): don't overwrite the saved values
   steer_ratio, stiffness_factor, angle_offset_deg, pInitial = retrieve_initial_vehicle_params(params, CP, REPLAY, DEBUG)
   learner = VehicleParamsLearner(CP, steer_ratio, stiffness_factor, np.radians(angle_offset_deg), pInitial)
 
@@ -268,7 +275,7 @@ def main():
       msg = learner.get_msg(sm.all_checks(), debug=DEBUG)
 
       msg_dat = msg.to_bytes()
-      if sm.frame % 1200 == 0:  # once a minute
+      if sm.frame % 1200 == 0 and save_cache:  # once a minute
         params.put("LiveParametersV2", msg_dat)
 
       pm.send('vehicleParameters', msg_dat)

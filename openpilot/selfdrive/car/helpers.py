@@ -7,6 +7,14 @@ from opendbc.car import structs
 _FIELDS = '__dataclass_fields__'  # copy of dataclasses._FIELDS
 
 
+def is_mock_car(CP) -> bool:
+  """True for the mock platform card falls back to when fingerprinting fails (car not recognised).
+
+  The car learners (lagd, paramsd, torqued) neither restore, delete nor save their caches on such a route,
+  and card does not make it the previous route the next route's learners compare against."""
+  return CP.brand == "mock"
+
+
 def is_dataclass(obj):
   """Similar to dataclasses.is_dataclass without instance type check checking"""
   return hasattr(obj, _FIELDS)

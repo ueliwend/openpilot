@@ -11,6 +11,7 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import config_realtime_process, DT_MDL
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.car.helpers import is_mock_car
 from openpilot.selfdrive.locationd.helpers import PointBuckets, ParameterEstimator, PoseCalibrator, Pose
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.selfdrive.locationd.torqued_ext import TorqueEstimatorExt
@@ -105,8 +106,12 @@ class TorqueEstimator(ParameterEstimator, TorqueEstimatorExt):
     # try to restore cached params
     params = Params()
     self.params = params
-    params_cache = params.get("CarParamsPrevRoute")
-    torque_cache = params.get("LiveTorqueParameters")
+    # car not recognised (mock): start from the defaults and keep the saved points for the next recognised route
+    self.save_cache = not is_mock_car(CP)
+    if not self.save_cache:
+      cloudlog.warning("torqued: car not recognised, not restoring or saving the torque parameters")
+    params_cache = params.get("CarParamsPrevRoute") if self.save_cache else None
+    torque_cache = params.get("LiveTorqueParameters") if self.save_cache else None
     if params_cache is not None and torque_cache is not None:
       try:
         with log.Event.from_bytes(torque_cache) as log_evt:
@@ -278,7 +283,7 @@ def main(demo=False):
       pm.send('lateralTorqueParameters', estimator.get_msg(valid=sm.all_checks(), with_points=DEBUG))
 
     # Cache points every 60 seconds while onroad
-    if sm.frame % 240 == 0:
+    if sm.frame % 240 == 0 and estimator.save_cache:
       msg = estimator.get_msg(valid=sm.all_checks(), with_points=True)
       params.put("LiveTorqueParameters", msg.to_bytes())
 

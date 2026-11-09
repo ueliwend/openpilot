@@ -20,7 +20,7 @@ from opendbc.car.car_helpers import get_car, interfaces
 from opendbc.car.interfaces import CarInterfaceBase, RadarInterfaceBase
 from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
 from openpilot.selfdrive.car.cruise import VCruiseHelper
-from openpilot.selfdrive.car.helpers import convert_carControlSP, convert_to_capnp
+from openpilot.selfdrive.car.helpers import convert_carControlSP, convert_to_capnp, is_mock_car
 
 from openpilot.sunnypilot.mads.helpers import set_alternative_experience, set_car_specific_params
 from openpilot.sunnypilot.selfdrive.car import interfaces as sunnypilot_interfaces
@@ -42,6 +42,24 @@ def obd_callback(params: Params) -> ObdCallback:
       params.get_bool("ObdMultiplexingChanged", block=True)
       cloudlog.warning("OBD multiplexing set successfully")
   return set_obd_multiplexing
+
+
+def write_prev_route_car_params(params: Params) -> None:
+  """Copy the previous route's CarParams (CarParamsPersistent) to CarParamsPrevRoute, which the learners compare against.
+
+  A route whose car was not recognised (mock) is skipped, so CarParamsPrevRoute keeps the last recognised car and
+  the next recognised route restores that car's learner caches as if the mock route had not happened."""
+  prev_cp = params.get("CarParamsPersistent")
+  if prev_cp is None:
+    return
+  try:
+    with car.CarParams.from_bytes(prev_cp) as prev_CP:
+      prev_mock = is_mock_car(prev_CP)
+  except Exception:
+    cloudlog.exception("card: failed to read CarParamsPersistent")
+    prev_mock = False
+  if not prev_mock:
+    params.put("CarParamsPrevRoute", prev_cp, block=True)
 
 
 def can_comm_callbacks(logcan: messaging.SubSocket, sendcan: messaging.PubSocket) -> tuple[CanRecvCallable, CanSendCallable]:
@@ -160,10 +178,8 @@ class Car:
         else:
           cloudlog.warning("Saved SecOC key is invalid")
 
-    # Write previous route's CarParams
-    prev_cp = self.params.get("CarParamsPersistent")
-    if prev_cp is not None:
-      self.params.put("CarParamsPrevRoute", prev_cp, block=True)
+    # Write previous route's CarParams (skipped when that car was not recognised)
+    write_prev_route_car_params(self.params)
 
     # Write CarParams for controls and radard
     cp_bytes = self.CP.to_bytes()
