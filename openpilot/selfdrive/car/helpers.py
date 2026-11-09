@@ -48,20 +48,36 @@ def convert_to_capnp(struct: structs.CarParamsSP | structs.CarStateSP) -> capnp.
   return struct_capnp
 
 
+def _convert_lead_data(struct: capnp.lib.capnp._DynamicStructReader, field: str) -> structs.LeadData:
+  if not struct._has(field):
+    return structs.LeadData()
+  lead = getattr(struct, field)
+  return structs.LeadData(dRel=lead.dRel, yRel=lead.yRel, vRel=lead.vRel, aRel=lead.aRel, vLead=lead.vLead, dPath=lead.dPath,
+                          vLat=lead.vLat, vLeadK=lead.vLeadK, aLeadK=lead.aLeadK, fcw=lead.fcw, status=lead.status,
+                          aLeadTau=lead.aLeadTau, modelProb=lead.modelProb, radar=lead.radar, radarTrackId=lead.radarTrackId)
+
+
 def convert_carControlSP(struct: capnp.lib.capnp._DynamicStructReader) -> structs.CarControlSP:
-  # TODO: recursively handle any car struct as needed
-  def remove_deprecated(s: dict) -> dict:
-    return {k: v for k, v in s.items() if not k.endswith('DEPRECATED')}
+  """
+  Copies a carControlSP reader into structs.CarControlSP, field by field (card runs this every cycle).
+  The result equals building the dataclass from struct.to_dict(): a sub-struct that is not set keeps the dataclass
+  defaults, enums become their names (str), DEPRECATED fields keep their defaults and params stays a list of dicts.
+  test_car_helpers.py compares it with that conversion over the whole schema and fails on a field not copied here.
+  """
+  if struct._has('mads'):
+    mads = struct.mads
+    mads_dataclass = structs.ModularAssistiveDrivingSystem(state=str(mads.state), enabled=mads.enabled, active=mads.active,
+                                                           available=mads.available)
+  else:
+    mads_dataclass = structs.ModularAssistiveDrivingSystem()
 
-  struct_dict = struct.to_dict()
-  struct_dataclass = structs.CarControlSP(**remove_deprecated({k: v for k, v in struct_dict.items() if not isinstance(k, dict)}))
+  if struct._has('intelligentCruiseButtonManagement'):
+    icbm = struct.intelligentCruiseButtonManagement
+    icbm_dataclass = structs.IntelligentCruiseButtonManagement(state=str(icbm.state), sendButton=str(icbm.sendButton), vTarget=icbm.vTarget)
+  else:
+    icbm_dataclass = structs.IntelligentCruiseButtonManagement()
 
-  struct_dataclass.mads = structs.ModularAssistiveDrivingSystem(**remove_deprecated(struct_dict.get('mads', {})))
-  # struct_dataclass.params = [structs.CarControlSP.Param(**remove_deprecated(p)) for p in struct_dict.get('params', [])]
-  struct_dataclass.leadOne = structs.LeadData(**remove_deprecated(struct_dict.get('leadOne', {})))
-  struct_dataclass.leadTwo = structs.LeadData(**remove_deprecated(struct_dict.get('leadTwo', {})))
-  struct_dataclass.intelligentCruiseButtonManagement = structs.IntelligentCruiseButtonManagement(
-    **remove_deprecated(struct_dict.get('intelligentCruiseButtonManagement', {}))
-  )
-
-  return struct_dataclass
+  # TODO: convert params to structs.CarControlSP.Param once something reads them
+  return structs.CarControlSP(mads=mads_dataclass, params=[p.to_dict() for p in struct.params],
+                              leadOne=_convert_lead_data(struct, 'leadOne'), leadTwo=_convert_lead_data(struct, 'leadTwo'),
+                              intelligentCruiseButtonManagement=icbm_dataclass)
