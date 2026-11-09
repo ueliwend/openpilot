@@ -44,6 +44,7 @@ from openpilot.selfdrive.modeld.helpers import MODELS_DIR, chestnut_present, che
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 from openpilot.sunnypilot.selfdrive.controls.lib.relc import RoadEdgeLaneChangeController
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import fixed_or_learned, mpc_fixed_values
 
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 
@@ -336,6 +337,9 @@ def main(demo=False):
   # TODO this needs more thought, use .2s extra for now to estimate other delays
   # TODO Move smooth seconds to action function
   long_delay = CP.longitudinalActuatorDelay + LONG_SMOOTH_SECONDS
+  # Hyundai Inster MPC (InsterMPC) only: the plan's action time uses the MPC parameter set's lateral delay, as controlsd does
+  # (inster_lateral.MPC_FIXED; lagd keeps learning); None otherwise
+  inster_mpc_fixed = mpc_fixed_values(CP, params)
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
@@ -380,7 +384,7 @@ def main(demo=False):
     frame_id = sm["narrowRoadCameraState"].frameId
     v_ego = max(sm["carState"].vEgo, 0.)
     model.lat_delay = get_lat_delay(params, sm["lateralDelay"].lateralDelay)
-    lat_delay = sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS
+    lat_delay = fixed_or_learned(inster_mpc_fixed, 'lat_delay', sm["lateralDelay"].lateralDelay) + LAT_SMOOTH_SECONDS
     if sm.updated["extrinsicsCalibration"] and sm.seen['narrowRoadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["extrinsicsCalibration"].rpyCalib, dtype=np.float32)
       dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['narrowRoadCameraState'].sensor))]

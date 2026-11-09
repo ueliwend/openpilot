@@ -15,7 +15,7 @@ from openpilot.common.pid import PIDController
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_PI_KI, ANGLE_PI_PI_KP, ANGLE_PI_PI_BASE_VERSION, \
                                                                        ANGLE_PI_PID_KD, ANGLE_PI_PID_KI, ANGLE_PI_PID_KP, LATERAL_PID, \
                                                                        INSTER_FIXED_FACTOR, SOFT_P_PARAM, InsterAnglePI, InsterSteerLimitObserver, \
-                                                                       MPC_PARAM, MPC_RAMP_PARAM, MPC_RAMP_PARAMS, CarControllerParams, \
+                                                                       MPC_FIXED, MPC_PARAM, MPC_RAMP_PARAM, MPC_RAMP_PARAMS, CarControllerParams, \
                                                                        InsterMPC, ff_table_slope_raw, ANGLE_PI_MPC_D_TAU, \
                                                                        ANGLE_PI_MPC_KD, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KP, \
                                                                        InsterStictionFriction, InsterWheelRateFilter, STEER_MAX_RAW, \
@@ -77,6 +77,7 @@ class LatControlTorque(LatControl):
     self.inster_mpc_delta = 0.0
     self.inster_mpc_overrun = False
     self.inster_mpc_overrun_log_t = -1e9
+    self.inster_fixed = None   # MPC_FIXED while InsterMPC is selected (learned delay / steer ratio / stiffness / offset held), else None
     if is_inster(CP):
       self._init_inster(Params(), CP)
 
@@ -133,6 +134,12 @@ class LatControlTorque(LatControl):
         cloudlog.warning("InsterMPC is ignored: it needs InsterSpeedFeedforward")
       mpc = mpc and controller == LATERAL_PID and feedforward
       if mpc:
+        # owner 9 Nov 2026: while the MPC runs, the learned values are held at those of its parameter set (inster_lateral.MPC_FIXED; the
+        # same selection as mpc_fixed_values, which controlsd and modeld read): the offset here, the delay and the vehicle model in
+        # controlsd, the plan's action time in modeld. Kept if the set-up below fails, so controlsd and modeld stay on the same delay.
+        self.inster_fixed = MPC_FIXED
+        self.torque_params.latAccelOffset = MPC_FIXED['lat_accel_offset']
+        cloudlog.info("InsterMPC: learned values held at " + ", ".join(f"{k} {v}" for k, v in MPC_FIXED.items()))
         try:
           from openpilot.selfdrive.modeld.constants import ModelConstants
           # ramp-aware sub-option (InsterMPCRampAware): the MPC plans around the car-side ramp, which it reads from the car's own
@@ -151,7 +158,8 @@ class LatControlTorque(LatControl):
         cloudlog.warning("InsterSoftSmallErrorP is off while InsterMPC runs (the MPC was fitted without it)")
         self.inster_soft_p = False
       self.inster_angle_pi_version = angle_pi_log_version(controller, self.inster_soft_p, mpc,
-                                                          mpc and self.inster_mpc is not None and self.inster_mpc.ra is not None)
+                                                          mpc and self.inster_mpc is not None and self.inster_mpc.ra is not None,
+                                                          self.inster_fixed is not None)
       if self.inster_soft_p and controller != LATERAL_PID:
         cloudlog.info("InsterSoftSmallErrorP: its parameters were fitted with the PID, not the PI selected")
       if controller == LATERAL_PID and mpc:
@@ -172,7 +180,8 @@ class LatControlTorque(LatControl):
 
   def update_torque_parameters(self, latAccelFactor, latAccelOffset, friction):
     self.torque_params.latAccelFactor = INSTER_FIXED_FACTOR if self.inster_fixed_factor else latAccelFactor
-    self.torque_params.latAccelOffset = latAccelOffset
+    # while the Inster MPC runs the learned offset is held at the parameter set's value (MPC_FIXED); torqued keeps learning it
+    self.torque_params.latAccelOffset = latAccelOffset if self.inster_fixed is None else self.inster_fixed['lat_accel_offset']
     self.torque_params.friction = friction
     self.update_limits()
 

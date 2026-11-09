@@ -34,6 +34,7 @@ Derived offline from the owner's logs (step 1, 21 Oct 2026; open-loop replays an
 Nothing here is validated on the car.
 """
 import math
+from types import MappingProxyType
 
 from opendbc.car.hyundai.values import CAR, INSTER_STEER_DELTA_DOWN, INSTER_STEER_DELTA_UP, INSTER_STEER_FULL_SCALE, INSTER_STEER_MAX, \
                                         CarControllerParams
@@ -371,10 +372,12 @@ SOFT_P_R_MIN = math.radians(1.0)
 ANGLE_PI_VERSION_SOFT_P_BIT = 8
 
 
-def angle_pi_log_version(controller: int, soft_p: bool, mpc: bool = False, mpc_ramp: bool = False) -> int:
+def angle_pi_log_version(controller: int, soft_p: bool, mpc: bool = False, mpc_ramp: bool = False, mpc_fixed: bool = False) -> int:
   """torqueState.version with F on: the controller type's base + 1000 x mask (D bit with the PID, option-5 bit, freeze-rule bit 64,
-  fixed-factor bit 256, MPC bit 128, ramp-aware MPC bit 512 (only with the MPC)). Since 30 Oct 2026 (gain sets PI-30Oct / PID-30Oct, fixed
-  factor): PI 320105, PID 336106, with option 5 328105 / 344106; PID + MPC 464106, + ramp-aware 976106."""
+  fixed-factor bit 256, MPC bit 128, ramp-aware MPC bit 512 (only with the MPC), learned values held at MPC_FIXED bit 1024). Since 30 Oct
+  2026 (gain sets PI-30Oct / PID-30Oct, fixed factor): PI 320105, PID 336106, with option 5 328105 / 344106; PID + MPC 464106, + ramp-aware
+  976106 (builds up to 36584a3, learned values in force); since 9 Nov 2026 with the held values 1488106 / 2000106 (1360106: MPC selected
+  but its set-up failed, plain PID with the held values)."""
   if controller == LATERAL_PID:
     base, mask = ANGLE_PI_PID_BASE_VERSION, ANGLE_PI_VERSION_D_BIT
   else:
@@ -385,6 +388,8 @@ def angle_pi_log_version(controller: int, soft_p: bool, mpc: bool = False, mpc_r
     mask |= ANGLE_PI_VERSION_MPC_BIT
     if mpc_ramp:
       mask |= ANGLE_PI_VERSION_MPC_RAMP_BIT
+  if mpc_fixed:
+    mask |= ANGLE_PI_VERSION_MPC_FIXED_BIT
   return base + 1000 * (mask | ANGLE_PI_VERSION_FREEZE_DIR_BIT | ANGLE_PI_VERSION_FIXED_FACTOR_BIT)
 
 
@@ -646,6 +651,52 @@ MPC_RAMP_RANGES = {'ra_in_lo': (0.0, 1.0), 'ra_in': (0.0, 1.0), 'ra_v0': (45.0, 
                    'ra_v0_out': (45.0, 160.0), 'ra_st': (0.0, 1.0), 'ra_lead': (0.0, 0.5), 'ra_pd': (0.0, 1.0),
                    'ra_pd_t': (0.05, 0.5)}
 MPC_RAMP_CAP = float(INSTER_STEER_MAX)    # raw: the predicted request is clipped to the cap
+
+# Learned values held fixed while the MPC runs (owner 9 Nov 2026). Part of the parameter set above (MPC 7 Nov): the values the fit
+# drives carried, which the simulator read per step from the logs. While InsterMPC is selected (mpc_fixed_values: Inster, v0, PID,
+# InsterSpeedFeedforward, no NNLC), controlsd and modeld use these instead of the learners' values:
+#   lat_delay         s       lagd's lateralDelay: controlsd's controller delay (v0 setpoint, MPC preview split, stiction plan history)
+#                             and modeld's plan action time (stock modeld and modeld_v2). Fit drives: 0.194-0.220 s (14 drives, active
+#                             time mean 0.205); learned since: 0.31-0.39 s on winter tyres (9 Nov 2026).
+#   steer_ratio       -       paramsd's steerRatio in controlsd's VehicleModel (measured curvature, curvature <-> wheel angle of P / I / D,
+#   stiffness_factor  -       the stiction term and the MPC). Fit drives: steer ratio 15.34-15.94 per drive (active time mean 15.54),
+#                             stiffness 0.998-1.011 (mean 1.004); winter: 16.0-16.2 / 0.98-1.00. The two are learned jointly by paramsd, so
+#                             both are held (a learned stiffness with a fixed steer ratio would mix two vehicle models).
+#   lat_accel_offset  m/s^2   torqued's latAccelOffsetFiltered (ff -= offset, before the feed-forward table; 0.01 m/s^2 is 0.76-0.90 raw
+#                             at a = 0, more in curves). Fit drives: -0.039-0 as applied (mean -0.017; 0 on the three earliest). Winter
+#                             regime, not used: torqued 0.12-0.14 (9 Nov 2026); the ~17 raw pull seen on winter tyres is 0.19-0.22 at a = 0.
+# Not held: angle offset and roll (sensor and road quantities; the simulator reads them per step and they move with the tyres, e.g. the
+# +1.2-1.3 deg straight-ahead offset on winter tyres), torqued's factor (replaced by F0 with any Inster switch) and friction (replaced by
+# the stiction term with InsterStictionFriction; learned friction still reaches get_friction with the MPC and that switch off).
+# lagd, paramsd and torqued keep running, publishing and saving, so the next fit can use their recorded values; a fit moves these
+# values (commit), never a learner. torqueState.version + 1000 x 1024 marks drives that ran with them.
+MPC_FIXED = MappingProxyType({'lat_delay': 0.2, 'steer_ratio': 15.55, 'stiffness_factor': 1.0, 'lat_accel_offset': 0.0})
+ANGLE_PI_VERSION_MPC_FIXED_BIT = 1024
+
+
+def mpc_fixed_values(CP, params) -> MappingProxyType | None:
+  """MPC_FIXED while controlsd runs the Inster MPC (the selection of ControlsExt.initialize_lateral_control and
+  LatControlTorque v0's InsterMPC rules; a failed MPC set-up keeps them, so controlsd and modeld always agree), else None. Read once at
+  start from CarParams and params (the switches change only offroad)."""
+  if not is_inster(CP):
+    return None
+  if params.get_bool("EnforceTorqueControl"):
+    if params.get("TorqueControlTune") != 0.0:
+      return None
+  elif CP.lateralTuning.which() != 'torque':
+    return None
+  if params.get_bool("NeuralNetworkLateralControl"):
+    return None
+  if not (params.get_bool("InsterAngleErrorPI") and params.get_bool("InsterSpeedFeedforward") and params.get_bool(MPC_PARAM)):
+    return None
+  if angle_lateral_controller(params) != LATERAL_PID:
+    return None
+  return MPC_FIXED
+
+
+def fixed_or_learned(fixed, key: str, learned: float) -> float:
+  """the fixed value `key` of MPC_FIXED while the Inster MPC runs (fixed not None), else the learner's value"""
+  return learned if fixed is None else fixed[key]
 
 
 def _smoothstep(x: float) -> float:

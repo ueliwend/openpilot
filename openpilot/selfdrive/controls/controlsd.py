@@ -23,7 +23,7 @@ from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 
 from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
-from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import crawl_plan_curvature, max_lateral_accel_no_roll
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import crawl_plan_curvature, fixed_or_learned, max_lateral_accel_no_roll
 
 State = log.SelfdriveState.OpenpilotState
 LaneChangeState = log.LaneChangeState
@@ -75,6 +75,9 @@ class Controls(ControlsExt):
     self.max_lat_accel_no_roll = max_lateral_accel_no_roll(self.CP, MAX_LATERAL_ACCEL_NO_ROLL)
     # Hyundai Inster with "F" (InsterAngleErrorPI) only: below 1.4 m/s the plan moves per metre travelled, not per second (inster_lateral.py)
     self.inster_crawl_plan = bool(getattr(self.LaC, 'inster_angle_pi', False))
+    # Hyundai Inster MPC (InsterMPC) only: the learned lateral delay, steer ratio and stiffness are held at the MPC parameter set's values
+    # (inster_lateral.MPC_FIXED; the learners keep running); None otherwise
+    self.inster_mpc_fixed = getattr(self.LaC, 'inster_fixed', None)
 
   def update(self):
     self.sm.update(15)
@@ -89,8 +92,8 @@ class Controls(ControlsExt):
 
     # Update VehicleModel
     lp = self.sm['vehicleParameters']
-    x = max(lp.stiffnessFactor, 0.1)
-    sr = max(lp.steerRatio, 0.1)
+    x = max(fixed_or_learned(self.inster_mpc_fixed, 'stiffness_factor', lp.stiffnessFactor), 0.1)
+    sr = max(fixed_or_learned(self.inster_mpc_fixed, 'steer_ratio', lp.steerRatio), 0.1)
     self.VM.update_params(x, sr)
 
     steer_angle_without_offset = math.radians(CS.steeringAngleDeg - lp.angleOffsetDeg)
@@ -107,7 +110,7 @@ class Controls(ControlsExt):
 
       self.LaC.extension.update_model_v2(self.sm['modelV2'])
 
-      self.LaC.extension.update_lateral_lag(self.lat_delay)
+      self.LaC.extension.update_lateral_lag(fixed_or_learned(self.inster_mpc_fixed, 'lat_delay', self.lat_delay))
 
     long_plan = self.sm['longitudinalPlan']
     model_v2 = self.sm['modelV2']
@@ -155,7 +158,7 @@ class Controls(ControlsExt):
         new_desired_curvature = crawl_plan_curvature(CS.vEgo, prev_curvature, new_desired_curvature, DT_CTRL)
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll,
                                                                self.max_lat_accel_no_roll)
-    lat_delay = self.sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS
+    lat_delay = fixed_or_learned(self.inster_mpc_fixed, 'lat_delay', self.sm["lateralDelay"].lateralDelay) + LAT_SMOOTH_SECONDS
 
     actuators.curvature = self.desired_curvature
     steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,

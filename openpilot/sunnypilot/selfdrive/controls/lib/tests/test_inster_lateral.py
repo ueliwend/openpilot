@@ -54,6 +54,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_
                                                                        CarControllerParams, ff_table_inverse, mpc_gain_matrix, \
                                                                        mpc_ramp_anticipation, mpc_ramp_envelope, stiction_predicted, \
                                                                        ff_table_top, MPC_NH, MPC_DTB
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_VERSION_MPC_FIXED_BIT, MPC_FIXED
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import LatControlTorque as LatControlTorqueV0
@@ -1751,7 +1752,9 @@ class TestInsterMPC(OpenpilotTestCase):
     for on in ((ANGLE_PI_KEY, "InsterSpeedFeedforward", MPC_KEY), INSTER_KEYS + (MPC_KEY,)):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=1)
       assert c.inster_mpc is not None
-      assert c.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | ANGLE_PI_VERSION_MPC_BIT | 256)
+      assert c.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | ANGLE_PI_VERSION_MPC_BIT | 256 |
+                                                                               ANGLE_PI_VERSION_MPC_FIXED_BIT)
+      assert c.inster_fixed is MPC_FIXED
     for car_name, on, ctrl in ((HYUNDAI.HYUNDAI_INSTER, INSTER_KEYS, 0), (HYUNDAI.HYUNDAI_INSTER, STEP2_KEYS, 1),
                                (HYUNDAI.HYUNDAI_INSTER, (ANGLE_PI_KEY,), 1),
                                (HYUNDAI.HYUNDAI_INSTER, ("InsterStictionFriction", ANGLE_PI_KEY), 1),
@@ -1765,7 +1768,8 @@ class TestInsterMPC(OpenpilotTestCase):
     # without the MPC (switch off, or the MPC set-up failed) Soft-P stays as selected
     sp_mpc, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (O5_KEY, MPC_KEY), ctrl=1)
     assert sp_mpc.inster_mpc is not None and not sp_mpc.inster_soft_p
-    assert sp_mpc.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | ANGLE_PI_VERSION_MPC_BIT | 256)
+    assert sp_mpc.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | ANGLE_PI_VERSION_MPC_BIT | 256 |
+                                                                                ANGLE_PI_VERSION_MPC_FIXED_BIT)
     def mdl(ay):
       return _MVM(int(ay * 1000), 0.0, 15.0)
     assert _run(sp_mpc, VM, extension_model=mdl) == _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1),
@@ -1926,16 +1930,16 @@ class TestInsterMPC(OpenpilotTestCase):
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY, MPC_RAMP_KEY), ctrl=1)
     assert c.inster_mpc is not None and c.inster_mpc.p == MPC_PARAMS and c.inster_mpc.ra == MPC_RAMP_PARAMS
     assert (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD)
-    assert c.inster_angle_pi_version == 976106
+    assert c.inster_angle_pi_version == 2000106                      # 976106 + the held learned values (bit 1024, 9 Nov 2026)
     # the default configuration (6 Nov 2026): InsterMPCRampAware defaults to on, so turning on InsterMPC alone gives the fitted
     # controller; off stays as an A/B option (the plain MPC with these settings, not fitted)
     assert Params().get_default_value(MPC_RAMP_KEY) is True
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1, defaults=(MPC_RAMP_KEY,))
-    assert c.inster_mpc is not None and c.inster_mpc.ra == MPC_RAMP_PARAMS and c.inster_angle_pi_version == 976106
+    assert c.inster_mpc is not None and c.inster_mpc.ra == MPC_RAMP_PARAMS and c.inster_angle_pi_version == 2000106
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=1, defaults=(MPC_RAMP_KEY,))
     assert c.inster_mpc is None                                       # without InsterMPC the default-on sub-switch does nothing
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
-    assert c.inster_mpc is not None and c.inster_mpc.ra is None and c.inster_angle_pi_version == 464106
+    assert c.inster_mpc is not None and c.inster_mpc.ra is None and c.inster_angle_pi_version == 1488106   # 464106 + bit 1024
     # distinct values patched in to see which set is taken
     mkp, mki, mkd, mtau = (3.0, 0.4, -0.01), (0.8, 0.3, -0.008), (0.3, 0.001, 0.0), 0.05
     with mock.patch.multiple(latcontrol_torque_v0, ANGLE_PI_MPC_KP=mkp, ANGLE_PI_MPC_KI=mki, ANGLE_PI_MPC_KD=mkd, ANGLE_PI_MPC_D_TAU=mtau):
@@ -1955,12 +1959,17 @@ class TestInsterMPC(OpenpilotTestCase):
 
   def test_setup_failure_falls_back_to_the_pid(self):
     # car review 1, change 3: any exception while building the MPC -> plain PID-30Oct, version without bit 128, output as without the param
+    # except for the held learned values (9 Nov 2026: kept, so controlsd and modeld, which cannot see the failure, stay on the same
+    # delay; version bit 1024): here the torque learner's offset
     with mock.patch.object(latcontrol_torque_v0, 'InsterMPC', side_effect=RuntimeError('gain rows')):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
-    assert c.inster_mpc is None
-    assert c.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | 256)
+    assert c.inster_mpc is None and c.inster_fixed is MPC_FIXED
+    assert c.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | 256 | ANGLE_PI_VERSION_MPC_FIXED_BIT) == 1360106
     assert (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (ANGLE_PI_PID_KP, ANGLE_PI_PID_KI, ANGLE_PI_PID_KD)
-    assert _run(c, VM) == _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=1))
+    ref, VM_ref = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=1)
+    ref_update = ref.update_torque_parameters
+    ref.update_torque_parameters = lambda f, o, fr: ref_update(f, MPC_FIXED['lat_accel_offset'], fr)
+    assert _run(c, VM) == _run(ref, VM_ref)
 
   def test_non_finite_latch(self):
     # car review 1, change 4: a persistently non-finite solve holds the fallback (h -> 0) until a finite solve; it then returns
@@ -2088,7 +2097,7 @@ class TestInsterMPCRampAware(OpenpilotTestCase):
       on, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY, MPC_RAMP_KEY), ctrl=1)
     assert on.inster_mpc.ra == strong
     assert on.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | ANGLE_PI_VERSION_MPC_BIT | 256 |
-                                                                             ANGLE_PI_VERSION_MPC_RAMP_BIT) == 976106
+                                                                             ANGLE_PI_VERSION_MPC_RAMP_BIT | ANGLE_PI_VERSION_MPC_FIXED_BIT) == 2000106
     assert angle_pi_log_version(LATERAL_PID, False, False, True) == angle_pi_log_version(LATERAL_PID, False)   # only with the MPC
     run_on = _run(on, VM, extension_model=mdl)
     assert run_on != base

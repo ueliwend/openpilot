@@ -153,7 +153,9 @@ class TorqueSettingsLayout(Widget):
                              "default) it starts turn-in earlier, so the rate-limited steering reaches the plan on time; with it off " +
                              "the plan is followed without that lead (not fitted). Works only with the PID and the speed " +
                              "feed-forward; off while you steer, during lane changes and at walking pace (below 3.6 km/h), fading in " +
-                             "up to a fitted speed. Soft Small-Error P is not used while it runs. Simulation only, not validated on " +
+                             "up to a fitted speed. Soft Small-Error P is not used while it runs. While it runs, the learned steering " +
+                             "delay, steer ratio and torque offset are held at the values it was fitted with (the learners keep " +
+                             "recording). Simulation only, not validated on " +
                              "the car. Off by default."),
     )
 
