@@ -5,7 +5,8 @@ This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 
 Hyundai Inster steering candidates for sunnypilot's torque controller v0 (latcontrol_torque_v0.py). Experimental, Inster only,
-each behind its own switch that is off by default. The switches are read by v0, never here: this module only holds pure functions
+each behind its own switch (on by default since 10 Nov 2026: params_keys.h, filled at manager start; unset = off). The switches
+are read by v0, never here: this module only holds pure functions
 and a small stateful filter class.
 
   * Speed feed-forward table (switch InsterSpeedFeedforward): ff_torque() gives the steering command the Inster needs to hold a
@@ -19,8 +20,9 @@ and a small stateful filter class.
   * Steering-angle PI "F" (switch InsterAngleErrorPI): InsterAnglePI replaces only v0's P and I. They act on the steering-wheel
     angle error (rad) with gains that are quadratic in speed, and the integrator runs from standstill. Feed-forward, limits and output
     conversion stay v0's. Tuned and checked in the closed-loop simulator only with both switches above on.
-    Controller type (param InsterLateralController, effective only with InsterAngleErrorPI on): PI (default; gains PI-30Oct) or PID
-    (gains PID-30Oct = PI + D on the measured wheel-angle rate; G6 / P6 until 30 Oct 2026). Option 5 (InsterSoftSmallErrorP, with
+    Controller type (param InsterLateralController, effective only with InsterAngleErrorPI on): PI (gains PI-30Oct) or PID
+    (gains PID-30Oct = PI + D on the measured wheel-angle rate; G6 / P6 until 30 Oct 2026); PID by default since 10 Nov 2026
+    (params_keys.h), unset = PI. Option 5 (InsterSoftSmallErrorP, with
     InsterAngleErrorPI on, either type; fitted for the PID): P scaled by sigma, softer for small errors on straights, stronger in curves (soft_p_sigma).
 
   * Torque cap (no switch): the Inster's steering command is capped at 409 raw (opendbc values.INSTER_STEER_MAX, the highest the
@@ -45,11 +47,12 @@ from openpilot.common.pid import PIDController
 # If it changes, F0 and the raw amplitudes below need a review: test_inster_lateral.py checks that both agree.
 STEER_MAX_RAW = 384.0
 
-# The Inster's switches (params, off by default, changeable only offroad, ignored while NNLC is enabled). With any of them on, the
-# Lateral Jerk Torque Controller is switched off.
+# The Inster's switches (params; on by default since 10 Nov 2026 (params_keys.h, filled at manager start), unset = off; changeable
+# only offroad, ignored while NNLC is enabled). With any of them on, the Lateral Jerk Torque Controller is switched off.
 INSTER_SWITCHES = ("InsterStictionFriction", "InsterSpeedFeedforward", "InsterAngleErrorPI")
 # Controller-type selector of InsterAngleErrorPI (same rules; alone it changes nothing, so it is not one of INSTER_SWITCHES):
-# 0 = PI (default; gains G6), 1 = PID (gains P6). One option per controller type (owner, 29 Oct 2026); gain set G2 is no longer
+# 0 = PI (gains G6), 1 = PID (gains P6); PID by default since 10 Nov 2026 (params_keys.h, filled at manager start), unset = PI.
+# One option per controller type (owner, 29 Oct 2026); gain set G2 is no longer
 # selectable. It replaces the gain-set selector InsterAngleErrorPIGains (28 Oct 2026: 0 = G2, 1 = G6, 2 = P6), which in turn replaced
 # the bool InsterAngleErrorPIG6 (27 Oct 2026, G6 only). params_migration turns both into this one (G2 / G6 -> PI, P6 -> PID) and
 # removes them; until then angle_lateral_controller() reads the gain-set selector as a fallback (the G6 bool means PI either way).

@@ -57,9 +57,9 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"InstallDate", {PERSISTENT, TIME}},
     {"IsDriverViewEnabled", {CLEAR_ON_MANAGER_START, BOOL}},
     {"IsEngaged", {PERSISTENT, BOOL}},
-    {"IsLdwEnabled", {PERSISTENT | BACKUP, BOOL}},
+    {"IsLdwEnabled", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"IsLiveStreaming", {CLEAR_ON_MANAGER_START | CLEAR_ON_IGNITION_ON, BOOL}},
-    {"IsMetric", {PERSISTENT | BACKUP, BOOL}},
+    {"IsMetric", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"IsOffroad", {CLEAR_ON_MANAGER_START, BOOL}},
     {"IsRhdDetected", {PERSISTENT, BOOL}},
     {"IsReleaseBranch", {CLEAR_ON_MANAGER_START, BOOL}},
@@ -85,7 +85,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"LocationFilterInitialState", {PERSISTENT, BYTES}},
     {"LateralManeuverMode", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
     {"LongitudinalManeuverMode", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
-    {"LongitudinalPersonality", {PERSISTENT | BACKUP, INT, std::to_string(static_cast<int>(cereal::LongitudinalPersonality::STANDARD))}},
+    {"LongitudinalPersonality", {PERSISTENT | BACKUP, INT, std::to_string(static_cast<int>(cereal::LongitudinalPersonality::AGGRESSIVE))}},
     {"NetworkMetered", {PERSISTENT | BACKUP, BOOL}},
     {"ObdMultiplexingChanged", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},
     {"ObdMultiplexingEnabled", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},
@@ -111,7 +111,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"PandaHeartbeatLost", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
     {"PrimeType", {PERSISTENT, INT}},
     {"RecordAudio", {PERSISTENT | BACKUP, BOOL}},
-    {"RecordFront", {PERSISTENT | BACKUP, BOOL}},
+    {"RecordFront", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"RecordFrontLock", {PERSISTENT, BOOL}},  // for the internal fleet
     {"SecOCKey", {PERSISTENT | DONT_LOG | BACKUP, STRING}},
     {"ShowDebugInfo", {PERSISTENT, BOOL}},
@@ -119,7 +119,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"SnoozeUpdate", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
     {"SshEnabled", {PERSISTENT | BACKUP, BOOL}},
     {"TermsVersion", {PERSISTENT, STRING}},
-    {"TorqueBar", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"TorqueBar", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"TrainingVersion", {PERSISTENT, STRING}},
     {"UbloxAvailable", {PERSISTENT, BOOL}},
     {"UpdateAvailable", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},
@@ -162,7 +162,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"CarParamsSPCache", {CLEAR_ON_MANAGER_START, BYTES}},
     {"CarParamsSPPersistent", {PERSISTENT, BYTES}},
     {"CarPlatformBundle", {PERSISTENT | BACKUP, JSON}},
-    {"ChevronInfo", {PERSISTENT | BACKUP, INT, "4"}},
+    {"ChevronInfo", {PERSISTENT | BACKUP, INT, "0"}},
     {"CompletedSunnylinkConsentVersion", {PERSISTENT, STRING, "0"}},
     {"CustomAccIncrementsEnabled", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"CustomAccLongPressIncrement", {PERSISTENT | BACKUP, INT, "5"}},
@@ -171,7 +171,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"DevUIInfo", {PERSISTENT | BACKUP, INT, "0"}},
     {"EnableCopyparty", {PERSISTENT | BACKUP, BOOL}},
     {"EnableGithubRunner", {PERSISTENT | BACKUP, BOOL}},
-    {"GreenLightAlert", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"GreenLightAlert", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"GithubRunnerSufficientVoltage", {CLEAR_ON_MANAGER_START , BOOL}},
     {"HasAcceptedTermsSP", {PERSISTENT, STRING, "0"}},
     {"HideVEgoUI", {PERSISTENT | BACKUP, BOOL, "0"}},
@@ -180,12 +180,12 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"IsDevelopmentBranch", {CLEAR_ON_MANAGER_START, BOOL}},
     {"IsReleaseSpBranch", {CLEAR_ON_MANAGER_START, BOOL}},
     {"LastGPSPositionLLK", {PERSISTENT, STRING}},
-    {"LeadDepartAlert", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"LeadDepartAlert", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"MaxTimeOffroad", {PERSISTENT | BACKUP, INT, "1800"}},
     {"ModelRunnerTypeCache", {CLEAR_ON_ONROAD_TRANSITION, INT}},
     {"OffroadMode", {CLEAR_ON_MANAGER_START, BOOL}},
     {"Offroad_TiciSupport", {CLEAR_ON_MANAGER_START, JSON}},
-    {"OnroadScreenOffBrightness", {PERSISTENT | BACKUP, INT, "0"}},
+    {"OnroadScreenOffBrightness", {PERSISTENT | BACKUP, INT, "1"}},
     {"OnroadScreenOffBrightnessMigrated", {PERSISTENT | BACKUP, STRING, "0.0"}},
     {"OnroadScreenOffTimer", {PERSISTENT | BACKUP, INT, "15"}},
     {"OnroadScreenOffTimerMigrated", {PERSISTENT | BACKUP, STRING, "0.0"}},
@@ -193,14 +193,14 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"QuickBootToggle", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"QuietMode", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"RainbowMode", {PERSISTENT | BACKUP, BOOL, "0"}},
-    {"RoadEdgeLaneChangeEnabled", {PERSISTENT | BACKUP, BOOL, "0"}},
-    {"RocketFuel", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"RoadEdgeLaneChangeEnabled", {PERSISTENT | BACKUP, BOOL, "1"}},
+    {"RocketFuel", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"ScreenSaverEnabled", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"ScreenSaverTimeout", {PERSISTENT | BACKUP, INT, "300"}},
-    {"ShowAdvancedControls", {PERSISTENT | BACKUP, BOOL, "0"}},
-    {"ShowTurnSignals", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"ShowAdvancedControls", {PERSISTENT | BACKUP, BOOL, "1"}},
+    {"ShowTurnSignals", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"StandstillTimer", {PERSISTENT | BACKUP, BOOL, "0"}},
-    {"TrueVEgoUI", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"TrueVEgoUI", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"UploadRlogs", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"UploadRlogsFromRoute", {PERSISTENT, INT}},
 
@@ -242,7 +242,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"BackupManager_RestoreVersion", {PERSISTENT, STRING}},
 
     // sunnypilot car specific params
-    {"HyundaiLongitudinalTuning", {PERSISTENT | BACKUP, INT, "0"}},
+    {"HyundaiLongitudinalTuning", {PERSISTENT | BACKUP, INT, "2"}},
     {"SubaruStopAndGo", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"SubaruStopAndGoManualParkingBrake", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"TeslaCoopSteering", {PERSISTENT | BACKUP, BOOL, "0"}},
@@ -251,15 +251,15 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ToyotaStopAndGoHack", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"ToyotaTSS2Smooth", {PERSISTENT | BACKUP, BOOL, "0"}},
 
-    {"BlindSpot", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"BlindSpot", {PERSISTENT | BACKUP, BOOL, "1"}},
 
     // sunnypilot model params
-    {"CameraOffset", {PERSISTENT | BACKUP, FLOAT, "0.0"}},
+    {"CameraOffset", {PERSISTENT | BACKUP, FLOAT, "0.05"}},
     {"LagdToggle", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"LagdToggleDelay", {PERSISTENT | BACKUP, FLOAT, "0.2"}},
     {"LagdValueCache", {PERSISTENT, FLOAT, "0.2"}},
-    {"LaneTurnDesire", {PERSISTENT | BACKUP, BOOL, "0"}},
-    {"LaneTurnValue", {PERSISTENT | BACKUP, FLOAT, "19.0"}},
+    {"LaneTurnDesire", {PERSISTENT | BACKUP, BOOL, "1"}},
+    {"LaneTurnValue", {PERSISTENT | BACKUP, FLOAT, "19.62"}},
     {"Blendful", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"PlanplusControl", {PERSISTENT | BACKUP, FLOAT, "1.0"}},
 
@@ -283,13 +283,13 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"OsmStateTitle", {PERSISTENT, STRING}},
     {"OsmWayTest", {PERSISTENT, STRING}},
     {"RoadName", {CLEAR_ON_ONROAD_TRANSITION, STRING}},
-    {"RoadNameToggle", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"RoadNameToggle", {PERSISTENT | BACKUP, BOOL, "1"}},
 
     // Speed Limit
-    {"SpeedLimitMode", {PERSISTENT | BACKUP, INT, "1"}},
-    {"SpeedLimitOffsetType", {PERSISTENT | BACKUP, INT, "0"}},
-    {"SpeedLimitPolicy", {PERSISTENT | BACKUP, INT, "3"}},
-    {"SpeedLimitValueOffset", {PERSISTENT | BACKUP, INT, "0"}},
+    {"SpeedLimitMode", {PERSISTENT | BACKUP, INT, "2"}},
+    {"SpeedLimitOffsetType", {PERSISTENT | BACKUP, INT, "2"}},
+    {"SpeedLimitPolicy", {PERSISTENT | BACKUP, INT, "4"}},
+    {"SpeedLimitValueOffset", {PERSISTENT | BACKUP, INT, "3"}},
 
     // Smart Cruise Control
     {"MapTargetVelocities", {CLEAR_ON_ONROAD_TRANSITION, STRING}},
@@ -298,18 +298,18 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
 
     // Torque lateral control custom params
     {"CustomTorqueParams", {PERSISTENT | BACKUP , BOOL}},
-    {"EnforceTorqueControl", {PERSISTENT | BACKUP, BOOL}},
-    {"InsterAngleErrorPI", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"EnforceTorqueControl", {PERSISTENT | BACKUP, BOOL, "1"}},
+    {"InsterAngleErrorPI", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"InsterAngleErrorPIG6", {PERSISTENT | BACKUP, BOOL}},  // legacy (G6 only), migrated to InsterLateralController = 0 (PI); no default
     {"InsterAngleErrorPIGains", {PERSISTENT | BACKUP, INT}},  // legacy (0 G2, 1 G6, 2 P6), migrated to InsterLateralController; no default
-    {"InsterLateralController", {PERSISTENT | BACKUP, INT, "0"}},  // 0 = PI (gains PI-30Oct), 1 = PID (gains PID-30Oct); G6 / P6 until 30 Oct 2026
-    {"InsterMPC", {PERSISTENT | BACKUP, BOOL, "0"}},  // model predictive control on top of the PID (SIM only)
+    {"InsterLateralController", {PERSISTENT | BACKUP, INT, "1"}},  // 0 = PI (gains PI-30Oct), 1 = PID (gains PID-30Oct); G6 / P6 until 30 Oct 2026
+    {"InsterMPC", {PERSISTENT | BACKUP, BOOL, "1"}},  // model predictive control on top of the PID; on by default since 10 Nov 2026 (filled at manager start), unset = off
     {"InsterMPCRampAware", {PERSISTENT | BACKUP, BOOL, "1"}},  // ramp-aware sub-option of InsterMPC, acts only with it (SIM only)
     {"InsterSoftSmallErrorP", {PERSISTENT | BACKUP, BOOL, "0"}},
-    {"InsterSpeedFeedforward", {PERSISTENT | BACKUP, BOOL, "0"}},
-    {"InsterStictionFriction", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"InsterSpeedFeedforward", {PERSISTENT | BACKUP, BOOL, "1"}},
+    {"InsterStictionFriction", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"LateralJerkTorqueController", {PERSISTENT | BACKUP, BOOL, "0"}},
-    {"LiveTorqueParamsToggle", {PERSISTENT | BACKUP , BOOL}},
+    {"LiveTorqueParamsToggle", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"LiveTorqueParamsRelaxedToggle", {PERSISTENT | BACKUP , BOOL}},
     {"TorqueControlTune", {PERSISTENT | BACKUP, FLOAT, "0.0"}},
     {"TorqueParamsOverrideEnabled", {PERSISTENT | BACKUP, BOOL, "0"}},

@@ -92,7 +92,7 @@ class TestInsterLateralControllerMigration(OpenpilotTestCase):
     params = Params()
     _migrate_inster_lateral_controller(params)
     assert params.get("InsterLateralController") is None
-    assert params.get("InsterLateralController", return_default=True) == 0   # default PI
+    assert params.get("InsterLateralController", return_default=True) == 1   # default PID (device defaults, 10 Nov 2026)
 
   def test_new_selector_already_set_wins(self):
     params = Params()

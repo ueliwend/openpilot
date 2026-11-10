@@ -63,7 +63,8 @@ class LatControlTorque(LatControl):
 
     self.extension = LatControlTorqueExt(self, CP, CP_SP, CI)
 
-    # Hyundai Inster steering candidates (experimental, off by default, see inster_lateral.py). The switches are read once and only
+    # Hyundai Inster steering candidates (experimental; on by default since 10 Nov 2026, unset = off; see inster_lateral.py). The
+    # switches are read once and only
     # for the Inster: every other car, and the Inster with all switches off, runs the unchanged code below.
     self.inster_friction = False
     self.inster_ff = False

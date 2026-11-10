@@ -109,13 +109,13 @@ class TorqueSettingsLayout(Widget):
       title=lambda: tr("Inster: Stiction Friction (experimental)"),
       description=lambda: tr("Hyundai Inster only. Replaces the friction part of the torque controller with a smooth term matched to " +
                              "the Inster's steering friction, so the wheel starts moving sooner when steering into and out of curves. " +
-                             "Off by default."),
+                             "On by default."),
     )
     self._inster_ff_toggle = toggle_item_sp(
       param="InsterSpeedFeedforward",
       title=lambda: tr("Inster: Speed Feed-Forward Table (experimental)"),
       description=lambda: tr("Hyundai Inster only. Uses a measured table of steering torque per speed and sideways acceleration for " +
-                             "the feed-forward instead of one linear factor. Off by default."),
+                             "the feed-forward instead of one linear factor. On by default."),
     )
     self._inster_angle_pi_toggle = toggle_item_sp(
       param="InsterAngleErrorPI",
@@ -124,13 +124,13 @@ class TorqueSettingsLayout(Widget):
                              "steering-wheel angle error, with speed-dependent gains and a stronger integrator that also works at low " +
                              "speed; choose PI or PID below. " +
                              "Tuned in simulation with both Inster switches above on. Turning it on switches the Lateral Jerk " +
-                             "Torque Controller off. Off by default."),
+                             "Torque Controller off. On by default."),
     )
     self._inster_angle_pi_gains = multiple_button_item_sp(
       param=LATERAL_CONTROLLER_PARAM,
       title=lambda: tr("Inster: Controller Type (experimental)"),
-      description=lambda: tr("Hyundai Inster only, with the steering-angle controller above on. PI (default): proportional and " +
-                             "integral action on the steering-wheel angle error. PID: the same plus a damping term on the measured " +
+      description=lambda: tr("Hyundai Inster only, with the steering-angle controller above on. PI: proportional and " +
+                             "integral action on the steering-wheel angle error. PID (default): the same plus a damping term on the measured " +
                              "steering-angle rate (off while you steer); smaller, smoother corrections. Tuned in simulation only, " +
                              "not validated on the car."),
       buttons=["PI", "PID"],
@@ -156,7 +156,7 @@ class TorqueSettingsLayout(Widget):
                              "up to a fitted speed. Soft Small-Error P is not used while it runs. While it runs, the learned steering " +
                              "delay, steer ratio and torque offset are held at the values it was fitted with (the learners keep " +
                              "recording). Simulation only, not validated on " +
-                             "the car. Off by default."),
+                             "the car. On by default."),
     )
 
     self._inster_mpc_ramp_toggle = toggle_item_sp(

@@ -1043,7 +1043,9 @@ class TestInsterLateralController(OpenpilotTestCase):
       assert angle_lateral_controller(params) == expected, (legacy, old, new)
     params.remove(CTRL_KEY)
     params.remove(GAINS_KEY)
-    assert params.get(CTRL_KEY, return_default=True) == LATERAL_PI       # the UI's default
+    # the UI's / manager's default: PID since the device-defaults change (owner, 10 Nov 2026; a fresh store gets it at manager start);
+    # unset in the process (no manager start) the controller still falls back to the legacy selector / PI, as the cases above show
+    assert params.get(CTRL_KEY, return_default=True) == LATERAL_PID
     for ctrl, legacy_gains, kp, ki, kd, version in ((0, None, CAR_PI_KP, CAR_PI_KI, None, 2368105), (1, None, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD, 2384106),
                                                     (None, None, CAR_PI_KP, CAR_PI_KI, None, 2368105), (None, 0, CAR_PI_KP, CAR_PI_KI, None, 2368105),
                                                     (None, 2, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD, 2384106)):
