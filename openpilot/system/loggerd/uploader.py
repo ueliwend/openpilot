@@ -2,6 +2,7 @@
 import json
 import os
 import random
+import re
 import requests
 import threading
 import time
@@ -13,7 +14,7 @@ from openpilot.cereal import log
 import openpilot.cereal.messaging as messaging
 from openpilot.common.api import Api
 from openpilot.common.utils import get_upload_stream
-from openpilot.common.params import Params
+from openpilot.common.params import Params, UnknownKeyName
 from openpilot.common.realtime import set_core_affinity
 from openpilot.common.hardware.hw import Paths
 from openpilot.system.loggerd.xattr_cache import getxattr, setxattr
@@ -33,6 +34,13 @@ allow_sleep = bool(int(os.getenv("UPLOADER_SLEEP", "1")))
 force_wifi = os.getenv("FORCEWIFI") is not None
 fake_upload = os.getenv("FAKEUPLOAD") is not None
 
+# segment directories of counter-named routes, e.g. 0000010b--b918394c0e--3
+ROUTE_COUNTER_RE = re.compile(r"^([0-9a-f]{8})--[0-9a-f]{10}--\d+$")
+# a failed rlog never holds up qlogs: after each failure in a row no rlog is tried for 1, 2, 4 ... 30 min,
+# and an rlog that failed RLOG_MAX_TRIES times waits for the next start, so newer rlogs still go up
+RLOG_MAX_TRIES = 5
+RLOG_PAUSE_MAX_S = 30 * 60
+
 
 class FakeRequest:
   def __init__(self):
@@ -47,6 +55,11 @@ class FakeResponse:
 
 def get_directory_sort(d: str) -> list[str]:
   return [s.rjust(10, '0') for s in d.rsplit('--', 1)]
+
+def route_counter(logdir: str) -> int | None:
+  """Route counter of a segment directory (0000010b--b918394c0e--3 -> 0x10b); None for boot/, crash/ and other names."""
+  m = ROUTE_COUNTER_RE.match(logdir)
+  return int(m.group(1), 16) if m else None
 
 def listdir_by_creation(d: str) -> list[str]:
   if not os.path.isdir(d):
@@ -84,6 +97,61 @@ class Uploader:
 
     self.immediate_folders = ["crash/", "boot/"]
     self.immediate_priority = {"qlog": 0, "qlog.zst": 0, "qcamera.ts": 1}
+    # full logs, uploaded on their own only while the UploadRlogs toggle is on
+    self.rlog_names = ("rlog", "rlog.zst")
+    self.rlog_params_missing = False
+    self.rlog_tries: dict[str, int] = {}  # failed attempts per rlog in this boot
+    self.rlog_fail_streak = 0
+    self.rlog_pause_until = 0.0  # time.monotonic() before which no rlog is tried
+
+  def rlog_route_range(self) -> tuple[int, int | None] | None:
+    """(first, end): rlogs of routes with first <= counter < end are uploaded without a request from comma connect.
+    None while UploadRlogs is off, or if this build does not know the new params.
+
+    first: the route in progress (or the last one) when the toggle was switched on, so switching it on never uploads
+    the backlog of older drives. The UI clears it whenever the toggle changes, and the uploader clears it whenever it
+    sees the toggle off. end: RouteCount, the counter of the next route; routes from before a counter reset keep their
+    higher counters and stay out. A reset (RouteCount at or below first) restarts first at 0, so nothing stops silently."""
+    if self.rlog_params_missing:
+      return None
+    try:
+      enabled = self.params.get_bool("UploadRlogs")
+      first = self.params.get("UploadRlogsFromRoute")
+    except UnknownKeyName:
+      # update installed without the rebuild (e.g. Quickboot prebuilt): treat as off, keep uploading everything else
+      self.rlog_params_missing = True
+      cloudlog.event("uploader_rlogs_unavailable", error=True)
+      return None
+
+    if not enabled:
+      if first is not None:
+        self.params.remove("UploadRlogsFromRoute")
+      return None
+
+    end = self.params.get("RouteCount")  # None only on a device that never logged a route
+    if first is None or (end is not None and first >= end):
+      if first is not None:
+        cloudlog.event("uploader_rlogs_counter_reset", from_route=f"{first:08x}", route_count=end)
+        new_first = 0
+      elif end is not None:
+        new_first = max(0, end - 1)
+      else:
+        new_first = max((c for c in map(route_counter, listdir_by_creation(self.root)) if c is not None), default=0)
+      first = new_first
+      self.params.put("UploadRlogsFromRoute", first)
+      cloudlog.event("uploader_rlogs_enabled", from_route=f"{first:08x}")
+    return first, end
+
+  def rlog_upload_done(self, key: str, success: bool) -> None:
+    if success:
+      self.rlog_fail_streak = 0
+      self.rlog_tries.pop(key, None)
+      return
+    self.rlog_tries[key] = self.rlog_tries.get(key, 0) + 1
+    self.rlog_fail_streak += 1
+    pause = min(60 * 2 ** (self.rlog_fail_streak - 1), RLOG_PAUSE_MAX_S)
+    self.rlog_pause_until = time.monotonic() + pause
+    cloudlog.event("uploader_rlog_paused", key=key, tries=self.rlog_tries[key], pause_s=pause)
 
   def list_upload_files(self, metered: bool) -> Iterator[tuple[str, str, str]]:
     r = self.params.get("AthenadRecentlyViewedRoutes")
@@ -125,6 +193,7 @@ class Uploader:
         yield name, key, fn
 
   def next_file_to_upload(self, metered: bool) -> tuple[str, str, str] | None:
+    rlog_routes = self.rlog_route_range()
     upload_files = list(self.list_upload_files(metered))
 
     for name, key, fn in upload_files:
@@ -134,6 +203,16 @@ class Uploader:
     for name, key, fn in upload_files:
       if name in self.immediate_priority:
         return name, key, fn
+
+    # then full logs, oldest first: only with UploadRlogs on, on unmetered networks, for routes in the range,
+    # not while paused after a failure, and not after RLOG_MAX_TRIES failures in this boot
+    if rlog_routes is not None and not metered and time.monotonic() >= self.rlog_pause_until:
+      first, end = rlog_routes
+      for name, key, fn in upload_files:
+        counter = route_counter(os.path.dirname(key))
+        if (name in self.rlog_names and counter is not None and first <= counter and (end is None or counter < end)
+            and self.rlog_tries.get(key, 0) < RLOG_MAX_TRIES):
+          return name, key, fn
 
     return None
 
@@ -221,7 +300,10 @@ class Uploader:
     if key.endswith(('qlog', 'rlog')) or (key.startswith('boot/') and not key.endswith('.zst')):
       key += ".zst"
 
-    return self.upload(name, key, fn, network_type, metered)
+    success = self.upload(name, key, fn, network_type, metered)
+    if name in self.rlog_names:
+      self.rlog_upload_done(d[1], success)
+    return success
 
 
 def main(exit_event: threading.Event | None = None) -> None:
@@ -248,6 +330,7 @@ def main(exit_event: threading.Event | None = None) -> None:
   backoff = 0.1
   while not exit_event.is_set():
     sm.update(0)
+    uploader.rlog_route_range()  # notice UploadRlogs changes even without a network
     offroad = params.get_bool("IsOffroad")
     network_type = sm['deviceState'].networkType if not force_wifi else NetworkType.wifi
     if network_type == NetworkType.none:

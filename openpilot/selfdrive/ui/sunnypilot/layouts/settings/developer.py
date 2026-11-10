@@ -10,6 +10,7 @@ from pathlib import Path
 
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.selfdrive.ui.layouts.settings.developer import DeveloperLayout
+from openpilot.common.params import UnknownKeyName
 from openpilot.common.hardware import PC
 from openpilot.common.hardware.hw import Paths
 from openpilot.system.ui.lib.application import gui_app
@@ -50,9 +51,33 @@ class DeveloperLayoutSP(DeveloperLayout):
 
     self.prebuilt_toggle = toggle_item_sp(tr("Quickboot Mode"), "", param="QuickBootToggle", callback=self._on_prebuilt_toggled)
 
+    # only if this build knows the params: an update installed without the rebuild (e.g. Quickboot prebuilt) does not
+    self.upload_rlogs_toggle = None
+    if self._params_known("UploadRlogs", "UploadRlogsFromRoute"):
+      self.upload_rlogs_toggle = toggle_item_sp(tr("Upload Full Logs (rlogs)"),
+                                                tr("Upload the full logs (rlogs) to comma automatically, without requesting them in comma connect. " +
+                                                   "Only on unmetered networks (Wi-Fi, including a phone hotspot unless it is set to metered in " +
+                                                   "Network > Advanced), starting with the drive in progress or the last drive. " +
+                                                   "About 0.7 GB per hour of driving."), param="UploadRlogs", callback=self._on_upload_rlogs_toggled)
+
     self.error_log_btn = button_item(tr("Error Log"), tr("VIEW"), tr("View the error log for sunnypilot crashes."), callback=self._on_error_log_clicked)
 
-    self.items: list = [self.show_advanced_controls, self.enable_github_runner_toggle, self.enable_copyparty_toggle, self.prebuilt_toggle, self.error_log_btn,]
+    self.items: list = [self.show_advanced_controls, self.enable_github_runner_toggle, self.enable_copyparty_toggle, self.prebuilt_toggle,
+                        *([self.upload_rlogs_toggle] if self.upload_rlogs_toggle else []), self.error_log_btn,]
+
+  @staticmethod
+  def _params_known(*keys: str) -> bool:
+    try:
+      for key in keys:
+        ui_state.params.check_key(key)
+      return True
+    except UnknownKeyName:
+      return False
+
+  @staticmethod
+  def _on_upload_rlogs_toggled(state):
+    # on or off, forget the start route: switching on again always starts from the drive in progress, never from an old one
+    ui_state.params.remove("UploadRlogsFromRoute")
 
   @staticmethod
   def _on_prebuilt_toggled(state):
