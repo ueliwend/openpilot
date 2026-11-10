@@ -171,8 +171,8 @@ class TestInsterMPCFixedValues(OpenpilotTestCase):
     assert dict(MPC_FIXED) == {'lat_delay': 0.2, 'steer_ratio': 15.55, 'stiffness_factor': 1.0, 'lat_accel_offset': 0.0}
     assert isinstance(MPC_FIXED, MappingProxyType)
     assert ANGLE_PI_VERSION_MPC_FIXED_BIT == 1024
-    assert angle_pi_log_version(LATERAL_PID, False, True, True, True) == 2000106
-    assert angle_pi_log_version(LATERAL_PID, False, True, False, True) == 1488106
+    assert angle_pi_log_version(LATERAL_PID, False, True, True, True) == 4048106      # 2000106 until 11 Nov 2026 (+ bit 2048, set 11 Nov)
+    assert angle_pi_log_version(LATERAL_PID, False, True, False, True) == 3536106     # 1488106 until 11 Nov 2026
     assert fixed_or_learned(None, 'lat_delay', 0.31) == 0.31 and fixed_or_learned(MPC_FIXED, 'lat_delay', 0.31) == 0.2
 
   def test_selection_matches_the_controller(self):

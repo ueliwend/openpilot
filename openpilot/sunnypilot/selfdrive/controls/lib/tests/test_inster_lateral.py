@@ -55,6 +55,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_
                                                                        mpc_ramp_anticipation, mpc_ramp_envelope, stiction_predicted, \
                                                                        ff_table_top, MPC_NH, MPC_DTB
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_VERSION_MPC_FIXED_BIT, MPC_FIXED
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_VERSION_SET_11NOV_BIT
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import LatControlTorque as LatControlTorqueV0
@@ -145,11 +146,13 @@ class TestInsterTable(OpenpilotTestCase):
 
   def test_smooth_in_lateral_accel(self):
     # the rule the table is built and refit by (t2_table409): below the cap, neighbouring slopes in a differ by at most x2.5 up and
-    # x0.4 down (0.01 tolerance: the cells are rounded to 0.1 raw)
+    # x0.4 down (0.01 tolerance: the cells are rounded to 0.1 raw). 11 Nov 2026: the cap of the table is its top cell, 409 x 0.95 =
+    # 388.55 (the joint fit's 409 cells scaled with the rest; a common factor leaves every slope ratio unchanged)
+    top = max(c for row in CMD_RAW for c in row)
     for row in CMD_RAW:
       s = [(row[i + 1] - row[i]) / (A_NODES[i + 1] - A_NODES[i]) for i in range(len(row) - 1)]
       for i in range(len(s) - 1):
-        if row[i + 2] < INSTER_STEER_MAX and s[i] > 0.0:
+        if row[i + 2] < top and s[i] > 0.0:
           assert 0.4 - 0.01 <= s[i + 1] / s[i] <= 2.5 + 0.01, (row, i)
 
   def test_fixed_factor_is_f0(self):
@@ -450,9 +453,10 @@ class TestInsterSteerCap(OpenpilotTestCase):
           assert max(out) <= cap + 1e-12 and max(out) > 1.0, (car_name, on, max(out))
 
   def test_feedforward_and_friction_bounded(self):
-    # neither step-2 contribution alone can ask for more than the cap: no table cell above INSTER_STEER_MAX (the table reaches 409
-    # at high lateral acceleration), the friction term at most 200 raw; the controller's limit decides the rest
-    assert max(c for row in CMD_RAW for c in row) == INSTER_STEER_MAX
+    # neither step-2 contribution alone can ask for more than the cap: no table cell above INSTER_STEER_MAX, the friction term at most
+    # 200 raw; the controller's limit decides the rest. 11 Nov 2026: the table tops out at 388.55 (joint fit's 409 x 0.95); the steering
+    # limit stays 409
+    assert max(c for row in CMD_RAW for c in row) == 388.55 < INSTER_STEER_MAX
     assert all(0.0 <= c <= INSTER_STEER_MAX for row in CMD_RAW for c in row)
     for v in SPEEDS:
       for a in ACCELS + [10.0]:
@@ -701,12 +705,13 @@ class TestInsterAnglePI(OpenpilotTestCase):
     assert first["F"][3] == angle_pi_log_version(LATERAL_PI, False)
 
   def test_log_version(self):
-    # F drives are identifiable in the logs: torqueState.version 320105 with F on and the selector unset (PI = PI-30Oct base 105 +
-    # 1000 x (freeze-rule bit 64 | fixed-factor bit 256); 30 Oct 2026 before the fixed factor 320105, 29 Oct 2026 with G6 64103; before
+    # F drives are identifiable in the logs: torqueState.version 2368105 with F on and the selector unset (PI = PI-30Oct base 105 +
+    # 1000 x (freeze-rule bit 64 | fixed-factor bit 256 | parameter set 11 Nov bit 2048); 30 Oct - 11 Nov 2026 320105, 29 Oct 2026 with G6 64103; before
     # the freeze fix 103; older drives: 102 G2, 101 F's gains with the crawl plan, 100 before it), 0 for v0 otherwise (upstream: 1)
     assert ANGLE_PI_G6_LOG_VERSION == 103 and ANGLE_PI_VERSION_FREEZE_DIR_BIT == 64 and ANGLE_PI_VERSION_FIXED_FACTOR_BIT == 256
     assert ANGLE_PI_G6_LOG_VERSION not in (latcontrol_torque_v0.VERSION, 1)
-    for on, expected in ((INSTER_KEYS, 320105), ((ANGLE_PI_KEY,), 320105), (STEP2_KEYS, 0), ((), 0),
+    assert ANGLE_PI_VERSION_SET_11NOV_BIT == 2048
+    for on, expected in ((INSTER_KEYS, 2368105), ((ANGLE_PI_KEY,), 2368105), (STEP2_KEYS, 0), ((), 0),
                          (INSTER_KEYS + ("NeuralNetworkLateralControl",), 0)):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
       for active in (True, False):
@@ -884,11 +889,11 @@ class TestInsterAnglePIG6(OpenpilotTestCase):
     assert Params().get_bool("LateralJerkTorqueController")
 
   def test_log_version(self):
-    # PI drives are identifiable in the logs: torqueState.version 320105 (PI-30Oct base 105 + 1000 x (freeze-rule bit 64 | fixed-factor
-    # bit 256); G6: 64103 on 29 Oct 2026, 103 before the freeze fix), 0 for v0
+    # PI drives are identifiable in the logs: torqueState.version 2368105 (PI-30Oct base 105 + 1000 x (freeze-rule bit 64 | fixed-factor
+    # bit 256 | parameter set 11 Nov bit 2048; 320105 until 11 Nov 2026); G6: 64103 on 29 Oct 2026, 103 before the freeze fix), 0 for v0
     # (upstream: 1); 102 (G2) is no longer produced
     assert ANGLE_PI_G6_LOG_VERSION == 103
-    for on, expected in ((INSTER_KEYS + (G6_KEY,), 320105), ((ANGLE_PI_KEY, G6_KEY), 320105), (INSTER_KEYS, 320105), ((ANGLE_PI_KEY,), 320105),
+    for on, expected in ((INSTER_KEYS + (G6_KEY,), 2368105), ((ANGLE_PI_KEY, G6_KEY), 2368105), (INSTER_KEYS, 2368105), ((ANGLE_PI_KEY,), 2368105),
                          (STEP2_KEYS + (G6_KEY,), 0), ((G6_KEY,), 0), (INSTER_KEYS + (G6_KEY, "NeuralNetworkLateralControl"), 0)):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
       for active in (True, False):
@@ -973,7 +978,7 @@ class TestInsterGainSets30Oct(OpenpilotTestCase):
     assert (ANGLE_PI_PI_BASE_VERSION, ANGLE_PI_PID_BASE_VERSION) == (105, 106)
     assert ANGLE_PI_PI_BASE_VERSION not in (ANGLE_PI_G6_LOG_VERSION, ANGLE_PI_P6_BASE_VERSION, 100, 101, 102)
     assert ANGLE_PI_PID_BASE_VERSION not in (ANGLE_PI_G6_LOG_VERSION, ANGLE_PI_P6_BASE_VERSION, 100, 101, 102)
-    expected = {(0, False): 320105, (1, False): 336106, (0, True): 328105, (1, True): 344106}
+    expected = {(0, False): 2368105, (1, False): 2384106, (0, True): 2376105, (1, True): 2392106}   # + bit 2048 since 11 Nov 2026
     for (ctrl, soft), version in expected.items():
       assert angle_pi_log_version(ctrl, soft) == version
 
@@ -1039,9 +1044,9 @@ class TestInsterLateralController(OpenpilotTestCase):
     params.remove(CTRL_KEY)
     params.remove(GAINS_KEY)
     assert params.get(CTRL_KEY, return_default=True) == LATERAL_PI       # the UI's default
-    for ctrl, legacy_gains, kp, ki, kd, version in ((0, None, CAR_PI_KP, CAR_PI_KI, None, 320105), (1, None, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD, 336106),
-                                                    (None, None, CAR_PI_KP, CAR_PI_KI, None, 320105), (None, 0, CAR_PI_KP, CAR_PI_KI, None, 320105),
-                                                    (None, 2, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD, 336106)):
+    for ctrl, legacy_gains, kp, ki, kd, version in ((0, None, CAR_PI_KP, CAR_PI_KI, None, 2368105), (1, None, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD, 2384106),
+                                                    (None, None, CAR_PI_KP, CAR_PI_KI, None, 2368105), (None, 0, CAR_PI_KP, CAR_PI_KI, None, 2368105),
+                                                    (None, 2, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD, 2384106)):
       for on in ((ANGLE_PI_KEY,), INSTER_KEYS):
         c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl, legacy_gains=legacy_gains)
         assert c.inster_angle_pi and (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (kp, ki, kd)
@@ -1092,10 +1097,10 @@ class TestInsterLateralController(OpenpilotTestCase):
 
   def test_versions(self):
     # base versions (before the freeze fix the logged values); logged now with the freeze-rule bit 64 and the fixed-factor bit 256:
-    # PI 320105, PID 336106 (gain sets PI-30Oct / PID-30Oct)
+    # PI 320105, PID 336106 (gain sets PI-30Oct / PID-30Oct); since 11 Nov 2026 + bit 2048 (parameter set 11 Nov): 2368105 / 2384106
     assert (ANGLE_PI_G6_LOG_VERSION, ANGLE_PI_P6_LOG_VERSION) == (103, 16104)
     assert ANGLE_PI_P6_LOG_VERSION == ANGLE_PI_P6_BASE_VERSION + 1000 * ANGLE_PI_VERSION_D_BIT and ANGLE_PI_VERSION_D_BIT == 16
-    for on, ctrl, expected in ((INSTER_KEYS, 1, 336106), ((ANGLE_PI_KEY,), 1, 336106), (INSTER_KEYS, 0, 320105), (INSTER_KEYS, None, 320105),
+    for on, ctrl, expected in ((INSTER_KEYS, 1, 2384106), ((ANGLE_PI_KEY,), 1, 2384106), (INSTER_KEYS, 0, 2368105), (INSTER_KEYS, None, 2368105),
                                (STEP2_KEYS, 1, 0), ((), 1, 0), (INSTER_KEYS + ("NeuralNetworkLateralControl",), 1, 0)):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl)
       for active in (True, False):
@@ -1253,11 +1258,11 @@ class TestInsterSoftSmallErrorP(OpenpilotTestCase):
 
   def test_versions(self):
     assert ANGLE_PI_VERSION_SOFT_P_BIT == 8 and ANGLE_PI_VERSION_D_BIT == 16
-    # incl. the freeze-rule bit 64 and the fixed-factor bit 256 (128 stays free)
-    expected = {(0, False): 320105, (1, False): 336106, (0, True): 328105, (1, True): 344106}
+    # incl. the freeze-rule bit 64, the fixed-factor bit 256 and the parameter-set-11-Nov bit 2048 (128 = the MPC)
+    expected = {(0, False): 2368105, (1, False): 2384106, (0, True): 2376105, (1, True): 2392106}   # + bit 2048 since 11 Nov 2026
     for (ctrl, soft), version in expected.items():
       assert angle_pi_log_version(ctrl, soft) == version, (ctrl, soft)
-    always = ANGLE_PI_VERSION_FREEZE_DIR_BIT | ANGLE_PI_VERSION_FIXED_FACTOR_BIT
+    always = ANGLE_PI_VERSION_FREEZE_DIR_BIT | ANGLE_PI_VERSION_FIXED_FACTOR_BIT | ANGLE_PI_VERSION_SET_11NOV_BIT
     assert angle_pi_log_version(LATERAL_PID, True) == ANGLE_PI_PID_BASE_VERSION + 1000 * (ANGLE_PI_VERSION_D_BIT | ANGLE_PI_VERSION_SOFT_P_BIT
                                                                                          | always)
     assert angle_pi_log_version(LATERAL_PID, False) == ANGLE_PI_PID_BASE_VERSION + 1000 * (ANGLE_PI_VERSION_D_BIT | always)
@@ -1732,15 +1737,26 @@ class TestInsterMPC(OpenpilotTestCase):
         kn = al * kn + (1 - al) * ap / v ** 2
         ap = u
       return cmd, nom, 0.05 * next(i for i, x in enumerate(cmd) if x >= 0.5), 0.05 * next(i for i, x in enumerate(nom) if x >= 0.5)
+
+    def cross(x, level=0.5):               # interpolated crossing time (s) on the 50 ms block grid
+      i = next(i for i, y in enumerate(x) if y >= level)
+      return 0.05 * (i - 1 + (level - x[i - 1]) / (x[i] - x[i - 1]))
     for v in (8.0, 15.0, 25.0, 33.0):
       K = np.array([np.interp(v, np.arange(1.0, 46.0), rows[:, i]) for i in range(rows.shape[1])])
       cmd, nom, t50_cmd, t50_nom = response(v, K)
-      _, _, _, t50_pass = response(v, None)
-      assert 0.0 < t50_cmd <= 0.55 and t50_cmd < t50_nom <= t50_pass + 1e-9, (v, t50_cmd, t50_nom, t50_pass)
+      cmd_pass, nom_pass, _, _ = response(v, None)
+      # the nominal response is not later than with the plan passed through: no net delay (area lag = integral of pass-through minus
+      # LQ, unit step, |.| <= 5 ms) for the command and the nominal curvature, and at most 0.10 s extra 10-90 % rise (interpolated
+      # crossings). The LQ smooths the plan step around the pass-through edge (leads at 10 %, trails at 50 / 90 %), a shape effect, not a
+      # delay. MPC 11 Nov: area lag 0.27 ms, extra rise 43-48 ms at 8-33 m/s
+      rise = lambda x: cross(x, 0.9) - cross(x, 0.1)  # noqa: E731
+      assert 0.0 < t50_cmd <= 0.55 and t50_cmd < t50_nom, (v, t50_cmd, t50_nom)
+      assert rise(nom) - rise(nom_pass) <= 0.10, (v, rise(nom), rise(nom_pass))
+      assert abs(0.05 * sum(np.subtract(cmd_pass, cmd))) <= 0.005 and abs(0.05 * sum(np.subtract(nom_pass, nom))) <= 0.005, v
       assert max(nom) < 1.10 and abs(nom[-1] - 1.0) < 1e-3 and max(cmd) < 3.0, (v, max(nom), max(cmd))
     # the shipped controller (these rows with the ramp-aware path, MPC_RAMP_PARAMS) leads the plan step: its feed-forward command
     # reaches 10 % of the step at least 0.15 s before the plan passed straight through (a pure pass-through fails here), and settles
-    # within 3x the step; at 18-54 km/h, where the fitted turn-in anticipation is strong (it fades to 0 at 109.5 km/h)
+    # within 3x the step; at 18-54 km/h, where the fitted turn-in anticipation is strong (it fades to 0 at 115.5 km/h)
     for v in (5.0, 8.0, 15.0):
       out = _plan_step_command(InsterMPC(DT_CTRL, p, model_t_idxs=ModelConstants.T_IDXS, ramp_aware=MPC_RAMP_PARAMS), v)
       assert _t_reach(out, 0.1) <= 3.0 - 0.2 - 0.15 + 1e-9, (v, _t_reach(out, 0.1))
@@ -1753,7 +1769,7 @@ class TestInsterMPC(OpenpilotTestCase):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=1)
       assert c.inster_mpc is not None
       assert c.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | ANGLE_PI_VERSION_MPC_BIT | 256 |
-                                                                               ANGLE_PI_VERSION_MPC_FIXED_BIT)
+                                                                               ANGLE_PI_VERSION_MPC_FIXED_BIT | 2048)
       assert c.inster_fixed is MPC_FIXED
     for car_name, on, ctrl in ((HYUNDAI.HYUNDAI_INSTER, INSTER_KEYS, 0), (HYUNDAI.HYUNDAI_INSTER, STEP2_KEYS, 1),
                                (HYUNDAI.HYUNDAI_INSTER, (ANGLE_PI_KEY,), 1),
@@ -1763,13 +1779,13 @@ class TestInsterMPC(OpenpilotTestCase):
       c, VM = _make_v0(car_name, on=on + (MPC_KEY,), ctrl=ctrl)
       assert c.inster_mpc is None
       assert _run(c, VM) == _run(*_make_v0(car_name, on=on, ctrl=ctrl)), (car_name, on, ctrl)
-    assert angle_pi_log_version(LATERAL_PID, True, True) == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 8 | 64 | 128 | 256)
+    assert angle_pi_log_version(LATERAL_PID, True, True) == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 8 | 64 | 128 | 256 | 2048)
     # owner 1 Nov 2026: Soft Small-Error P is off while the MPC runs (version without the Soft-P bit; the run equals MPC without Soft-P);
     # without the MPC (switch off, or the MPC set-up failed) Soft-P stays as selected
     sp_mpc, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (O5_KEY, MPC_KEY), ctrl=1)
     assert sp_mpc.inster_mpc is not None and not sp_mpc.inster_soft_p
     assert sp_mpc.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | ANGLE_PI_VERSION_MPC_BIT | 256 |
-                                                                                ANGLE_PI_VERSION_MPC_FIXED_BIT)
+                                                                                ANGLE_PI_VERSION_MPC_FIXED_BIT | 2048)
     def mdl(ay):
       return _MVM(int(ay * 1000), 0.0, 15.0)
     assert _run(sp_mpc, VM, extension_model=mdl) == _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1),
@@ -1909,18 +1925,22 @@ class TestInsterMPC(OpenpilotTestCase):
     assert c.inster_mpc.n_solve > 100
 
   def test_gain_set(self):
-    # car review 1, change 2: the MPC variant's own PID gains and D filter, selected only when the MPC is in use. Parameter set MPC 7 Nov
-    # (fitted at ramp 3 / 6 with the ramp-aware MPC on, on the 26-drive feed-forward table) is pinned here, its ramp-aware parameters
-    # included; it differs from PID-30Oct. Unpatched: the MPC uses it.
+    # car review 1, change 2: the MPC variant's own PID gains and D filter, selected only when the MPC is in use. Parameter set MPC 11 Nov
+    # (fitted at ramp 3 / 6 with the ramp-aware MPC on, on the joint-fit feed-forward table x 0.95, summer and winter) is pinned here, its
+    # ramp-aware parameters included; it differs from PID-30Oct. Unpatched: the MPC uses it. (MPC 7 Nov until 11 Nov 2026.)
     assert (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD, ANGLE_PI_MPC_D_TAU) == (
-      (2.3291265229498572, 0.3493828389681169, -0.0022509794785350334), (-0.14385429318612764, 1.6813322693441184, -0.04253866028664136),
-      (0.09485120379508169, 0.016987681460720737, 7.511713014005203e-05), 0.8510167207818206)
-    assert MPC_PARAMS == {'g': 0.2565493476760934, 'g_lo': 0.22377120305459947, 'g_vlo': 0.026576882070846172, 'wy': 0.31739420191845724,
-                          'wpsi': 1.7052763121821215, 'wdu': 7.518239192951498, 'wu': 7.91666564387851, 'tau_vlo': 1.5072973847589601,
-                          'tau_lo': 0.5347320633541794, 'tau_hi': 0.5198521809253115, 'v_on': 43.08959807828134}
-    assert MPC_RAMP_PARAMS == {'ra_in_lo': 0.654851178336799, 'ra_in': 0.8191807789445549, 'ra_v0': 109.45649599343251,
-                               'ra_out_lo': 0.002499870105593264, 'ra_out': 0.0025705281741539594, 'ra_v0_out': 160.0,
-                               'ra_st': 0.0004975832927271756, 'ra_lead': 0.0, 'ra_pd': 0.003011002037188249, 'ra_pd_t': 0.05}
+      (1.190859156488378, 0.6758686070047979, -0.011033469480174404), (-0.3173593295080285, 2.504047318684433, -0.06391789776183339),
+      (-0.4187312142480444, 0.049049588286649445, -0.00038912116593913096), 0.9395176649192107)
+    assert MPC_PARAMS == {'g': 0.24904231631222715, 'g_lo': 0.407151427781796, 'g_vlo': 0.031453772040196726, 'wy': 0.5167014477912737,
+                          'wpsi': 1.9488175405472, 'wdu': 7.776907967981213, 'wu': 7.205549294493615, 'tau_vlo': 1.4681135029991168,
+                          'tau_lo': 0.5259044466169603, 'tau_hi': 0.5918330423708914, 'v_on': 39.98938116414386}
+    assert MPC_RAMP_PARAMS == {'ra_in_lo': 0.6366800074413821, 'ra_in': 0.8047902275045123, 'ra_v0': 115.50503377218267,
+                               'ra_out_lo': 0.020080860987339636, 'ra_out': 0.014029555874718797, 'ra_v0_out': 159.87249223026686,
+                               'ra_st': 0.06106149583776907, 'ra_lead': 0.0, 'ra_pd': 0.0, 'ra_pd_t': 0.051058342512113705}
+    # the D gain's constant term is negative: D is 0 below 9.21 m/s (33.2 km/h), the I gain 0 above 39.05 m/s (140.6 km/h); P never clipped
+    assert angle_pi_gain(ANGLE_PI_MPC_KD, 9.15) == 0.0 < angle_pi_gain(ANGLE_PI_MPC_KD, 9.3)
+    assert angle_pi_gain(ANGLE_PI_MPC_KI, 39.0) > 0.0 == angle_pi_gain(ANGLE_PI_MPC_KI, 39.1)
+    assert all(angle_pi_gain(ANGLE_PI_MPC_KP, v) > 0.0 for v in np.linspace(0.0, 45.0, 451))
     assert (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD) != (ANGLE_PI_PID_KP, ANGLE_PI_PID_KI, ANGLE_PI_PID_KD)
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
     assert c.inster_mpc is not None and c.inster_mpc.p == MPC_PARAMS
@@ -1930,16 +1950,16 @@ class TestInsterMPC(OpenpilotTestCase):
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY, MPC_RAMP_KEY), ctrl=1)
     assert c.inster_mpc is not None and c.inster_mpc.p == MPC_PARAMS and c.inster_mpc.ra == MPC_RAMP_PARAMS
     assert (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD)
-    assert c.inster_angle_pi_version == 2000106                      # 976106 + the held learned values (bit 1024, 9 Nov 2026)
+    assert c.inster_angle_pi_version == 4048106                      # 976106 + the held learned values (bit 1024, 9 Nov 2026) + set 11 Nov (2048)
     # the default configuration (6 Nov 2026): InsterMPCRampAware defaults to on, so turning on InsterMPC alone gives the fitted
     # controller; off stays as an A/B option (the plain MPC with these settings, not fitted)
     assert Params().get_default_value(MPC_RAMP_KEY) is True
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1, defaults=(MPC_RAMP_KEY,))
-    assert c.inster_mpc is not None and c.inster_mpc.ra == MPC_RAMP_PARAMS and c.inster_angle_pi_version == 2000106
+    assert c.inster_mpc is not None and c.inster_mpc.ra == MPC_RAMP_PARAMS and c.inster_angle_pi_version == 4048106
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=1, defaults=(MPC_RAMP_KEY,))
     assert c.inster_mpc is None                                       # without InsterMPC the default-on sub-switch does nothing
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
-    assert c.inster_mpc is not None and c.inster_mpc.ra is None and c.inster_angle_pi_version == 1488106   # 464106 + bit 1024
+    assert c.inster_mpc is not None and c.inster_mpc.ra is None and c.inster_angle_pi_version == 3536106   # 464106 + bit 1024 + bit 2048
     # distinct values patched in to see which set is taken
     mkp, mki, mkd, mtau = (3.0, 0.4, -0.01), (0.8, 0.3, -0.008), (0.3, 0.001, 0.0), 0.05
     with mock.patch.multiple(latcontrol_torque_v0, ANGLE_PI_MPC_KP=mkp, ANGLE_PI_MPC_KI=mki, ANGLE_PI_MPC_KD=mkd, ANGLE_PI_MPC_D_TAU=mtau):
@@ -1964,7 +1984,7 @@ class TestInsterMPC(OpenpilotTestCase):
     with mock.patch.object(latcontrol_torque_v0, 'InsterMPC', side_effect=RuntimeError('gain rows')):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
     assert c.inster_mpc is None and c.inster_fixed is MPC_FIXED
-    assert c.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | 256 | ANGLE_PI_VERSION_MPC_FIXED_BIT) == 1360106
+    assert c.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | 256 | ANGLE_PI_VERSION_MPC_FIXED_BIT | 2048) == 3408106
     assert (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (ANGLE_PI_PID_KP, ANGLE_PI_PID_KI, ANGLE_PI_PID_KD)
     ref, VM_ref = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=1)
     ref_update = ref.update_torque_parameters
@@ -2064,7 +2084,7 @@ class TestInsterMPCRampAware(OpenpilotTestCase):
     for v in SPEEDS[::4]:
       for a in np.linspace(0.01, 3.4, 40):
         raw = ff_torque(float(a), v) * STEER_MAX_RAW
-        if raw < 408.9:                                                  # below the 409 plateau the inverse is exact
+        if raw < max(c for row in CMD_RAW for c in row) - 0.1:           # below the table's top plateau (388.55 since 11 Nov 2026) exact
           assert abs(ff_table_inverse(raw, v) - a) < 1e-9, (v, a)
           assert abs(ff_table_inverse(-raw, v) + a) < 1e-9
       assert ff_table_inverse(0.0, v) == 0.0
@@ -2097,7 +2117,7 @@ class TestInsterMPCRampAware(OpenpilotTestCase):
       on, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY, MPC_RAMP_KEY), ctrl=1)
     assert on.inster_mpc.ra == strong
     assert on.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | ANGLE_PI_VERSION_MPC_BIT | 256 |
-                                                                             ANGLE_PI_VERSION_MPC_RAMP_BIT | ANGLE_PI_VERSION_MPC_FIXED_BIT) == 2000106
+                                                                             ANGLE_PI_VERSION_MPC_RAMP_BIT | ANGLE_PI_VERSION_MPC_FIXED_BIT | 2048) == 4048106
     assert angle_pi_log_version(LATERAL_PID, False, False, True) == angle_pi_log_version(LATERAL_PID, False)   # only with the MPC
     run_on = _run(on, VM, extension_model=mdl)
     assert run_on != base
@@ -2168,7 +2188,11 @@ class TestInsterMPCRampAware(OpenpilotTestCase):
     # a non-finite solve: no ramp-aware shift while the fallback fades the MPC out (not the last block's values), finite outputs;
     # the next finite solve brings it back
     m = InsterMPC(DT_CTRL, model_t_idxs=ModelConstants.T_IDXS, ramp_aware=MPC_RAMP_PARAMS)
-    v, k_step = 8.0, 1.0 / 64.0
+    # curvature step 1/52 (1.23 m/s^2 at 8 m/s): large enough that the torque ramp binds and the anticipation acts for every plausible
+    # table (summer and winter, winter factor down to 2 SE below its estimate); with 1/64 the anticipation stayed at 0 on the winter
+    # table, so the non-finite branch below was not exercised (11 Nov 2026: on the joint-fit table x 0.95 with MPC 11 Nov, 1/64 gives a
+    # turn-in anticipation of 0.007, below the 0.05 this test needs; 1/52 gives 0.26)
+    v, k_step = 8.0, 1.0 / 52.0
     def step(k):
       t = k * DT_CTRL
       m.observe_model(_MVMProfile(k // 5, lambda T: k_step if t + T >= 3.0 else 0.0, v))
