@@ -217,6 +217,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ModelManager_ActiveJson", {CLEAR_ON_MANAGER_START, JSON}},
     {"ModelManager_ClearCache", {CLEAR_ON_MANAGER_START, BOOL}},
     {"ModelManager_DownloadRef", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, STRING}},
+    {"ModelManager_DefaultSeed", {PERSISTENT, STRING}},  // first-boot model seed: pending / requested / done:<reason> (sunnypilot/models/manager.py)
     {"ModelManager_Favs", {PERSISTENT | BACKUP, STRING}},
     {"ModelManager_LastSyncTime", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, INT, "0"}},
     {"ModelManager_LastSyncTime_Chestnut", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, INT, "0"}},

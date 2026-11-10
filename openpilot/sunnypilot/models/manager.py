@@ -37,6 +37,20 @@ NO_COMPRESSION = {"Accept-Encoding": "identity"}
 SPEED_SMOOTHING = 0.7  # weight of the previous speed sample in the published speed
 SPEED_FLOOR = 0.05 * 1024 ** 2  # bytes/s; anything slower would only display as 0.0 MB/s, so it reads as no rate
 
+# First-boot model seed (owner, 10 Nov 2026): a fresh install requests this bundle once, so it comes up on the model the owner drives
+# (route 00000113: ModelManager_ActiveBundle = Pop Model v2 (March 24, 2026), internalName PMV2, generation 12). State in
+# ModelManager_DefaultSeed: unset = not decided yet, "pending" = fresh store, request not made yet, "requested" = the one request is
+# out (persisted before it is made, so a reboot during the download does not request again), "done:<reason>" = never again.
+# Rules: only on a store where the model manager has never run and no model is selected (no ModelsCache, no active bundle; decided once
+# at start); done as soon as anyone selects a model or requests a download; one request in the store's lifetime, made only once the
+# catalog is reachable; if the catalog has no such ref, or the download fails (also a network drop after each piece's three retries),
+# is cancelled, is cut by a restart, or the car goes onroad (the model manager runs only offroad and the request is cleared on the onroad
+# transition), the shipped default model stays and the seed is done. No retries on later boots, so it never loops on the network and
+# never overrides a choice made after a failed download. Residual: "Default" in the model UI only removes the active-bundle key, so a
+# "Default" choice made before the seed fires or during its download does not stop it.
+DEFAULT_SEED_BUNDLE_REF = "62bf6fb072880905a4c490f0f4f4a6b3c23346ec"
+DEFAULT_SEED_PARAM = "ModelManager_DefaultSeed"
+
 
 class DownloadCancelled(Exception):
   pass
@@ -125,6 +139,7 @@ class ModelManagerSP:
 
   def __init__(self):
     self.params = Params()
+    self._decide_default_seed()                              # before the fetcher writes any model-manager state
     self.model_fetcher = ModelFetcher(self.params)
     self.pm = messaging.PubMaster(["modelManagerSP"])
     self.sm = messaging.SubMaster(["deviceState"])
@@ -136,6 +151,46 @@ class ModelManagerSP:
     self._block_size = 128 * 1000  # 128 KB network read blocks
     self._download_start_times: dict[str, float] = {}  # Track start time per model
     self._download_ref: bytes | str | None = None
+
+  def _decide_default_seed(self) -> None:
+    """once per store: "pending" on a fresh store (the model manager never ran, no model selected), else done"""
+    if self.params.get(DEFAULT_SEED_PARAM) is not None:
+      return
+    fresh = (self.params.get("ModelManager_ModelsCache") is None and self.params.get("ModelManager_ModelsCache_Chestnut") is None
+             and all(self.params.get(key) is None for key in ACTIVE_BUNDLE_KEYS.values()))
+    self.params.put(DEFAULT_SEED_PARAM, "pending" if fresh else "done:existing store", block=True)
+
+  def _finish_default_seed(self, reason: str) -> None:
+    self.params.put(DEFAULT_SEED_PARAM, f"done:{reason}", block=True)
+    cloudlog.info(f"model manager: first-boot model seed done ({reason})")
+
+  def _seed_default_bundle(self) -> None:
+    """one-time request of DEFAULT_SEED_BUNDLE_REF on a fresh store (rules at DEFAULT_SEED_BUNDLE_REF)"""
+    state = self.params.get(DEFAULT_SEED_PARAM)
+    if state not in ("pending", "requested"):
+      return
+    requested = state == "requested"
+    selected = [b for b in (get_selected_bundle(self.params, source) for source in ACTIVE_BUNDLE_KEYS) if b is not None]
+    if selected:
+      ours = requested and any(b.ref == DEFAULT_SEED_BUNDLE_REF for b in selected)
+      self._finish_default_seed("installed" if ours else "model selected")
+      return
+    ref = self.params.get("ModelManager_DownloadRef")
+    if requested:
+      if ref is None:                                        # the download ended (or the device restarted) without an active bundle
+        self._finish_default_seed("download failed, cancelled or interrupted; shipped default kept")
+      return
+    if ref is not None:                                      # someone else asked for a model first
+      self._finish_default_seed("model requested")
+      return
+    if not self.source_models.get("qcom"):                  # the seed bundle is a qcom bundle: wait for that catalog, nothing requested
+      return
+    if resolve_bundle_by_ref(DEFAULT_SEED_BUNDLE_REF, self.source_models) is None:
+      self._finish_default_seed("bundle not in the catalog; shipped default kept")
+      return
+    self.params.put(DEFAULT_SEED_PARAM, "requested", block=True)
+    self.params.put("ModelManager_DownloadRef", DEFAULT_SEED_BUNDLE_REF, block=True)
+    cloudlog.info(f"model manager: first-boot model seed requests {DEFAULT_SEED_BUNDLE_REF}")
 
   def _download_interrupted(self) -> bool:
     # only removal cancels: a different ref is a queued selection that
@@ -378,6 +433,7 @@ class ModelManagerSP:
         self.available_models = self.source_models[ModelFetcher.active_source(self.chestnut_present)]
         validate_active_bundles(self.params, self.source_models)
         self.active_bundle = get_active_bundle(self.params, chestnut=self.chestnut_present)
+        self._seed_default_bundle()
 
         if get_selected_bundle(self.params, "chestnut") is not None and get_selected_bundle(self.params, "qcom") is None:
           if self.params.get("ModelManager_DownloadRef") is None:
