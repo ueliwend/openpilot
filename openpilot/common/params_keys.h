@@ -201,7 +201,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ShowTurnSignals", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"StandstillTimer", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"TrueVEgoUI", {PERSISTENT | BACKUP, BOOL, "1"}},
-    {"UploadRlogs", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"UploadRlogs", {PERSISTENT | BACKUP, BOOL, "1"}},  // on by default since 11 Nov 2026 (owner); filled only when unset: a device with it off stays off
     {"UploadRlogsFromRoute", {PERSISTENT, INT}},
 
     // MADS params

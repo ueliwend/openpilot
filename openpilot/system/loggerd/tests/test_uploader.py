@@ -182,7 +182,8 @@ class TestUploader(UploaderTestCase):
       lock_path = f_path.with_suffix(f_path.suffix + ".lock")
       assert not lock_path.is_file(), "File lock not cleared on startup"
 
-  def test_rlogs_not_uploaded_by_default(self):
+  def test_rlogs_not_uploaded_while_unset(self):
+    # an unset UploadRlogs reads as off (the default "1" is filled in by manager_init, before the uploader starts)
     self.make_file_with_data(self.seg_dir, "qlog", upload_xattr=UPLOAD_ATTR_VALUE)
     self.make_file_with_data(self.seg_dir, "rlog")
     uploader = Uploader("0000000000000000", Paths.log_root())

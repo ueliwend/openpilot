@@ -24,6 +24,7 @@ DEVICE_DEFAULTS = {
   "IsMetric": True, "IsLdwEnabled": True, "RecordFront": True,
   "Mads": True, "MadsUnifiedEngagementMode": True, "MadsMainCruiseAllowed": True, "MadsSteeringMode": 0,
   "LagdToggle": True, "LagdToggleDelay": 0.2, "NeuralNetworkLateralControl": False, "DisengageOnAccelerator": False, "OnroadUploads": True,
+  "UploadRlogs": True,  # owner, 11 Nov 2026: full logs upload by themselves on a fresh install (unmetered networks only)
 }
 
 # a value different from each default (the owner's store must survive a start unchanged)
