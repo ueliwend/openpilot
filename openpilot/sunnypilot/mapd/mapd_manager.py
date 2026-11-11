@@ -20,11 +20,21 @@ from openpilot.sunnypilot.mapd.live_map_data.osm_map_data import OsmMapData
 from openpilot.common.hardware.hw import Paths
 from openpilot.sunnypilot.mapd import MAPD_PATH
 from openpilot.sunnypilot.mapd.mapd_installer import VERSION, update_installed_version
+from openpilot.sunnypilot.mapd.offline_update import PREV, TMP, OfflineMapUpdater, ParamsLink
 
 # PFEIFER - MAPD {{
 params = Params()
 mem_params = Params("/dev/shm/params") if platform.system() != "Darwin" else params
 # }} PFEIFER - MAPD
+_offline_updater: OfflineMapUpdater | None = None
+
+
+def offline_updater() -> OfflineMapUpdater:
+  """Inster: runs map downloads so that a re-download cannot corrupt the stored maps (offline_update.py)."""
+  global _offline_updater
+  if _offline_updater is None:
+    _offline_updater = OfflineMapUpdater(Paths.mapd_root(), ParamsLink(params, mem_params, request_refresh_osm_location_data))
+  return _offline_updater
 
 
 def get_files_for_cleanup() -> list[str]:
@@ -57,9 +67,10 @@ def cleanup_old_osm_data(files_to_remove: list[str]) -> None:
 
 def clear_downloaded_maps() -> None:
   """Deletes downloaded OSM map data and resets params."""
-  path = f"{Paths.mapd_root()}/offline"
-  if os.path.exists(path):
-    shutil.rmtree(path, ignore_errors=True)
+  for sub in ("offline", PREV, TMP):  # Inster: also the moved-aside old copies, their journal and download files
+    path = f"{Paths.mapd_root()}/{sub}"
+    if os.path.exists(path):
+      shutil.rmtree(path, ignore_errors=True)
 
   for param in ("OsmDownloadedDate", "OsmLocal", "OsmLocationName", "OsmLocationTitle",
                 "OsmStateName", "OsmStateTitle"):
@@ -111,12 +122,15 @@ def filter_nations_and_states(nations: list[str], states: list[str] | None = Non
 
 
 def update_osm_db() -> None:
-  if params.get_bool("OsmDbUpdatesCheck"):
+  # Inster: the request goes through the updater, which sends it offroad, one location at a time, after moving the old
+  # tiles aside (request_refresh_osm_location_data is called at the send, and clears OsmDbUpdatesCheck then)
+  if params.get_bool("OsmDbUpdatesCheck") and offline_updater().accepts_request():
     cleanup_old_osm_data(get_files_for_cleanup())
     country = params.get("OsmLocationName", return_default=True)
     state = params.get("OsmStateName", return_default=True)
     filtered_nations, filtered_states = filter_nations_and_states([country], [state])
-    request_refresh_osm_location_data(filtered_nations, filtered_states)
+    offline_updater().request(filtered_nations, filtered_states)
+  offline_updater().step()
 
   if not mem_params.get("OSMDownloadBounds"):
     mem_params.put("OSMDownloadBounds", "", block=True)
@@ -145,7 +159,7 @@ def main_thread():
     show_alert = bool(get_files_for_cleanup() and params.get_bool("OsmLocal"))
     set_offroad_alert("Offroad_OSMUpdateRequired", show_alert, "This alert will be cleared when new maps are downloaded.")
 
-    if params.get("Mapd_ClearCache"):
+    if params.get("Mapd_ClearCache") and offline_updater().ready_for_clear():  # Inster: not while mapd downloads for us
       clear_downloaded_maps()
       params.remove("Mapd_ClearCache")
 
