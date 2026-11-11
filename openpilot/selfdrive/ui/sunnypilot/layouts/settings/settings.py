@@ -17,7 +17,7 @@ from openpilot.selfdrive.ui.sunnypilot.layouts.settings.device import DeviceLayo
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.display import DisplayLayout
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.models import ModelsLayout
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.network import NetworkUISP
-from openpilot.selfdrive.ui.sunnypilot.layouts.settings.osm import OSMLayout
+from openpilot.selfdrive.ui.sunnypilot.layouts.settings.osm_multi import OSMLayoutMulti as OSMLayout  # Inster: several countries (E9)
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.software import SoftwareLayoutSP
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.steering import SteeringLayout
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.sunnylink import SunnylinkLayout

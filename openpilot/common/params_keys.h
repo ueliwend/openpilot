@@ -271,14 +271,18 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"NextMapSpeedLimit", {CLEAR_ON_ONROAD_TRANSITION, JSON}},
     {"Offroad_OSMUpdateRequired", {CLEAR_ON_MANAGER_START, JSON}},
     {"OsmDbUpdatesCheck", {CLEAR_ON_MANAGER_START, BOOL}},  // mapd database update happens with device ON, reset on boot
+    {"OsmDeleteLocation", {CLEAR_ON_MANAGER_START, STRING}},  // Inster: map locations to delete ("CH", "US:CA", "OTHER"), read by mapd_manager
+    {"OsmDownloadRequest", {CLEAR_ON_MANAGER_START, STRING}},  // Inster: "all" or map location ids to download, read by mapd_manager
     {"OSMDownloadBounds", {PERSISTENT, STRING}},
     {"OsmDownloadedDate", {PERSISTENT, STRING, "0.0"}},
     {"OSMDownloadLocations", {PERSISTENT, JSON}},
     {"OSMDownloadProgress", {CLEAR_ON_MANAGER_START, JSON}},
     {"OsmLocal", {PERSISTENT, BOOL}},
     {"OsmLocationName", {PERSISTENT, STRING}},
+    {"OsmLocationStatus", {PERSISTENT, JSON}},  // Inster: per map location state from the tiles on disk, written by mapd_manager only
     {"OsmLocationTitle", {PERSISTENT, STRING}},
     {"OsmLocationUrl", {PERSISTENT, STRING}},
+    {"OsmSelectedLocations", {PERSISTENT | BACKUP, JSON}},  // Inster: the selected map locations (list), the only source of truth
     {"OsmStateName", {PERSISTENT, STRING, "All"}},
     {"OsmStateTitle", {PERSISTENT, STRING}},
     {"OsmWayTest", {PERSISTENT, STRING}},

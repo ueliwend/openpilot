@@ -51,6 +51,9 @@ class FileLink:
   def is_offroad(self):
     return self.world.offroad
 
+  def network(self):
+    return self.world.network
+
 
 class World:
   def __init__(self, monkeypatch, root=None, request_path=None, progress_path=None, link=None):
@@ -63,6 +66,7 @@ class World:
     self.clock = Clock()
     self.server: dict = {}
     self.offroad = True
+    self.network = ("wifi", False)
     self.mapd_alive = True
     self.sent: list = []
     self.events: list = []

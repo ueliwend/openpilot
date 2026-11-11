@@ -20,6 +20,8 @@ from openpilot.sunnypilot.mapd.live_map_data.osm_map_data import OsmMapData
 from openpilot.common.hardware.hw import Paths
 from openpilot.sunnypilot.mapd import MAPD_PATH
 from openpilot.sunnypilot.mapd.mapd_installer import VERSION, update_installed_version
+from openpilot.sunnypilot.mapd.offline_maps import REQUEST_KEY, OfflineMaps
+from openpilot.sunnypilot.mapd.offline_server import TileServer
 from openpilot.sunnypilot.mapd.offline_update import PREV, TMP, OfflineMapUpdater, ParamsLink
 
 # PFEIFER - MAPD {{
@@ -27,6 +29,7 @@ params = Params()
 mem_params = Params("/dev/shm/params") if platform.system() != "Darwin" else params
 # }} PFEIFER - MAPD
 _offline_updater: OfflineMapUpdater | None = None
+_offline_maps: OfflineMaps | None = None
 
 
 def offline_updater() -> OfflineMapUpdater:
@@ -35,6 +38,14 @@ def offline_updater() -> OfflineMapUpdater:
   if _offline_updater is None:
     _offline_updater = OfflineMapUpdater(Paths.mapd_root(), ParamsLink(params, mem_params, request_refresh_osm_location_data))
   return _offline_updater
+
+
+def offline_maps() -> OfflineMaps:
+  """Inster: several map locations at once: selection, requests, deletes, gates, status (offline_maps.py)."""
+  global _offline_maps
+  if _offline_maps is None:
+    _offline_maps = OfflineMaps(params, Paths.mapd_root(), offline_updater(), TileServer())
+  return _offline_maps
 
 
 def get_files_for_cleanup() -> list[str]:
@@ -75,6 +86,7 @@ def clear_downloaded_maps() -> None:
   for param in ("OsmDownloadedDate", "OsmLocal", "OsmLocationName", "OsmLocationTitle",
                 "OsmStateName", "OsmStateTitle"):
     params.remove(param)
+  offline_maps().cleared()  # Inster: size cache, multi-location keys; the country list becomes empty
 
   cloudlog.info("mapd: downloaded maps cleared")
 
@@ -121,16 +133,20 @@ def filter_nations_and_states(nations: list[str], states: list[str] | None = Non
   return nations, states or []
 
 
+def clear_maps_if_requested() -> None:
+  """Mapd_ClearCache: DELETE ALL on the screen, or a remote write through sunnylink (sunnypilot #1971). Inster: waits while
+  mapd downloads for us; entries not yet sent and queued per-country deletes are dropped (offline_maps.ready_for_clear)."""
+  if params.get("Mapd_ClearCache") and offline_maps().ready_for_clear():
+    clear_downloaded_maps()
+    params.remove("Mapd_ClearCache")
+
+
 def update_osm_db() -> None:
-  # Inster: the request goes through the updater, which sends it offroad, one location at a time, after moving the old
-  # tiles aside (request_refresh_osm_location_data is called at the send, and clears OsmDbUpdatesCheck then)
-  if params.get_bool("OsmDbUpdatesCheck") and offline_updater().accepts_request():
+  # Inster: requests (OsmDownloadRequest, OsmDbUpdatesCheck = all) go through offline_maps, which sends them offroad, one
+  # location at a time, after its gates and after moving the old tiles aside (offline_update.py)
+  if params.get_bool("OsmDbUpdatesCheck") or params.get(REQUEST_KEY):
     cleanup_old_osm_data(get_files_for_cleanup())
-    country = params.get("OsmLocationName", return_default=True)
-    state = params.get("OsmStateName", return_default=True)
-    filtered_nations, filtered_states = filter_nations_and_states([country], [state])
-    offline_updater().request(filtered_nations, filtered_states)
-  offline_updater().step()
+  offline_maps().step()
 
   if not mem_params.get("OSMDownloadBounds"):
     mem_params.put("OSMDownloadBounds", "", block=True)
@@ -159,9 +175,7 @@ def main_thread():
     show_alert = bool(get_files_for_cleanup() and params.get_bool("OsmLocal"))
     set_offroad_alert("Offroad_OSMUpdateRequired", show_alert, "This alert will be cleared when new maps are downloaded.")
 
-    if params.get("Mapd_ClearCache") and offline_updater().ready_for_clear():  # Inster: not while mapd downloads for us
-      clear_downloaded_maps()
-      params.remove("Mapd_ClearCache")
+    clear_maps_if_requested()  # Inster: helper (offline_maps)
 
     update_osm_db()
     live_map_sp.tick()

@@ -4,6 +4,10 @@ The binary stores offline map data in 2-degree tiles, one folder per tile: `<map
 A download of a location (nation or US state) fetches every tile of the location's bounding box, row by row:
 latitude rising, then longitude rising (download.go:199-200 at v1.12.0). The bounding boxes are vendored from the
 same version (they are embedded in the binary), so this module knows which tiles a request touches and in which order.
+
+Binary-specific knowledge lives here and in offline_update.py only (tile grid, order, folder and download-file layout,
+tile URL, request format); the selection, storage, status and UI modules use it through the functions below.
+Locations are named by an id: the nation code ("CH") or "US:<state code>" for a US state ("US:CA").
 """
 import json
 import math
@@ -14,6 +18,8 @@ GRID_DEGREES = 2  # GROUP_AREA_BOX_DEGREES, generate_offline.go:48
 BOXES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bounding_boxes")
 BOX_FILES = {"nation": "nation_bounding_boxes.json", "state": "us_states_bounding_boxes.json"}
 BOXES_VERSION = "v1.12.0"  # the mapd version the vendored boxes come from
+TILE_URL = "https://map-data.pfeifer.dev/offline/{lat}/{lon}.tar.gz"  # download.go:201-202
+STATE_PREFIX = "US:"
 
 Tile = tuple[int, int]
 
@@ -63,3 +69,88 @@ def tile_dir(root: str, sub: str, tile: Tile) -> str:
 def tile_archive(root: str, tile: Tile) -> str:
   """The binary's download file for a tile: `<root>/tmp/offline/<lat>/<lon>.tar.gz` (download.go:201-203)."""
   return os.path.join(root, "tmp", "offline", str(tile[0]), f"{tile[1]}.tar.gz")
+
+
+def tile_url(tile: Tile) -> str:
+  return TILE_URL.format(lat=tile[0], lon=tile[1])
+
+
+def parse_tile_key(key: str) -> Tile | None:
+  try:
+    lat, lon = key.split("/")
+    return int(lat), int(lon)
+  except (ValueError, AttributeError):
+    return None
+
+
+# ---- locations (entries of the selection)
+def entry_id(kind: str, code: str) -> str:
+  return f"{STATE_PREFIX}{code}" if kind == "state" else code
+
+
+def parse_entry_id(location_id: str) -> tuple[str, str] | None:
+  """(kind, code) for a known location id, None otherwise."""
+  if not isinstance(location_id, str):
+    return None
+  location_id = location_id.strip()
+  kind, code = ("state", location_id[len(STATE_PREFIX):]) if location_id.startswith(STATE_PREFIX) else ("nation", location_id)
+  return (kind, code) if code in bounding_boxes(kind) else None
+
+
+def location_title(kind: str, code: str) -> str:
+  location = bounding_boxes(kind).get(code)
+  return location["full_name"] if location else code
+
+
+def locations(kind: str) -> list[tuple[str, str]]:
+  """Every location the binary knows, as (code, full name), sorted by name."""
+  return sorted(((code, v["full_name"]) for code, v in bounding_boxes(kind).items()), key=lambda x: x[1])
+
+
+def entry_tiles(location_id: str) -> list[Tile]:
+  parsed = parse_entry_id(location_id)
+  return (tile_order(*parsed) or []) if parsed else []
+
+
+def union_tiles(location_ids) -> set[Tile]:
+  out: set[Tile] = set()
+  for location_id in location_ids:
+    out.update(entry_tiles(location_id))
+  return out
+
+
+def exclusive_tiles(location_id: str, other_ids) -> list[Tile]:
+  """Tiles of a location that no other selected location uses: the ones its delete removes (shared tiles stay)."""
+  others = union_tiles(i for i in other_ids if i != location_id)
+  return [t for t in entry_tiles(location_id) if t not in others]
+
+
+def tiles_on_disk(root: str, sub: str = "offline") -> list[Tile]:
+  """Tile folders `<root>/<sub>/<lat>/<lon>` present on disk (other names are ignored)."""
+  out = []
+  base = os.path.join(root, sub)
+  for lat in os.listdir(base) if os.path.isdir(base) else []:
+    lat_dir = os.path.join(base, lat)
+    for lon in os.listdir(lat_dir) if os.path.isdir(lat_dir) else []:
+      tile = parse_tile_key(f"{lat}/{lon}")
+      if tile is not None and os.path.isdir(os.path.join(lat_dir, lon)):
+        out.append(tile)
+  return sorted(out)
+
+
+def tile_stats(root: str, tile: Tile, sub: str = "offline") -> tuple[int, float] | None:
+  """(bytes, newest file mtime) of a tile folder; None if the folder does not exist."""
+  path = tile_dir(root, sub, tile)
+  try:
+    entries = [e for e in os.scandir(path) if e.is_file(follow_symlinks=False)]
+  except (FileNotFoundError, NotADirectoryError):
+    return None
+  size, newest = 0, 0.0
+  for e in entries:
+    try:
+      st = e.stat()
+    except FileNotFoundError:
+      continue
+    size += st.st_size
+    newest = max(newest, st.st_mtime)
+  return size, newest

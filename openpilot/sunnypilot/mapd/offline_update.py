@@ -28,7 +28,13 @@ file rewritten without growing past its largest size. A stall is no tile advance
 largest size for 10 min. Either way the request is cleared; the entry ends as failed once the binary is idle.
 
 Downloads start only offroad. Design: inster-dev results/2026-11-11_offline_maps_multi_country/DESIGN.md (rev 4),
-sections 4.3-4.5; this is the subset for the single-country "Database Update" (results/2026-11-11_map_redownload_fix).
+sections 4.3-4.5 (results/2026-11-11_map_redownload_fix, results/2026-11-11_offline_maps_patch).
+
+Several locations (E9): the queue holds one entry per location, sent one at a time in order. Before each send a gate
+(offline_maps.py: network, storage, tile server probe) may let it go, make it wait, skip it or stop the run. A location
+whose tiles are all covered by the tiles already sent in this run or by a later entry of the queue is not sent (the
+binary would download the same tiles again); if a covering entry leaves the queue, it is sent at the end of the run.
+After each entry, the tiles it refreshed are reported (on_entry_end), so the status can be judged from disk.
 """
 import json
 import os
@@ -49,6 +55,7 @@ TICK_POLL_SECONDS = 0.05
 TICK_WAIT_SECONDS = 2.0
 
 START, IDLE, QUEUED, RUNNING, DRAINING, RECOVERING = "start", "idle", "queued", "running", "draining", "recovering"
+GO, WAIT, SKIP, STOP = "go", "wait", "skip", "stop"  # gate answers
 
 
 # Filesystem steps that change state. Module level, so the tests can stop the process between any two of them.
@@ -107,6 +114,7 @@ class ParamsLink:
     self._mem_params = mem_params
     self._send = send
     self.request_path = mem_params.get_param_path("OSMDownloadLocations")
+    self._sm = None
 
   def send(self, nations: list[str], states: list[str]) -> None:
     self._send(nations, states)
@@ -127,6 +135,17 @@ class ParamsLink:
   def is_offroad(self) -> bool:
     return self._params.get_bool("IsOffroad")
 
+  def network(self) -> tuple[str, bool] | None:
+    """(network type, metered) from deviceState; None while hardwared has not been heard from."""
+    if self._sm is None:
+      from openpilot.cereal import messaging
+      self._sm = messaging.SubMaster(["deviceState"])
+    self._sm.update(0)
+    if not self._sm.seen["deviceState"]:
+      return None
+    ds = self._sm["deviceState"]
+    return str(ds.networkType), bool(ds.networkMetered)
+
 
 @dataclass
 class Watch:
@@ -139,13 +158,20 @@ class Watch:
 
 
 class OfflineMapUpdater:
-  def __init__(self, root: str, link, monotonic=time.monotonic, sleep=time.sleep):
+  def __init__(self, root: str, link, monotonic=time.monotonic, sleep=time.sleep, gate=None, on_entry_end=None):
     self.root = root
     self.link = link
     self._monotonic = monotonic
     self._sleep = sleep
+    self.gate = gate  # (kind, code, tiles) -> (GO | WAIT | SKIP | STOP, reason); None = always GO
+    self.on_entry_end = on_entry_end  # (kind, code, result, refreshed tile list, tiles attempted) after each entry
     self.state = START
     self.queue: list[tuple[str, str]] = []  # (kind, code), kind "nation" or "state"
+    self.waiting = ""  # why the head of the queue is not sent yet
+    self.run_attempted: set[Tile] = set()  # tiles sent in this run (whatever the result)
+    self.run_refreshed: set[Tile] = set()  # tiles refreshed in this run
+    self._skipped: list[tuple[str, str]] = []  # entries covered by others in this run
+    self._no_skip: set[tuple[str, str]] = set()
     self._watch: Watch | None = None
     self._journal: dict | None = None  # the running request's journal (also on disk)
     self._failure = ""
@@ -179,22 +205,58 @@ class OfflineMapUpdater:
     except FileNotFoundError:
       return "missing"
 
-  # ---- interface for mapd_manager
+  # ---- interface for mapd_manager / offline_maps
   def accepts_request(self) -> bool:
     return self.state == IDLE and not self.queue
 
   def request(self, nations: list[str], states: list[str]) -> None:
     """Queue one entry per location, nations first (the binary's order). Sent one at a time."""
-    self.queue = [("nation", n) for n in nations] + [("state", s) for s in states]
-    if self.queue:
-      if self.state == IDLE:
-        self.state = QUEUED  # otherwise recovery runs first, then the queue
+    entries = [("nation", n) for n in nations] + [("state", s) for s in states]
+    if entries:
+      self.enqueue(entries)
     else:
       self.link.send([], [])  # nothing to download: as before, an empty request (mapd ignores it)
+
+  def enqueue(self, entries: list[tuple[str, str]]) -> None:
+    """Append entries not queued yet (a running run takes them at its end)."""
+    if not self.busy:
+      self.run_attempted, self.run_refreshed = set(), set()
+    for entry in entries:
+      if entry not in self.queue and entry != self.current:
+        self.queue.append(entry)
+        if entry in self._skipped:
+          self._skipped.remove(entry)
+    if self.queue and self.state == IDLE:
+      self.state = QUEUED  # otherwise recovery runs first, then the queue
+
+  def dequeue(self, entry: tuple[str, str]) -> None:
+    """The entry leaves the queue (a delete); an entry already sent runs to its end (the binary has no cancel)."""
+    if entry in self.queue:
+      self.queue.remove(entry)
+    if entry in self._skipped:
+      self._skipped.remove(entry)
+
+  @property
+  def current(self) -> tuple[str, str] | None:
+    """The entry sent to the binary and not yet ended."""
+    if self.state in (RUNNING, DRAINING) and self._journal is not None:
+      return self._journal["kind"], self._journal["code"]
+    return None
+
+  @property
+  def busy(self) -> bool:
+    """A run is active: entries queued, one sent, or covered entries waiting to be judged."""
+    return bool(self.queue or self._skipped) or self.state in (RUNNING, DRAINING)
+
+  def tiles_idle(self) -> bool:
+    """Tile folders may be changed by others (deletes): no request of ours runs and mapd is idle."""
+    return self.state in (IDLE, QUEUED) and self._request_state() == "empty"
 
   def ready_for_clear(self) -> bool:
     """Mapd_ClearCache: allowed once no request of ours runs. Entries not yet sent are dropped at once."""
     self.queue.clear()
+    self._skipped.clear()
+    self._no_skip.clear()
     if self.state in (IDLE, QUEUED):
       self.state = IDLE
       return True
@@ -216,7 +278,7 @@ class OfflineMapUpdater:
       if self._request_state() != "empty":
         return
       self._reconcile_leftovers("recovered after a restart")
-      self.state = QUEUED if self.queue else IDLE
+      self.state = QUEUED if (self.queue or self._skipped) else IDLE
     if self.state == QUEUED:
       self._start_next()
     elif self.state == RUNNING:
@@ -225,14 +287,62 @@ class OfflineMapUpdater:
       if self._request_state() == "empty":
         self._end_request()
 
-  def _start_next(self) -> None:
+  def _covered(self, entry: tuple[str, str], tiles: list[Tile]) -> bool:
+    if not tiles or entry in self._no_skip:
+      return False
+    cover = set(self.run_attempted)
+    for later in self.queue[1:]:
+      cover.update(tile_order(*later) or [])
+    return set(tiles) <= cover
+
+  def _end_of_queue(self) -> None:
+    """Covered entries: sent now if a tile of theirs was not sent after all, otherwise judged from disk."""
+    for entry in list(self._skipped):
+      self._skipped.remove(entry)
+      tiles = tile_order(*entry) or []
+      if not set(tiles) <= self.run_attempted:
+        self._no_skip.add(entry)
+        self.queue.append(entry)
+      elif self.on_entry_end:
+        self.on_entry_end(entry[0], entry[1], "covered by other locations", [t for t in tiles if t in self.run_refreshed], tiles)
     if not self.queue:
+      self._no_skip.clear()
+      self.waiting = ""
       self.state = IDLE
+
+  def _start_next(self) -> None:
+    while self.queue:
+      entry = self.queue[0]
+      if not self._covered(entry, tile_order(*entry) or []):
+        break
+      self._skipped.append(self.queue.pop(0))
+    if not self.queue:
+      self._end_of_queue()
       return
-    if not self.link.is_offroad() or self._request_state() != "empty":
-      return  # onroad, or mapd busy / not seen alive since the request was last removed
+    if not self.link.is_offroad():
+      self.waiting = "onroad"
+      return
+    if self._request_state() != "empty":
+      self.waiting = "mapd"
+      return  # mapd busy / not seen alive since the request was last removed
     kind, code = self.queue[0]
     tiles = tile_order(kind, code) or []
+    if self.gate is not None:
+      answer, reason = self.gate(kind, code, tiles)
+      if answer != GO:
+        self.waiting = reason
+        if answer == SKIP:
+          self.queue.pop(0)
+          self._no_skip.discard((kind, code))
+          if self.on_entry_end:
+            self.on_entry_end(kind, code, reason, [], [])
+        elif answer == STOP:
+          self.queue.clear()
+          self._skipped.clear()
+          self._end_of_queue()
+          self.waiting = reason
+        return
+    self.waiting = ""
     self._reconcile_leftovers("recovered before a new request")
     self._prepare(kind, code, tiles)
     if not self._wait_for_tick():
@@ -244,6 +354,7 @@ class OfflineMapUpdater:
     self.link.remove_progress()
     self.link.send([code] if kind == "nation" else [], [code] if kind == "state" else [])
     self.queue.pop(0)
+    self._no_skip.discard((kind, code))
     self._journal = journal
     self._watch = Watch(last_advance=self._monotonic())
     self._failure = ""
@@ -360,7 +471,7 @@ class OfflineMapUpdater:
     if journal is not None:
       self._finish(journal, self._failure or "done")
     self._watch = self._journal = None
-    self.state = QUEUED if self.queue else IDLE
+    self.state = QUEUED if (self.queue or self._skipped) else IDLE
 
   # ---- decisions from disk (end of a request, crash recovery, undo of an unsent prepare)
   def _finish(self, journal: dict, reason: str, log: bool = True) -> dict:
@@ -377,6 +488,7 @@ class OfflineMapUpdater:
     else:
       finished = [sent] * len(tiles)  # tmp/ gone: mapd reached the end of the location; not sent: it never started
     counts = {"refreshed": 0, "kept_old": 0, "incomplete": 0, "missing": 0, "decided_before": 0}
+    refreshed: list[Tile] = []
     touched = set()
     for i, t in enumerate(tiles):
       new_dir, prev_dir = tile_dir(self.root, OFFLINE, t), tile_dir(self.root, PREV, t)
@@ -388,6 +500,7 @@ class OfflineMapUpdater:
         elif finished[i] and self._new_copy_complete(journal, t):
           _rmtree(prev_dir)
           counts["refreshed"] += 1
+          refreshed.append(t)
         else:
           _rmtree(new_dir)
           _rename(prev_dir, new_dir)
@@ -399,8 +512,11 @@ class OfflineMapUpdater:
         counts["kept_old" if had_old else "missing"] += 1
       elif had_old:
         counts["refreshed" if i in self._released else "decided_before"] += 1  # old copy deleted or put back earlier
+        if i in self._released:
+          refreshed.append(t)
       elif finished[i]:
         counts["refreshed"] += 1
+        refreshed.append(t)
       else:
         counts["incomplete"] += 1  # first download of this tile, cut short: kept, a later update completes it
     for d in touched:
@@ -409,6 +525,11 @@ class OfflineMapUpdater:
     if log:
       cloudlog.event("mapd_offline_update", kind=journal["kind"], code=journal["code"], result=reason,
                      tiles=len(tiles), had_old=len(old), **counts)
+      if sent:
+        self.run_attempted.update(tiles)
+        self.run_refreshed.update(refreshed)
+        if self.on_entry_end:
+          self.on_entry_end(journal["kind"], journal["code"], reason, refreshed, tiles)
     return counts
 
   def _clean_up(self) -> None:

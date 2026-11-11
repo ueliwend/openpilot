@@ -48,6 +48,12 @@ NET_ERROR = "net_error"  # http.Get fails: no network (download.go:50-52)
 NOT_FOUND = "not_found"  # 404: no data on the server for this tile (download.go:57-58)
 
 
+class HttpStatus:
+  """The server answers with this status (e.g. 403): the download fails (download.go:57-58)."""
+  def __init__(self, code: int):
+    self.code = code
+
+
 class Cut:
   """The connection breaks after n bytes of the body (io.Copy error, download.go:62-64)."""
   def __init__(self, body: bytes, n: int):
@@ -151,7 +157,7 @@ class FakeMapd:
       yield ("archive", tile)
       reply = self.server.get(tile, NOT_FOUND)
       self.gets.append(tile)
-      if reply in (NET_ERROR, NOT_FOUND):
+      if reply in (NET_ERROR, NOT_FOUND) or isinstance(reply, HttpStatus):
         yield ("download_failed", tile)
         continue
       body, limit = (reply.body, min(reply.n, len(reply.body))) if isinstance(reply, Cut) else (reply, len(reply))
