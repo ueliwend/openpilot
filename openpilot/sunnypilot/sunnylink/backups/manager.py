@@ -21,7 +21,7 @@ from openpilot.common.version import get_version
 from openpilot.cereal import messaging, custom
 from openpilot.sunnypilot.sunnylink.api import SunnylinkApi
 from openpilot.sunnypilot.sunnylink.backups.utils import decrypt_compressed_data, encrypt_compressed_data, SnakeCaseEncoder
-from openpilot.sunnypilot.sunnylink.utils import get_param_as_byte, save_param_from_base64_encoded_string
+from openpilot.sunnypilot.sunnylink.utils import BLOCKED_PARAMS, get_param_as_byte, save_param_from_base64_encoded_string
 
 
 class OperationType(Enum):
@@ -72,10 +72,15 @@ class BackupManagerSP:
     self.operation = op_type
     self._report_status()
 
+  def _backup_keys(self) -> list[str]:
+    """Params a backup holds and a restore may write: those marked for backup, except the ones sunnylink may never set (BLOCKED_PARAMS)."""
+    keys = [k.decode('utf-8') for k in self.params.all_keys(ParamKeyFlag.BACKUP)]
+    return [k for k in keys if k not in BLOCKED_PARAMS]
+
   def _collect_config_data(self) -> dict[str, Any]:
     """Collects configuration data to be backed up."""
     config_data = {}
-    params_to_backup = [k.decode('utf-8') for k in self.params.all_keys(ParamKeyFlag.BACKUP)]
+    params_to_backup = self._backup_keys()
     for param in params_to_backup:
       value = get_param_as_byte(param)
       if value is not None:
@@ -190,15 +195,19 @@ class BackupManagerSP:
       return False
 
   def _apply_config(self, config_data: dict[str, str]) -> None:
-    """Applies configuration data from a backup, but only for parameters marked as backupable."""
-    backupable_params = [k.decode('utf-8') for k in self.params.all_keys(ParamKeyFlag.BACKUP)]
+    """Applies configuration data from a backup, but only for parameters marked as backupable and never for BLOCKED_PARAMS."""
+    backupable_params = self._backup_keys()
     backupable_set_lower = {p.lower() for p in backupable_params}
+    blocked_set_lower = {p.lower() for p in BLOCKED_PARAMS}
 
     restored_count = 0
     skipped_count = 0
 
     for param, encoded_value in config_data.items():
-      if param.lower() in backupable_set_lower:
+      if param.lower() in blocked_set_lower:
+        skipped_count += 1
+        cloudlog.warning(f"Skipped restoring param {param}: blocked for remote changes")
+      elif param.lower() in backupable_set_lower:
         # Find real param name (with correct casing)
         real_param = next(p for p in backupable_params if p.lower() == param.lower())
         try:

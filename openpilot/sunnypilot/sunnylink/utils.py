@@ -5,6 +5,20 @@ from openpilot.sunnypilot.sunnylink.api import SunnylinkApi, UNREGISTERED_SUNNYL
 from openpilot.common.params import Params, ParamKeyType
 from openpilot.common.version import is_prebuilt
 
+# Parameters that should never be remotely modified: refused by sunnylinkd's saveParams, and never written by a sunnylink
+# settings restore (backups/manager.py) nor included in a backup
+BLOCKED_PARAMS = {
+  "AdbEnabled",
+  "CompletedSunnylinkConsentVersion",
+  "CompletedTrainingVersion",
+  "GithubUsername",  # Could grant SSH access
+  "GithubSshKeys",   # Direct SSH key injection
+  "HasAcceptedTerms",
+  "HasAcceptedTermsSP",
+  "OnroadCycleRequested",      # Prevent remote cycle trigger
+  "ParamsVersion",         # Device-managed version counter
+}
+
 
 def get_sunnylink_status(params=None) -> tuple[bool, bool, bool]:
   """Get the status of Sunnylink on the device. Returns a tuple of (is_sunnylink_enabled, is_registered)."""

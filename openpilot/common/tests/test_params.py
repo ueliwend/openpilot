@@ -1,5 +1,6 @@
 import datetime
 import os
+import re
 import threading
 import time
 import uuid
@@ -113,6 +114,23 @@ class TestParams(OpenpilotTestCase):
     assert len(keys) > 20
     assert len(keys) == len(set(keys))
     assert b"CarParams" in keys
+
+  def test_params_all_keys_by_flag(self):
+    # expected sets read from the key table: {"Key", {FLAG | FLAG, TYPE[, default]}},
+    with open(os.path.join(os.path.dirname(__file__), "..", "params_keys.h")) as f:
+      table = re.findall(r'^\s*\{"(\w+)",\s*\{([A-Z_ |]+),', f.read(), re.MULTILINE)
+    flags = {key.encode(): {name.strip() for name in names.split("|")} for key, names in table}
+    assert set(self.params.all_keys()) == set(flags)
+
+    for flag in (ParamKeyFlag.BACKUP, ParamKeyFlag.PERSISTENT, ParamKeyFlag.CLEAR_ON_MANAGER_START,
+                 ParamKeyFlag.CLEAR_ON_ONROAD_TRANSITION, ParamKeyFlag.CLEAR_ON_OFFROAD_TRANSITION,
+                 ParamKeyFlag.DEVELOPMENT_ONLY, ParamKeyFlag.CLEAR_ON_IGNITION_ON):
+      keys = self.params.all_keys(flag)
+      assert len(keys) == len(set(keys)), flag
+      assert set(keys) == {key for key, names in flags.items() if flag.name in names}, flag
+
+    keys = self.params.all_keys(ParamKeyFlag.CLEAR_ON_ONROAD_TRANSITION | ParamKeyFlag.CLEAR_ON_OFFROAD_TRANSITION)
+    assert set(keys) == {key for key, names in flags.items() if names & {"CLEAR_ON_ONROAD_TRANSITION", "CLEAR_ON_OFFROAD_TRANSITION"}}
 
   def test_params_default_value(self):
     self.params.remove("LanguageSetting")

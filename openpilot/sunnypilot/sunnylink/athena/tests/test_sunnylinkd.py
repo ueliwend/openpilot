@@ -4,7 +4,9 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
+from openpilot.sunnypilot.sunnylink import utils
 from openpilot.sunnypilot.sunnylink.athena import sunnylinkd
+from openpilot.sunnypilot.sunnylink.backups import manager
 from openpilot.common.test import OpenpilotTestCase
 
 
@@ -30,6 +32,12 @@ class TestSunnylinkdMethods(OpenpilotTestCase):
 
     sunnylinkd.saveParams(blocked_params)
 
+    assert len(self.saved_params) == 0
+
+  def test_blocked_params_shared_with_backup_restore(self):
+    # one list for remote saveParams and the settings backup / restore (sunnypilot/sunnylink/backups/manager.py)
+    assert sunnylinkd.BLOCKED_PARAMS is utils.BLOCKED_PARAMS is manager.BLOCKED_PARAMS
+    sunnylinkd.saveParams(dict.fromkeys(utils.BLOCKED_PARAMS, "MQ=="))
     assert len(self.saved_params) == 0
 
   def test_saveParams_allowed(self):

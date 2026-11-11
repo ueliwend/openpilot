@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <exception>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -160,14 +161,22 @@ ParamsBuffer params_key_at(ParamsHandle *handle, size_t index) noexcept {
   });
 }
 
+// The buffers point into handle->keys, which lives as long as the handle. return_string() keeps only one string per
+// thread, so it cannot hand out several strings at once (every entry would point at the same, last-written buffer).
 size_t params_keys_by_flag(ParamsHandle *handle, uint32_t flag, ParamsBuffer *out, size_t out_size) noexcept {
   return translate_exceptions(size_t{0}, [&]() {
     auto filtered = handle->params.allKeys(static_cast<ParamKeyFlag>(flag));
-    size_t count = std::min(filtered.size(), out_size);
-    for (size_t i = 0; i < count; i++) {
-      out[i] = return_string(filtered[i]);
+    const std::unordered_set<std::string> selected(filtered.begin(), filtered.end());
+    size_t count = 0;
+    for (const auto &key : handle->keys) {
+      if (selected.count(key) != 0) {
+        if (count < out_size) {
+          out[count] = ParamsBuffer{key.data(), key.size()};
+        }
+        count++;
+      }
     }
-    return filtered.size();
+    return count;
   });
 }
 
