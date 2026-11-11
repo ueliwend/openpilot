@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import re
+import json
 import datetime
 import subprocess
 import shutil
@@ -66,8 +67,154 @@ def write_time_to_param(params, param) -> None:
   t = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
   params.put(param, t, block=True)
 
+class ProcessState:
+  """What only this updated process knows. Never read from disk, so every new process starts with all of it unset."""
+  overlay_built = False   # this process built the staging overlay itself and has no reason to distrust it
+  in_command = False      # run() is between starting a command and having seen it end
+  stop_requested = False  # SIGINT arrived during a command; run() ends the command and then raises KeyboardInterrupt
+
+# Stopping. The manager sends SIGINT to this process only and kills it with SIGKILL 5 seconds later
+# (system/manager/process.py), so everything here has to be over well before that.
+STOP_POLL = 0.1       # s, how often a running command looks for a stop request
+STOP_TERM_WAIT = 2.5  # s, for the command's process group to end after SIGTERM (git removes its lock files on SIGTERM)
+STOP_KILL_WAIT = 0.5  # s, for it to be gone after SIGKILL
+
+def request_stop(signum: int, frame) -> None:
+  """SIGINT handler. Outside a command it is Python's own behaviour (KeyboardInterrupt, here and now). During a
+  command the interrupt is held back until run() has ended the command's process group, so that no command is
+  ever left behind half-started or killed while it holds a lock."""
+  if ProcessState.in_command:
+    ProcessState.stop_requested = True
+  else:
+    raise KeyboardInterrupt
+
+def mark_overlay_for_rebuild() -> None:
+  # the same mark as after a failed attempt (main loop): the next init_overlay() builds a new staging area
+  ProcessState.overlay_built = False
+  OVERLAY_INIT.unlink(missing_ok=True)
+
+def end_command(proc: subprocess.Popen, own_group: bool) -> None:
+  """End a running command and everything it started: SIGTERM to its process group, a bounded wait, SIGKILL only
+  if it is still there. A sudo command gets the signal itself: where sudo accepts it, it passes SIGTERM on to its
+  command; where it refuses (EPERM), the command gets the same bounded wait and is then left to finish by itself.
+  Whatever had to be killed or left behind may have stopped half-way, so the staging area is then marked for rebuild."""
+  def send(sig: int) -> None:
+    try:
+      if own_group:
+        os.killpg(proc.pid, sig)  # proc is not reaped yet (see run()), so its pid still names its own process group
+      else:
+        proc.send_signal(sig)
+    except (ProcessLookupError, PermissionError):
+      pass
+
+  def ended(timeout: float) -> bool:
+    try:
+      proc.communicate(timeout=timeout)  # waits for the output pipe to close too, i.e. for the command's children
+      return True
+    except subprocess.TimeoutExpired:
+      return False
+
+  send(signal.SIGTERM)
+  if not ended(STOP_TERM_WAIT):
+    send(signal.SIGKILL)
+    gone = ended(STOP_KILL_WAIT)
+    mark_overlay_for_rebuild()
+    cloudlog.error(f"stopping: {proc.args} did not end on SIGTERM, {'killed' if gone else 'still running'}; staging area marked for rebuild")
+
 def run(cmd: list[str], cwd: str | None = None) -> str:
-  return subprocess.check_output(cmd, cwd=cwd, stderr=subprocess.STDOUT, encoding='utf8')
+  """subprocess.check_output() with a clean stop, see request_stop() and end_command()."""
+  # Own session: one signal reaches the command and all its children, and git can never wait for input on a
+  # terminal. sudo commands are started exactly as before; sudo passes a signal on to its command (see end_command).
+  own_group = cmd[0] != "sudo"
+  proc = None
+  ProcessState.in_command = True
+  try:
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding='utf8', start_new_session=own_group)
+    while True:
+      try:
+        output, _ = proc.communicate(timeout=STOP_POLL)
+        break
+      except subprocess.TimeoutExpired:
+        if ProcessState.stop_requested:
+          raise KeyboardInterrupt from None
+  except BaseException:
+    # not reaped yet: the command is still running, or it has exited and something it started still holds its output
+    if proc is not None and proc.returncode is None:
+      end_command(proc, own_group)
+    raise
+  finally:
+    ProcessState.in_command = False
+    if ProcessState.stop_requested:  # also when the request came just as the command ended
+      raise KeyboardInterrupt
+
+  if proc.returncode:
+    raise subprocess.CalledProcessError(proc.returncode, cmd, output=output)
+  return output
+
+
+# The last failure, kept in the persistent param UpdaterLastFailure (and with it in the initData of every drive).
+FAILURE_RECORD_MAX_BYTES = 1024  # stored size of the whole record
+FAILURE_SECRETS = [  # (pattern, replacement); nothing that could be a credential may reach the record
+  (re.compile(r'(\b[a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s@]+@'), r'\1'),                                  # user:password@ in a URL
+  (re.compile(r'\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_\w{16,})'), '<removed>'),                 # GitHub tokens
+  (re.compile(r'\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}'), '<removed>'),                               # JSON web tokens
+  (re.compile(r'(?i)\b((?:proxy-)?authorization:\s*)\S+(?:[ \t]+\S+)?'), r'\1<removed>'),           # HTTP auth headers
+]
+
+def strip_secrets(text: str) -> str:
+  for pattern, replacement in FAILURE_SECRETS:
+    text = pattern.sub(replacement, text)
+  return text
+
+def failure_reason(output: str) -> str:
+  """One line that says why: git's first "fatal:" / "error:" line (what follows it is consequence), else the last line."""
+  lines = [line.strip() for line in output.splitlines() if line.strip()]
+  verdicts = [line for line in lines if line.lower().startswith(("fatal:", "error:"))]
+  reason = verdicts[0] if verdicts else (lines[-1] if lines else "")
+  return re.sub(r'^(fatal|error):\s*', '', reason, flags=re.IGNORECASE)
+
+def failure_record(stage: str, e: Exception) -> dict:
+  """The record of one failed step: time (UTC), stage, command, exit code, short reason, last lines of the output."""
+  if isinstance(e, subprocess.CalledProcessError):
+    cmd = e.cmd if isinstance(e.cmd, str) else ' '.join(map(str, e.cmd))
+    output = strip_secrets(e.output if isinstance(e.output, str) else "").strip()
+    rc, reason = e.returncode, failure_reason(output) or f"exit code {e.returncode}"
+  else:
+    cmd, output, rc, reason = "", "", None, strip_secrets(f"{type(e).__name__}: {e}")
+  return {
+    "time": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "stage": stage,
+    "cmd": strip_secrets(cmd)[:200],
+    "rc": rc,
+    "reason": reason[:160],
+    "output": output,
+  }
+
+def with_retry_outcome(first: dict, retry: dict | None) -> dict:
+  """The first failure stays as it is; of the immediate retry only the outcome is added."""
+  if retry is None:
+    return {**first, "retry": "ok"}
+  return {**first, "retry": "failed", "retry_stage": retry["stage"], "retry_cmd": retry["cmd"][:120], "retry_reason": retry["reason"]}
+
+def fit_failure_record(record: dict) -> dict:
+  """Cut the record to FAILURE_RECORD_MAX_BYTES as it is stored (JSON): the output keeps its last lines, the other
+  texts their beginning."""
+  def excess() -> int:
+    return len(json.dumps(record)) - FAILURE_RECORD_MAX_BYTES
+
+  def surplus() -> int:  # characters to drop next: one character is at most 12 bytes in JSON
+    return -(-excess() // 12)
+
+  output = record["output"]
+  record["output"] = output[-FAILURE_RECORD_MAX_BYTES:]  # more than this can never fit
+  while excess() > 0 and record["output"]:
+    record["output"] = record["output"][surplus():]
+  if len(record["output"]) < len(output):
+    record["output"] = record["output"].partition("\n")[2] or record["output"]  # start on a whole line
+  for key in ("retry_cmd", "cmd", "retry_reason", "reason"):  # only when dropping all of the output was not enough
+    while excess() > 0 and record.get(key):
+      record[key] = record[key][:-surplus()]
+  return record
 
 
 def set_consistent_flag(consistent: bool) -> None:
@@ -124,8 +271,9 @@ def dismount_overlay() -> None:
 
 def init_overlay() -> None:
 
-  # Re-create the overlay if BASEDIR/.git has changed since we created the overlay
-  if OVERLAY_INIT.is_file() and os.path.ismount(OVERLAY_MERGED):
+  # Re-create the overlay if BASEDIR/.git has changed since we created the overlay,
+  # and always if another updated process created it (it may have been stopped in the middle of anything)
+  if ProcessState.overlay_built and OVERLAY_INIT.is_file() and os.path.ismount(OVERLAY_MERGED):
     git_dir_path = os.path.join(BASEDIR, ".git")
     new_files = run(["find", git_dir_path, "-newer", str(OVERLAY_INIT)])
     if not len(new_files.splitlines()):
@@ -135,6 +283,7 @@ def init_overlay() -> None:
       cloudlog.info(".git directory changed, recreating overlay")
 
   cloudlog.info("preparing new safe staging area")
+  ProcessState.overlay_built = False
 
   params = Params()
   params.put_bool("UpdateAvailable", False, block=True)
@@ -170,6 +319,7 @@ def init_overlay() -> None:
   git_diff = run(["git", "diff", "--submodule=diff"], OVERLAY_MERGED)
   params.put("GitDiff", git_diff, block=True)
   cloudlog.info(f"git diff output:\n{git_diff}")
+  ProcessState.overlay_built = True
 
 
 def finalize_update() -> None:
@@ -220,6 +370,8 @@ class Updater:
     self.params = Params()
     self.branches = defaultdict(str)
     self._has_internet: bool = False
+    self.stage = "staging"  # what the current attempt is doing: staging | check | download | finalize
+    self._first_failure: dict | None = None  # set while the immediate retry of a failed download runs
 
   @property
   def has_internet(self) -> bool:
@@ -359,10 +511,10 @@ class Updater:
 
   def fetch_update(self) -> None:
     cloudlog.info("attempting git fetch inside staging overlay")
+    self.stage = "download"
 
     self.params.put("UpdaterState", "downloading...", block=True)
 
-    # TODO: cleanly interrupt this and invalidate old update
     set_consistent_flag(False)
     self.params.put_bool("UpdateAvailable", False, block=True)
 
@@ -370,8 +522,11 @@ class Updater:
 
     run(["git", "config", "--replace-all", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], OVERLAY_MERGED)
 
+    # Only the branch itself: without the flag git also fetches, for every commit new to this repository, the
+    # commits its submodule pointers name, and fails if a single one of them is not on the submodule's remote.
+    # The submodule commits of the target are fetched by "git submodule update" below.
     branch = self.target_branch
-    git_fetch_output = run(["git", "fetch", "origin", branch], OVERLAY_MERGED)
+    git_fetch_output = run(["git", "fetch", "--no-recurse-submodules", "origin", branch], OVERLAY_MERGED)
     cloudlog.info("git fetch success: %s", git_fetch_output)
 
     cloudlog.info("git reset in progress")
@@ -392,9 +547,45 @@ class Updater:
       handle_agnos_update()
 
     # Create the finalized, ready-to-swap update
+    self.stage = "finalize"
     self.params.put("UpdaterState", "finalizing update...", block=True)
     finalize_update()
     cloudlog.info("finalize success!")
+
+  def fetch_update_retry_once(self) -> None:
+    """fetch_update(); if it fails, once more at once on a rebuilt staging area. A second failure goes to the
+    caller like any other (counted, then the 5-minute wait): this never loops."""
+    try:
+      self.fetch_update()
+      return
+    except Exception as e:
+      self._first_failure = self.record_failure(e)  # stored now, so that it is kept if the retry is cut short
+      cloudlog.event("update download failed, trying once more on a rebuilt staging area", error=True, failure=self._first_failure)
+
+    self.stage = "staging"
+    OVERLAY_INIT.unlink(missing_ok=True)
+    init_overlay()
+    self.fetch_update()
+
+    record, self._first_failure = with_retry_outcome(self._first_failure, None), None
+    self.store_failure(record)
+
+  def record_failure(self, e: Exception) -> dict:
+    """Keep what failed in UpdaterLastFailure. The failure of an immediate retry does not replace the first
+    failure; its outcome is added to it."""
+    record = failure_record(self.stage, e)
+    if self._first_failure is not None:
+      record, self._first_failure = with_retry_outcome(self._first_failure, record), None
+    self.store_failure(record)
+    return record
+
+  def store_failure(self, record: dict) -> None:
+    """The only writer of UpdaterLastFailure, and nothing clears it: a record stays until the next failure replaces
+    it. A record that cannot be written is logged; it never changes what the updater does next."""
+    try:
+      self.params.put("UpdaterLastFailure", fit_failure_record(record), block=True)
+    except Exception:
+      cloudlog.exception("failed to store the update failure")
 
 
 def main() -> None:
@@ -421,6 +612,7 @@ def main() -> None:
     updater = Updater()
     update_failed_count = 0 # TODO: Load from param?
     wait_helper = WaitTimeHelper()
+    signal.signal(signal.SIGINT, request_stop)
 
     # invalidate old finalized update
     set_consistent_flag(False)
@@ -435,11 +627,14 @@ def main() -> None:
 
       # Attempt an update
       exception = None
+      failure = None
+      failed_count_before = update_failed_count
       try:
-        # TODO: reuse overlay from previous updated instance if it looks clean
+        updater.stage = "staging"
         init_overlay()
 
         # ensure we have some params written soon after startup
+        updater.stage = "check"
         updater.set_params(False, update_failed_count, exception)
 
         if not system_time_valid() or first_run:
@@ -462,7 +657,7 @@ def main() -> None:
         elif wait_helper.user_request == UserRequest.CHECK:
           cloudlog.info("skipping fetch, only checking")
         else:
-          updater.fetch_update()
+          updater.fetch_update_retry_once()
           write_time_to_param(params, "UpdaterLastFetchTime")
         update_failed_count = 0
       except subprocess.CalledProcessError as e:
@@ -474,10 +669,21 @@ def main() -> None:
         )
         exception = f"command failed: {e.cmd}\n{e.output}"
         OVERLAY_INIT.unlink(missing_ok=True)
+        failure = e
       except Exception as e:
         cloudlog.exception("uncaught updated exception, shouldn't happen")
         exception = str(e)
         OVERLAY_INIT.unlink(missing_ok=True)
+        failure = e
+
+      if failure is not None:
+        # every failure counts, also one before this attempt was counted above (init_overlay, the first set_params):
+        # with the count left at 0 it would be reported as a successful check and retried 1.5 hours later
+        update_failed_count = failed_count_before + 1
+        try:
+          updater.record_failure(failure)
+        except Exception:
+          cloudlog.exception("failed to store the update failure")
 
       try:
         params.put("UpdaterState", "idle", block=True)

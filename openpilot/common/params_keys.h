@@ -203,6 +203,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"TrueVEgoUI", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"UploadRlogs", {PERSISTENT | BACKUP, BOOL, "1"}},  // on by default since 11 Nov 2026 (owner); filled only when unset: a device with it off stays off
     {"UploadRlogsFromRoute", {PERSISTENT, INT}},
+    {"UpdaterLastFailure", {PERSISTENT, JSON}},  // the updater's last failure (system/updated/updated.py); kept across boots, replaced by the next failure; not in backups
 
     // MADS params
     {"Mads", {PERSISTENT | BACKUP, BOOL, "1"}},

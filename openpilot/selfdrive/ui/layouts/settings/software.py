@@ -25,6 +25,29 @@ STATE_TO_DISPLAY_TEXT = {
 }
 
 
+def update_failure_text(failure) -> tuple[str, str]:
+  """Download row after a failed attempt, from the updater's stored record (param UpdaterLastFailure):
+  the row's value ("check failed" or "download failed" by the stage, with the short reason) and the full record
+  as the text that opens when the row is tapped."""
+  if not isinstance(failure, dict) or not failure.get("stage"):
+    return tr("failed to check for update"), ""
+
+  what = tr("download failed") if failure["stage"] in ("download", "finalize") else tr("check failed")
+  reason = str(failure.get("reason") or "")
+  lines = [f"{what} ({failure['stage']}), {str(failure.get('time') or '').replace('T', ' ').replace('Z', ' UTC')}"]
+  if failure.get("cmd"):
+    lines.append(f"{failure['cmd']} (exit code {failure.get('rc')})")
+  lines += str(failure.get("output") or reason).splitlines()
+  if failure.get("retry") == "ok":
+    lines.append("immediate retry: ok")
+  elif failure.get("retry"):
+    lines.append(f"immediate retry: failed ({failure.get('retry_stage')}): {failure.get('retry_cmd') or ''}")
+    lines.append(str(failure.get("retry_reason") or ""))
+  # the description is rendered as HTML: keep the text free of tags, one line each
+  details = "<br>".join(line.replace("<", "(").replace(">", ")") for line in lines if line.strip())
+  return (f"{what}: {reason}" if reason else what), details
+
+
 def time_ago(date: datetime.datetime | None) -> str:
   if not date:
     return tr("never")
@@ -106,6 +129,7 @@ class SoftwareLayout(Widget):
     fetch_available = ui_state.params.get_bool("UpdaterFetchAvailable")
     update_available = ui_state.params.get_bool("UpdateAvailable")
 
+    failure_details = ""
     if updater_state != "idle":
       # Updater responded
       self._waiting_for_updater = False
@@ -115,7 +139,8 @@ class SoftwareLayout(Widget):
       self._download_btn.action_item.set_value(display_text)
     else:
       if failed_count > 0:
-        self._download_btn.action_item.set_value(tr("failed to check for update"))
+        failure_value, failure_details = update_failure_text(ui_state.params.get("UpdaterLastFailure"))
+        self._download_btn.action_item.set_value(failure_value)
         self._download_btn.action_item.set_text(tr("CHECK"))
       elif fetch_available:
         self._download_btn.action_item.set_value(tr("update available"))
@@ -136,6 +161,8 @@ class SoftwareLayout(Widget):
       # Only enable if we're not waiting for updater to flip out of idle
       self._download_btn.action_item.set_enabled(not self._waiting_for_updater)
 
+    self._set_download_details(failure_details)
+
     # Update target branch button value
     current_branch = ui_state.params.get("UpdaterTargetBranch") or ""
     self._branch_btn.action_item.set_value(current_branch)
@@ -152,6 +179,12 @@ class SoftwareLayout(Widget):
       self._install_btn.action_item.set_enabled(True)
     else:
       self._install_btn.set_visible(False)
+
+  def _set_download_details(self, details: str):
+    # The text that opens when the Download row is tapped: what failed, and only while the row says that it failed.
+    if not details and self._download_btn.description_visible:
+      self._download_btn._set_description_visible(False)  # close it while there still is a text to close
+    self._download_btn.set_description(details)
 
   def _on_download_update(self):
     # Check if we should start checking or start downloading
