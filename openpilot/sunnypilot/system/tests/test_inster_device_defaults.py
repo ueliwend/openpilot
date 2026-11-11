@@ -24,7 +24,6 @@ DEVICE_DEFAULTS = {
   "IsMetric": True, "IsLdwEnabled": True, "RecordFront": True,
   "Mads": True, "MadsUnifiedEngagementMode": True, "MadsMainCruiseAllowed": True, "MadsSteeringMode": 0,
   "LagdToggle": True, "LagdToggleDelay": 0.2, "NeuralNetworkLateralControl": False, "DisengageOnAccelerator": False, "OnroadUploads": True,
-  "UploadRlogs": True,  # owner, 11 Nov 2026: full logs upload by themselves on a fresh install (unmetered networks only)
   # owner, 11 Nov 2026 (the three settings changed on the device after the reinstall; initData of the 11 Nov 09:27 drive): once the blind-spot
   # monitor has seen a vehicle, a timed lane change starts 1 s after it clears (later than the set time in Nudgeless / 0.5 s / 1 s, possibly
   # earlier in 2 s / 3 s); mobile data is not treated as metered and may roam (both without effect without a SIM)
