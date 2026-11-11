@@ -25,6 +25,10 @@ DEVICE_DEFAULTS = {
   "Mads": True, "MadsUnifiedEngagementMode": True, "MadsMainCruiseAllowed": True, "MadsSteeringMode": 0,
   "LagdToggle": True, "LagdToggleDelay": 0.2, "NeuralNetworkLateralControl": False, "DisengageOnAccelerator": False, "OnroadUploads": True,
   "UploadRlogs": True,  # owner, 11 Nov 2026: full logs upload by themselves on a fresh install (unmetered networks only)
+  # owner, 11 Nov 2026 (the three settings changed on the device after the reinstall; initData of the 11 Nov 09:27 drive): once the blind-spot
+  # monitor has seen a vehicle, a timed lane change starts 1 s after it clears (later than the set time in Nudgeless / 0.5 s / 1 s, possibly
+  # earlier in 2 s / 3 s); mobile data is not treated as metered and may roam (both without effect without a SIM)
+  "AutoLaneChangeBsmDelay": True, "GsmMetered": False, "GsmRoaming": True,
 }
 
 # a value different from each default (the owner's store must survive a start unchanged)
@@ -68,10 +72,11 @@ class TestInsterDeviceDefaults(OpenpilotTestCase):
       assert params.get(k) == v, (k, params.get(k), v)
 
   def test_store_without_the_new_default_keys(self):
-    # the 5 keys that had no default before become 1 on a store that never set them; every value the store holds stays
+    # the keys that had no default before (5 on 10 Nov 2026, GsmRoaming on 11 Nov 2026) become 1 on a store that never set them;
+    # every value the store holds stays
     params = Params()
     params.put("OnroadScreenOffBrightnessMigrated", "1.0", block=True)
-    new_keys = ("EnforceTorqueControl", "LiveTorqueParamsToggle", "IsMetric", "IsLdwEnabled", "RecordFront")
+    new_keys = ("EnforceTorqueControl", "LiveTorqueParamsToggle", "IsMetric", "IsLdwEnabled", "RecordFront", "GsmRoaming")
     for k, v in OTHER.items():
       if k not in new_keys:
         params.put(k, v, block=True)

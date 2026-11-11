@@ -50,8 +50,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"GithubUsername", {PERSISTENT | BACKUP, STRING}},
     {"GitRemote", {PERSISTENT, STRING}},
     {"GsmApn", {PERSISTENT | BACKUP, STRING}},
-    {"GsmMetered", {PERSISTENT | BACKUP, BOOL, "1"}},
-    {"GsmRoaming", {PERSISTENT | BACKUP, BOOL}},
+    {"GsmMetered", {PERSISTENT | BACKUP, BOOL, "0"}},  // off by default since 11 Nov 2026 (owner); filled only when unset: a device with it on stays on
+    {"GsmRoaming", {PERSISTENT | BACKUP, BOOL, "1"}},  // on by default since 11 Nov 2026 (owner; no default before); filled only when unset: a device with it off stays off
     {"HardwareSerial", {PERSISTENT, STRING}},
     {"HasAcceptedTerms", {PERSISTENT, STRING, "0"}},
     {"InstallDate", {PERSISTENT, TIME}},
@@ -151,7 +151,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // --- sunnypilot params --- //
     {"AccelBoostSP", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"ApiCache_DriveStats", {PERSISTENT, JSON}},
-    {"AutoLaneChangeBsmDelay", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"AutoLaneChangeBsmDelay", {PERSISTENT | BACKUP, BOOL, "1"}},  // on by default since 11 Nov 2026 (owner); filled only when unset: a device with it off stays off
     {"AutoLaneChangeTimer", {PERSISTENT | BACKUP, INT, "0"}},
     {"BlinkerLateralReengageDelay", {PERSISTENT | BACKUP, INT, "0"}},  // seconds
     {"BlinkerMinLateralControlSpeed", {PERSISTENT | BACKUP, INT, "20"}},  // MPH or km/h
