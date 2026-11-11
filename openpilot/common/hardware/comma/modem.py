@@ -3,6 +3,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import select
 import signal
 import string
@@ -18,6 +19,7 @@ from ipaddress import IPv4Address, AddressValueError
 from enum import Enum
 
 from openpilot.common.esim.base import WEBBING_ICCID_PREFIX
+from openpilot.common.swaglog import cloudlog
 
 logging.basicConfig(
   level=logging.INFO,
@@ -44,6 +46,15 @@ NETWORK_TYPE = {0: "gsm", 1: "gsm", 3: "gsm", 8: "gsm",
                 2: "utran", 4: "utran", 5: "utran", 6: "utran",
                 7: "lte", 9: "lte", 10: "lte",
                 11: "nr", 12: "nr", 13: "nr"}
+# +CPIN: <code> (3GPP TS 27.007) -> SIM state in the modem_status event; any other code is "other"
+CPIN = {"READY": "ready", "SIM PIN": "pin_required", "SIM PUK": "puk_required"}
+# eUICC ISD-R applet, same value as openpilot.common.esim.lpa.ISDR_AID (not imported: the daemon stays free of the LPA stack)
+ISDR_AID = "A0000005591010FFFFFFFF8900000100"
+# modem_status logs the firmware version only if the whole reply line has this form, else "" (an unsolicited +CREG / +CGREG
+# report read in place of the AT+GMR reply would otherwise carry LAC / TAC and cell id)
+VERSION_FORMAT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
+# modem_status is repeated once per drive this long after going onroad: loggerd (onroad only) is recording by then
+ONROAD_REPEAT_DELAY = 10.0
 
 DIAL_CID = 1
 
@@ -217,6 +228,13 @@ class Modem:
     self._roaming_allowed = True
     self.running = True
     self.S = INITIAL_STATE.copy()
+    # modem_status event (see _log_identity / _log_registration); _identity_seen keeps the last identity read in memory only
+    self._identity_seen: tuple | None = None
+    self._sim_status: dict = {}
+    self._probe_pending = False  # the last SIM probe found AT_LOCK busy: retried at the next trigger
+    self._reg_status = {"registration": "unknown", "data_registration": "unknown", "technology": "unknown"}
+    self._onroad_since: float | None = None
+    self._onroad_logged = False
 
   @staticmethod
   def _read_param(key):
@@ -250,14 +268,29 @@ class Modem:
     os.chmod(f.name, 0o644)
     os.replace(f.name, STATE_PATH)
 
-  def _at(self, cmd):
-    """Send AT command, return response lines. [] on error or if LPA holds port."""
+  @contextmanager
+  def _at_lock(self):
+    """Hold AT_LOCK (shared with the LPA and qcomgpsd) without waiting; yields False if another process holds it."""
     fd = os.open(AT_LOCK, os.O_CREAT | os.O_RDWR, 0o666)
     try:
       fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+      locked = True
     except OSError:
+      locked = False
+    try:
+      yield locked
+    finally:
+      if locked:
+        fcntl.flock(fd, fcntl.LOCK_UN)
       os.close(fd)
-      return []
+
+  def _at(self, cmd):
+    """Send AT command, return response lines. [] on error or if LPA holds port."""
+    with self._at_lock() as locked:
+      return (self._at_send(cmd) or []) if locked else []
+
+  def _at_send(self, cmd) -> list[str] | None:
+    """Send AT command without taking AT_LOCK (the caller holds it); response lines, None on error."""
     try:
       with _serial_port(AT_PORT, 9600) as serial_fd:
         termios.tcflush(serial_fd, termios.TCIFLUSH)
@@ -280,10 +313,7 @@ class Modem:
         return lines
     except (RuntimeError, TimeoutError, OSError) as e:
       logging.info(f"AT {cmd} failed: {e}")
-      return []
-    finally:
-      fcntl.flock(fd, fcntl.LOCK_UN)
-      os.close(fd)
+      return None
 
   def _atv(self, cmd, pfx):
     for line in self._at(cmd):
@@ -329,6 +359,7 @@ class Modem:
       return State.INITIALIZING
 
     identity = self._read_identity()
+    self._log_identity(identity)
     if not identity["iccid"] or not identity["imei"]:
       logging.warning(f"identity read incomplete: {identity}, retrying")
       return State.INITIALIZING
@@ -347,9 +378,8 @@ class Modem:
     return State.SEARCHING
 
   def _read_identity(self):
-    def first_line(cmd):
-      r = self._at(cmd)
-      return r[0].strip() if r else ""
+    def first_line(cmd):  # the first reply line that is not an unsolicited report (+CREG: ..., +QSIMSTAT: ...)
+      return next((line.strip() for line in self._at(cmd) if not line.startswith("+")), "")
 
     imei = first_line("AT+CGSN")
     if not (imei.isdigit() and 14 <= len(imei) <= 17):  # 3GPP TS 23.003
@@ -367,6 +397,138 @@ class Modem:
     logging.info(f"imei={imei} iccid={iccid} mcc_mnc={mcc_mnc} ver={modem_version}")
     return {"imei": imei, "iccid": iccid, "mcc_mnc": mcc_mnc, "modem_version": modem_version}
 
+  # modem_status: a cloudlog event (error level, so it reaches qlogs as errorLogMessage, and rlogs) at each new identity read,
+  # each registration change and once per drive after going onroad. It holds only booleans, values from the fixed tables
+  # above, the SIM's home network code (first 5 IMSI digits: MCC + 2 MNC digits) and the firmware version if it matches
+  # VERSION_FORMAT. Never the IMEI, the card id (ICCID), the rest of the IMSI, a phone number or a location: the LAC / TAC
+  # and cell id fields of +CREG / +CGREG replies and reports are never stored.
+
+  @staticmethod
+  def _clean_version(raw: str, imei: str, iccid: str) -> str:
+    """The AT+GMR line as it is if it is a plain version string, else "": no character stripping, no run of 8 digits, not
+    containing the IMEI or card id."""
+    if not VERSION_FORMAT.fullmatch(raw) or re.search(r"[0-9]{8}", raw):
+      return ""
+    if any(len(x) >= 6 and x in raw for x in (imei, iccid)):
+      return ""
+    return raw
+
+  def _log_identity(self, identity: dict):
+    """Once at the first identity read the modem answers, then whenever the result changes (SIM inserted, removed, swapped),
+    and when a SIM probe that found AT_LOCK busy succeeds at a later read."""
+    try:
+      if not (identity["imei"] or identity["modem_version"]):
+        return  # the modem did not answer (or the LPA holds the port); the read is retried
+      iccid = identity["iccid"]
+      version = self._clean_version(identity["modem_version"], identity["imei"], iccid)
+      seen = (identity["imei"], iccid, identity["mcc_mnc"], version)
+      new = seen != self._identity_seen
+      if not new and not self._probe_pending:
+        return
+      self._identity_seen = seen
+      if new:
+        self._sim_status = {
+          "modem_version": version,
+          "sim_present": bool(iccid),
+          "sim_state": "unknown",
+          "euicc": None,
+          "comma_profile": iccid.startswith(WEBBING_ICCID_PREFIX) if iccid else None,
+          "sim_home_mcc_mnc": "",  # sim_state, euicc and sim_home_mcc_mnc: filled in by _update_probe
+        }
+        self._reg_status = dict.fromkeys(self._reg_status, "unknown")
+      if not self._update_probe() and not new:
+        return  # same identity, lock still busy: nothing new to report
+      self._emit_status("identity")
+    except Exception:
+      logging.exception("modem_status (identity) failed")
+
+  def _update_probe(self) -> bool:
+    """Fill sim_state, euicc and sim_home_mcc_mnc from _probe_sim. If AT_LOCK is busy they read "unknown" / None / the
+    identity read's value, and the probe is retried at the next trigger instead of keeping a wrong value for the boot."""
+    _, iccid, mcc_mnc, _ = self._identity_seen
+    r = self._probe_sim(bool(iccid), mcc_mnc)
+    self._probe_pending = r is None
+    self._sim_status.update(r or {"sim_state": "unknown", "euicc": None, "sim_home_mcc_mnc": mcc_mnc[:5]})
+    return r is not None
+
+  def _probe_sim(self, card: bool, mcc_mnc: str) -> dict | None:
+    """SIM state (AT+CPIN?), eUICC (AT+CCHO / AT+CCHC) and, if the identity read got none, the home network (AT+CIMI), all
+    under one hold of AT_LOCK, so that no other user of the port (LPA, qcomgpsd) comes between the commands.
+    None if the lock is busy or the probe failed."""
+    try:
+      with self._at_lock() as locked:
+        if not locked:
+          return None
+        v = next((line.split(":", 1)[1].strip() for line in self._at_send("AT+CPIN?") or [] if line.startswith("+CPIN:")), None)
+        sim_state = "no_answer" if v is None else CPIN.get(v, "other")  # no answer: an error such as SIM not inserted
+        ready = card and sim_state == "ready"
+        if ready and not mcc_mnc:
+          imsi = next((line.strip() for line in self._at_send("AT+CIMI") or [] if not line.startswith("+")), "")
+          mcc_mnc = imsi[:6] if imsi.isascii() and imsi.isdigit() and len(imsi) >= 6 else ""
+        return {"sim_state": sim_state, "euicc": self._probe_euicc() if ready else None, "sim_home_mcc_mnc": mcc_mnc[:5]}
+    except Exception:
+      logging.exception("modem_status (probe) failed")
+      return None
+
+  def _probe_euicc(self) -> bool:
+    """The probe of LPA.is_euicc (the caller holds AT_LOCK): only an eUICC opens a logical channel to the ISD-R applet.
+    A channel the modem opened is closed again on every path (one retry), so it is not lost to the LPA."""
+    ch = ""
+    try:
+      for line in self._at_send(f'AT+CCHO="{ISDR_AID}"') or []:
+        n = line.split(":", 1)[1].strip() if line.startswith("+CCHO:") else ""
+        if n.isascii() and n.isdecimal():
+          ch = n
+          return True
+      return False
+    finally:
+      if ch and self._at_send(f"AT+CCHC={ch}") is None:
+        self._at_send(f"AT+CCHC={ch}")
+
+  @staticmethod
+  def _parse_act(v: str) -> str:
+    """Technology from a +CREG / +CGREG read reply (<n>,<stat>,<lac>,<ci>,<AcT>): only the unquoted AcT number, mapped
+    through NETWORK_TYPE; the quoted LAC / TAC and cell id fields are skipped."""
+    p = v.split(",")
+    act = p[4].strip() if len(p) >= 5 else ""
+    return NETWORK_TYPE.get(int(act), "unknown") if act.isascii() and act.isdecimal() else "unknown"
+
+  def _log_registration(self, reg: str, greg: str, v: str, gv: str):
+    """On each change of the registration pair (network, packet data) the daemon reads in SEARCHING."""
+    try:
+      if (reg, greg) == (self._reg_status["registration"], self._reg_status["data_registration"]):
+        return
+      technology = self._parse_act(v)
+      if technology == "unknown":
+        technology = self._parse_act(gv)
+      self._reg_status = {"registration": reg, "data_registration": greg, "technology": technology}
+      if self._probe_pending:
+        self._update_probe()
+      self._emit_status("registration", roaming_allowed=self._roaming_allowed)
+    except Exception:
+      logging.exception("modem_status (registration) failed")
+
+  def _log_onroad(self):
+    """Repeat the last status once per drive, ONROAD_REPEAT_DELAY after going onroad: loggerd records only onroad, so the
+    events of a boot can predate the route. IsOffroad is the param manager keeps for processes without deviceState."""
+    try:
+      if self._read_param("IsOffroad") != "0":
+        self._onroad_since, self._onroad_logged = None, False
+        return
+      now = time.monotonic()
+      if self._onroad_since is None:
+        self._onroad_since = now
+      if not self._onroad_logged and self._sim_status and now - self._onroad_since >= ONROAD_REPEAT_DELAY:
+        self._onroad_logged = True
+        if self._probe_pending:
+          self._update_probe()
+        self._emit_status("onroad", roaming_allowed=self._roaming_allowed)
+    except Exception:
+      logging.exception("modem_status (onroad) failed")
+
+  def _emit_status(self, reason: str, **extra):
+    cloudlog.event("modem_status", reason=reason, **self._sim_status, **self._reg_status, **extra, error=True)
+
   def _do_searching(self):
     new_roaming = self._is_roaming_allowed()
     if new_roaming != self._roaming_allowed:
@@ -378,7 +540,9 @@ class Modem:
       return self._searching_idle()
 
     reg = self._parse_reg(v)
-    greg = self._parse_reg(self._atv("AT+CGREG?", "+CGREG:") or "")
+    gv = self._atv("AT+CGREG?", "+CGREG:") or ""
+    greg = self._parse_reg(gv)
+    self._log_registration(reg, greg, v, gv)
     logging.debug(f"creg={reg} cgreg={greg} roaming_allowed={self._roaming_allowed}")
 
     if reg == "roaming" and not self._roaming_allowed:
@@ -593,6 +757,7 @@ class Modem:
     while self.running:
       try:
         self._check_iccid(state)
+        self._log_onroad()
         prev = state
         state = handlers[state]()
         if state != prev:
