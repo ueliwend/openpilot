@@ -197,6 +197,7 @@ class TestLoggerd(OpenpilotTestCase):
 
   def test_rotation(self):
     Params().put("RecordFront", True, block=True)
+    Params().put("RecordRoadFull", True, block=True)
 
     expected_files = {"rlog.zst", "qlog.zst", "qcamera.ts", "fcamera.hevc", "dcamera.hevc", "ecamera.hevc"}
 
@@ -324,6 +325,21 @@ class TestLoggerd(OpenpilotTestCase):
 
     cabin_hevc_exists = os.path.exists(os.path.join(self._get_latest_log_dir(), 'dcamera.hevc'))
     assert cabin_hevc_exists == record_front
+
+  @parameterized.expand([True, False])
+  def test_record_road_full(self, record_road_full):
+    # full-resolution road and wide cameras only with the setting; the road preview, the logs and the encode indexes always
+    Params().put_bool("RecordRoadFull", record_road_full, block=True)
+
+    self._publish_camera_and_audio_messages()
+
+    seg = self._get_latest_log_dir()
+    for fn in ("fcamera.hevc", "ecamera.hevc"):
+      assert os.path.exists(os.path.join(seg, fn)) == record_road_full, fn
+    for fn in ("qcamera.ts", "rlog.zst", "qlog.zst"):
+      assert os.path.exists(os.path.join(seg, fn)), fn
+    logged = {m.which() for m in LogReader(os.path.join(seg, "rlog.zst"))}
+    assert {"narrowRoadEncodeIdx", "wideRoadEncodeIdx", "qNarrowRoadEncodeIdx"} <= logged, logged
 
   @parameterized.expand([True, False])
   def test_record_audio(self, record_audio):

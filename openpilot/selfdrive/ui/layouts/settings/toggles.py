@@ -36,6 +36,9 @@ DESCRIPTIONS = {
   'RecordFront': tr_noop("Upload data from the driver facing camera and help improve the driver monitoring algorithm."),
   "IsMetric": tr_noop("Display speed in km/h instead of mph."),
   "RecordAudio": tr_noop("Record and store microphone audio while driving. The audio will be included in the dashcam video in comma connect."),
+  "RecordRoadFull": tr_noop("Store the road and wide road cameras in full resolution (about 150 MB per minute of driving). When off, only the " +
+                            "small road camera preview (526x330) is stored, so many more drives fit on the device, but full-resolution road " +
+                            "and wide video for model tests, close review and clips is lost. Applies from the next drive."),
 }
 
 
@@ -80,6 +83,12 @@ class TogglesLayout(Widget):
         lambda: tr("Record and Upload Microphone Audio"),
         DESCRIPTIONS["RecordAudio"],
         "microphone.png",
+        True,
+      ),
+      "RecordRoadFull": (
+        lambda: tr("Record Full-Resolution Road Cameras"),
+        DESCRIPTIONS["RecordRoadFull"],
+        "road.png",
         True,
       ),
       "IsMetric": (

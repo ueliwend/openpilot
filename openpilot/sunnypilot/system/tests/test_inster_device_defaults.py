@@ -29,6 +29,8 @@ DEVICE_DEFAULTS = {
   # monitor has seen a vehicle, a timed lane change starts 1 s after it clears (later than the set time in Nudgeless / 0.5 s / 1 s, possibly
   # earlier in 2 s / 3 s); mobile data is not treated as metered and may roam (both without effect without a SIM)
   "AutoLaneChangeBsmDelay": True, "GsmMetered": False, "GsmRoaming": True,
+  # owner, 12 Nov 2026 (E10): only the road camera preview qcamera.ts is stored by default, not fcamera.hevc / ecamera.hevc
+  "RecordRoadFull": False,
 }
 
 # a value different from each default (the owner's store must survive a start unchanged)
@@ -73,10 +75,10 @@ class TestInsterDeviceDefaults(OpenpilotTestCase):
 
   def test_store_without_the_new_default_keys(self):
     # the keys that had no default before (5 on 10 Nov 2026, GsmRoaming on 11 Nov 2026) get their default on a store that never set
-    # them (1; RecordFront 0 since 12 Nov 2026); every value the store holds stays
+    # them (1; RecordFront 0 since 12 Nov 2026; RecordRoadFull, new on 12 Nov 2026, 0); every value the store holds stays
     params = Params()
     params.put("OnroadScreenOffBrightnessMigrated", "1.0", block=True)
-    new_keys = ("EnforceTorqueControl", "LiveTorqueParamsToggle", "IsMetric", "IsLdwEnabled", "RecordFront", "GsmRoaming")
+    new_keys = ("EnforceTorqueControl", "LiveTorqueParamsToggle", "IsMetric", "IsLdwEnabled", "RecordFront", "GsmRoaming", "RecordRoadFull")
     for k, v in OTHER.items():
       if k not in new_keys:
         params.put(k, v, block=True)

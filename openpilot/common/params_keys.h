@@ -202,6 +202,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"StandstillTimer", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"TrueVEgoUI", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"UpdaterLastFailure", {PERSISTENT, JSON}},  // the updater's last failure (system/updated/updated.py); kept across boots, replaced by the next failure; not in backups
+    {"RecordRoadFull", {PERSISTENT | BACKUP, BOOL, "0"}},  // Inster (owner, 12 Nov 2026): record fcamera.hevc + ecamera.hevc; 0 = only the road preview qcamera.ts; read at loggerd start
 
     // MADS params
     {"Mads", {PERSISTENT | BACKUP, BOOL, "1"}},
