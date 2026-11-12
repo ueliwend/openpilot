@@ -6,6 +6,7 @@ import datetime
 import subprocess
 import shutil
 import signal
+import sys
 import fcntl
 import threading
 from collections import defaultdict
@@ -153,6 +154,7 @@ def run(cmd: list[str], cwd: str | None = None) -> str:
 
 
 # The last failure, kept in the persistent param UpdaterLastFailure (and with it in the initData of every drive).
+# Stage "precompile" is information only: files that did not compile in a successful update (precompile()).
 FAILURE_RECORD_MAX_BYTES = 1024  # stored size of the whole record
 FAILURE_SECRETS = [  # (pattern, replacement); nothing that could be a credential may reach the record
   (re.compile(r'(\b[a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s@]+@'), r'\1'),                                  # user:password@ in a URL
@@ -322,9 +324,46 @@ def init_overlay() -> None:
   ProcessState.overlay_built = True
 
 
-def finalize_update() -> None:
+# Bytecode. `git clean -xdff` in fetch_update() removes every .pyc, so without this each process compiled its modules
+# at its first import, onroad, on the first drive after every update (modeld_v2 alone: about 2 s CPU and 77 MB that
+# stay allocated). The trees Python imports from on the device: the install is on PYTHONPATH and launch_chffrplus.sh
+# links msgq, opendbc, rednose, teleoprtc and tinygrad into it from these folders. Tests and vendored code are skipped,
+# except the __init__.py right inside a test folder: opendbc imports every folder of opendbc/car as a brand
+# (get_interface_attr), so opendbc.car.tests is imported onroad.
+PRECOMPILE_DIRS = ("openpilot", "opendbc_repo/opendbc", "tinygrad_repo/tinygrad", "msgq_repo/msgq", "rednose_repo/rednose",
+                   "teleoprtc_repo/teleoprtc", "panda")
+PRECOMPILE_SKIP = r"(^|/)(tests?|third_party)/(?!__init__\.py$)"
+
+def precompile_command(dirs: list[str]) -> list[str]:
+  # The interpreter that runs openpilot (the manager starts updated with it), so the file names (cache tag) match.
+  # checked-hash: a pyc is used only while its source has the hash it was compiled from, whatever happens to mtimes;
+  # -f writes every pyc in this mode, also where an older timestamp pyc (e.g. in a submodule) looks current.
+  # Relative paths: nothing compiled depends on the staging folder (Python sets co_filename to the real path on load).
+  return [sys.executable, "-m", "compileall", "-q", "-f", "--invalidation-mode", "checked-hash", "-x", PRECOMPILE_SKIP, *dirs]
+
+def precompile(path: str) -> dict | None:
+  """Compile the bytecode of the tree at path. Never fails the update: a file that does not compile behaves at its
+  import exactly as before. Returns a record of the files that did not compile (for UpdaterLastFailure, as
+  information only), or None."""
+  dirs = [d for d in PRECOMPILE_DIRS if os.path.isdir(os.path.join(path, d))]
+  if not dirs:
+    return None
+  try:
+    run(precompile_command(dirs), path)
+    return None
+  except Exception as e:  # not KeyboardInterrupt: a stop ends the update attempt as during any other command
+    record = failure_record("precompile", e)
+    failed = re.findall(r"^\*\*\* Error compiling '([^']*)'", record["output"], flags=re.MULTILINE)
+    why = f"{len(failed)} file(s) not compiled: {', '.join(failed)}" if failed else record["reason"]
+    record["reason"] = f"update continues; {why}"[:160]
+    cloudlog.event("precompile: not all files compiled; update continues", error=True, record=record)
+    return record
+
+
+def finalize_update() -> dict | None:
   """Take the current OverlayFS merged view and finalize a copy outside of
-  OverlayFS, ready to be swapped-in at BASEDIR. Copy using shutil.copytree"""
+  OverlayFS, ready to be swapped-in at BASEDIR. Copy using shutil.copytree.
+  Returns precompile()'s record of files that did not compile, or None."""
 
   # Remove the update ready flag and any old updates
   cloudlog.info("creating finalized version of the overlay")
@@ -338,8 +377,12 @@ def finalize_update() -> None:
   run(["git", "reset", "--hard"], FINALIZED)
   run(["git", "submodule", "foreach", "--recursive", "git", "reset", "--hard"], FINALIZED)
 
+  # after the resets (the files are final), before the flag (whose sync puts the pycs on disk before any swap)
+  not_compiled = precompile(FINALIZED)
+
   set_consistent_flag(True)
   cloudlog.info("done finalizing overlay")
+  return not_compiled
 
 
 def handle_agnos_update() -> None:
@@ -549,7 +592,9 @@ class Updater:
     # Create the finalized, ready-to-swap update
     self.stage = "finalize"
     self.params.put("UpdaterState", "finalizing update...", block=True)
-    finalize_update()
+    not_compiled = finalize_update()
+    if not_compiled is not None:
+      self.store_failure(not_compiled)  # information only: the update did not fail and is not counted
     cloudlog.info("finalize success!")
 
   def fetch_update_retry_once(self) -> None:
@@ -580,8 +625,8 @@ class Updater:
     return record
 
   def store_failure(self, record: dict) -> None:
-    """The only writer of UpdaterLastFailure, and nothing clears it: a record stays until the next failure replaces
-    it. A record that cannot be written is logged; it never changes what the updater does next."""
+    """The only writer of UpdaterLastFailure, and nothing clears it: a record stays until the next failure (or the
+    next note of files that did not compile) replaces it. A record that cannot be written is logged; it never changes what the updater does next."""
     try:
       self.params.put("UpdaterLastFailure", fit_failure_record(record), block=True)
     except Exception:

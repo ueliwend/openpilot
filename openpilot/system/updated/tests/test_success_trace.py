@@ -2,7 +2,7 @@
 
 success_trace_0057d61.json is the record of updated.py as it was before the fix (0057d61) in the scenario below:
 every command it ran and every param it wrote or removed, in order. The updater of this tree must produce the same
-record, except for the one flag added to `git fetch`.
+record, except for the one flag added to `git fetch` and the bytecode compilation added to finalize (precompile).
 
 Scenario: a device on an old commit boots; the updater starts, builds its staging area and waits its first minute;
 checks, downloads and finalizes the update; after its 1.5 hours the user presses CHECK; the updater checks again.
@@ -21,6 +21,8 @@ from openpilot.system.updated.tests.helpers import FakeCommands, Recorder, reset
 GOLDEN = Path(__file__).with_name("success_trace_0057d61.json")
 OLD_FETCH = ["git", "fetch", "origin", "inster"]
 NEW_FETCH = ["git", "fetch", "--no-recurse-submodules", "origin", "inster"]
+FINALIZED = "<root>/safe_staging/finalized"
+LAST_RESET = ["run", ["git", "submodule", "foreach", "--recursive", "git", "reset", "--hard"], FINALIZED]
 
 
 def record_success_trace(test, mocker) -> tuple[list, list]:
@@ -46,7 +48,12 @@ class TestSuccessTrace(OpenpilotTestCase):
     with open(GOLDEN) as f:
       before = json.load(f)
     assert sum(entry == ["run", OLD_FETCH, "<root>/safe_staging/merged"] for entry in before) == 1
-    expected = [["run", NEW_FETCH, entry[2]] if entry[:2] == ["run", OLD_FETCH] else entry for entry in before]
+    assert sum(entry == LAST_RESET for entry in before) == 1
+    expected = []
+    for entry in before:
+      expected.append(["run", NEW_FETCH, entry[2]] if entry[:2] == ["run", OLD_FETCH] else entry)
+      if entry == LAST_RESET:
+        expected.append(["run", updated.precompile_command(["openpilot"]), FINALIZED])
     assert json.loads(json.dumps(trace)) == expected
     assert not any("UpdaterLastFailure" in entry for entry in trace)
 
