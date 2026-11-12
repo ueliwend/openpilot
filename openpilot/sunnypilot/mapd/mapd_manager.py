@@ -22,7 +22,8 @@ from openpilot.sunnypilot.mapd import MAPD_PATH
 from openpilot.sunnypilot.mapd.mapd_installer import VERSION, update_installed_version
 from openpilot.sunnypilot.mapd.offline_maps import REQUEST_KEY, OfflineMaps
 from openpilot.sunnypilot.mapd.offline_server import TileServer
-from openpilot.sunnypilot.mapd.offline_update import PREV, TMP, OfflineMapUpdater, ParamsLink
+from openpilot.sunnypilot.mapd.mapd_priority import MapdPriority
+from openpilot.sunnypilot.mapd.offline_update import DRAINING, PREV, RUNNING, TMP, OfflineMapUpdater, ParamsLink
 
 # PFEIFER - MAPD {{
 params = Params()
@@ -30,6 +31,7 @@ mem_params = Params("/dev/shm/params") if platform.system() != "Darwin" else par
 # }} PFEIFER - MAPD
 _offline_updater: OfflineMapUpdater | None = None
 _offline_maps: OfflineMaps | None = None
+_mapd_priority: MapdPriority | None = None
 
 
 def offline_updater() -> OfflineMapUpdater:
@@ -46,6 +48,14 @@ def offline_maps() -> OfflineMaps:
   if _offline_maps is None:
     _offline_maps = OfflineMaps(params, Paths.mapd_root(), offline_updater(), TileServer())
   return _offline_maps
+
+
+def mapd_priority() -> MapdPriority:
+  """Inster: the mapd binary at low CPU / I/O priority while one of our downloads runs (mapd_priority.py)."""
+  global _mapd_priority
+  if _mapd_priority is None:
+    _mapd_priority = MapdPriority(params)
+  return _mapd_priority
 
 
 def get_files_for_cleanup() -> list[str]:
@@ -147,6 +157,7 @@ def update_osm_db() -> None:
   if params.get_bool("OsmDbUpdatesCheck") or params.get(REQUEST_KEY):
     cleanup_old_osm_data(get_files_for_cleanup())
   offline_maps().step()
+  mapd_priority().step(offline_updater().state in (RUNNING, DRAINING))  # Inster: low priority only while ours runs
 
   if not mem_params.get("OSMDownloadBounds"):
     mem_params.put("OSMDownloadBounds", "", block=True)

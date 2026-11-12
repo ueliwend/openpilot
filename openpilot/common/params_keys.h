@@ -267,6 +267,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // mapd
     {"MapAdvisorySpeedLimit", {CLEAR_ON_ONROAD_TRANSITION, FLOAT}},
     {"Mapd_ClearCache", {CLEAR_ON_MANAGER_START, BOOL}},
+    {"MapdRestartRequest", {CLEAR_ON_MANAGER_START, BOOL}},  // Inster: mapd_manager asks the manager to restart the mapd binary (mapd_priority.py)
     {"MapdVersion", {PERSISTENT, STRING}},
     {"MapSpeedLimit", {CLEAR_ON_ONROAD_TRANSITION, FLOAT, "0.0"}},
     {"NextMapSpeedLimit", {CLEAR_ON_ONROAD_TRANSITION, JSON}},

@@ -17,6 +17,7 @@ BLOCKED_PARAMS = {
   "HasAcceptedTermsSP",
   "OnroadCycleRequested",      # Prevent remote cycle trigger
   "ParamsVersion",         # Device-managed version counter
+  "MapdRestartRequest",    # Inster: device-managed (mapd_priority.py); a remote write would stop the mapd binary
 }
 
 
