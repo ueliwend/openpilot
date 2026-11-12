@@ -50,9 +50,11 @@ class Blendful:
     self.model_curvature = 0.0
     self.smooth = 0.0 # smooths the correction target below .53 lat accel
     self.curvature = 0.0
+    self.yield_fade = 1.0  # read-only hook for RightLineBlendful: the going-around / away fade of the trust (1 = no yield); no effect on the output
 
   def update(self, model_output: dict[str, np.ndarray], v_ego: float, active: bool, model_curvature: float, enabled: bool = True) -> float:
     self.l_prob = self.r_prob = 0.0
+    self.yield_fade = 1.0
     self.model_curvature = model_curvature
     if not enabled:
       if self.curvature or self.trust:
@@ -146,7 +148,9 @@ class Blendful:
     if inside_curve:
       lane_trust *= np.interp(abs(offset) - abs(center_now) - 0.25 * abs(model_curvature) * lookahead ** 2 / 2, (0.5, 1.0), [1.0, 0.0])
     else:
-      lane_trust *= np.interp(swerve, (YIELD[0] / 2, YIELD[0]), [1.0, 0.0]) if self.going_around else np.interp(away, YIELD, [1.0, 0.0])
+      fade = np.interp(swerve, (YIELD[0] / 2, YIELD[0]), [1.0, 0.0]) if self.going_around else np.interp(away, YIELD, [1.0, 0.0])
+      self.yield_fade = float(fade)
+      lane_trust *= fade
 
     if lane_trust < self.trust:
       dk = float(np.clip(dk, min(self.dk, 0.0), max(self.dk, 0.0)))

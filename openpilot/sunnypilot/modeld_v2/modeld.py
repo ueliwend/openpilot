@@ -401,6 +401,7 @@ def main(demo=False):
   blendful_enabled = False
   blendful_kind = 0
   blendful_gaps = (0.5, 1.0)
+  blendful_last_eof = 0  # timestamp_eof of the previous model frame: the true frame interval for the A8 filters and target
 
   while True:
     # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
@@ -524,7 +525,8 @@ def main(demo=False):
       blendful_mode = mode_from_params(blendful_enabled, blendful_kind)
       if blendful_mode != MODE_OFF or blendful_ctl.releasing:  # a mode switch to Off releases the correction first (2.0 m/s^3)
         sm_car = sm['carState']
-        rl_inputs = RightInputs(gap_low=blendful_gaps[0], gap_high=blendful_gaps[1], c_set=camera_offset_helper.camera_offset,
+        frame_dt = (meta_main.timestamp_eof - blendful_last_eof) * 1e-9 if blendful_last_eof else DT_MDL
+        rl_inputs = RightInputs(frame_dt=frame_dt, gap_low=blendful_gaps[0], gap_high=blendful_gaps[1], c_set=camera_offset_helper.camera_offset,
                                 c_applied=camera_offset_helper.actual_camera_offset, left_blinker=bool(sm_car.leftBlinker),
                                 right_blinker=bool(sm_car.rightBlinker))
 
@@ -535,6 +537,7 @@ def main(demo=False):
       else:  # Off: today's car, bit for bit
         action = model.get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego,
                                              partial(blendful.update, model_output, v_ego, blendful_active, enabled=False))
+      blendful_last_eof = meta_main.timestamp_eof
       prev_action = action
       fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,

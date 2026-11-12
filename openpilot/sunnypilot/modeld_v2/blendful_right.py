@@ -1,10 +1,14 @@
 """
 Right-line Blendful ("keep right", task A8): follows the right lane line (or road edge) at a speed dependent gap, never left of the lane
 centre, and hands back to regular upstream Blendful where the right reference is not usable.  Design: inster-dev
-results/2026-11-12_a8_right_line_blendful/DESIGN.md rev 4.3 (section letters B.. below refer to it).
+results/2026-11-12_a8_right_line_blendful/DESIGN.md rev 5.1 (section letters B.. below refer to it); this is implementation round 2
+(results/2026-11-12_a8_impl_r2), which answers the E1 replay causes C1-C11 / K1 (results/2026-11-12_a8_replay).
 
 Everything is expressed as a lateral plan shift (plan_correction.py): the profile amplitude k0 is the quantity that is blended, capped
-and rate limited; the instantaneous desired-curvature correction is c = F k0.
+and rate limited; the instantaneous desired-curvature correction is c = F k0 (F per frame with the plan's own v_x(0), C11).
+
+Junctions (owner 20:55, Q10): in mode Right line a junction episode lets both corrections fade through the final limiter and the model
+steers alone; Regular is unchanged.  Appendix J of the design (hold / latch / ramp context / split classifier) is documentation only.
 
 Signs: model frame [forward, right, down], y > 0 is right; curvature > 0 is a right turn.
 """
@@ -40,28 +44,39 @@ COAST_Q, COAST_MAX, REINIT_Q = 0.3, 1.0, 0.5
 PUSH = 1.5  # m, outward push of an unconfident candidate (weights only)
 SOFTMIN_TAU = 0.05  # m
 PLAUS_TOL, WIDTH_RANGE = 0.3, (2.0, 8.0)
-# correction (B4)
+# correction (B4, B11)
 STRENGTH_RIGHT_ONLY = 0.8
 RISING_STRENGTH = False  # owner 17:24: flat 0.8; True = 0.8 -> 1.0 with |k_m| v^2 over 0.18 .. 0.53 m/s^2 (one-line option)
 FIT_WINDOW = (0.5, 1.5)  # of L_a
 ERROR_CLIP = 1.0  # m
+D_MAX = 1.0  # m, the fitted profile amplitude is clipped here (C9)
 BUILD, RELEASE, FADING_RELEASE, SWERVE_RELEASE = 0.5, 2.0, 0.5, 5.0  # m/s^3, final limiter (blendful.py:57-60; 5 = controlsd's limit)
 # authority (B5)
 A_DEAD, A_DWELL, A_OUT, A_IN, A_HOLD = 0.05, 0.5, 1.0, 0.5, 1.0
-TARGET_RATE, FIRST_MOVE_RATE, SPLIT_RATE = 0.25, 0.1, 0.5  # m/s, offset of the target from the lane centre
-# yields (B6)
-RHO_BANDS_KMH = (30.0, 50.0, 80.0, 100.0)  # band edges, five bands
-RHO_PRIOR = (0.5, 0.5, 0.5, 0.5, 0.5)  # placeholder until E1 fits the per-band prior
-ABSORB = 0.1  # m, bound on the expected return's change per onset
+# ground-fixed target (B5, C1; owner 21:44 question 9)
+TARGET_RATE_LEFT = 0.25  # m/s, the target moving left (toward the lane centre, away from the right line)
+MOVE_RATE_RIGHT = 0.05  # m/s, the move to the right-hand position (owner 21:44, question 9 option b)
+LAG_BOUND, LAG_RATE = 1.0, 0.5  # m, m/s: where the target lags its raw value by more, that point moves at LAG_RATE (still glide-limited)
+# yields (B6, C7, C8)
 Q_NO_GROWTH, Q_CAP_START, Q_CAP_FULL, Q_RELEASE = 0.1, 0.15, 0.2, 0.1
-ESTABLISH_RESIDUAL, ESTABLISH_TTL = 0.05, 600.0
-# junctions (B7)
-EPISODE_START, EPISODE_END, EPISODE_MAX = 0.4, 0.15, 300.0  # m (start threshold is EST, tuned on E1)
-PAST_GORE = 20.0  # m
-RAMP_N = 1500.0  # m
-HEADING_WINDOW = 40.0  # m
-HEADING_LIMIT = np.radians(60.0)
+GAP_SMOOTH_TAU, GAP_MEDIAN_S = 0.25, 0.5  # s, endpoint gap smoothing and the median window before the running minimum
+USUAL_TAU, USUAL_TAU_AROUND = 10.0, 20.0  # s
+MOVE_LAG_EPS, MOVE_SETTLE = 0.03, 3.0  # m, s: a move to the right is on while the target still glides or the correction builds, plus settle time (EST)
+# jumps (B5 table, C6)
+JUMP_LINE, JUMP_EDGE, JUMP_FRAMES, JUMP_HOLD, JUMP_WEIGHT = 0.6, 1.2, 2, 2.0, 0.5  # m, m, frames, s, candidate weight
+CAND_CHANGE = 0.1  # change of a candidate's weight per frame that freezes the running minimum
+# junctions (B7); all thresholds are EST start values, set on E1
+CUE_WIDEN_FRAME, CUE_WIDEN_TIME, CUE_EDGE_DIV, CUE_EDGE_ANGLE = 0.5, 0.5, 0.6, 4.0  # m, m, m, deg
+CUE_GORE_SEP, CUE_GORE_SPREAD, CUE_KINK, CUE_BEND = 0.6, 0.5, 4.0, 0.5  # m, m, deg, b
+EPISODE_ON_TIME, EPISODE_QUIET_TIME, EPISODE_QUIET_DIST = 0.2, 2.0, 30.0  # s, s, m
+EPISODE_WIDENING, EPISODE_WIDENING_TIME, EPISODE_MAX = 0.15, 1.0, 300.0  # m, s, m
+WIDTH_TAU, WIDTH_STALE, WIDTH_REMEASURE = 10.0, 20.0, 2.0  # s
+# road class (B5 table, C4)
+ROAD_DWELL = 5.0  # s
 BLINKER_MAX_SPEED = 32 / 3.6
+# episode end reasons and road classes (log)
+END_NONE, END_QUIET, END_WIDENING, END_MAX = 0, 1, 2, 3
+ROAD_EDGES, ROAD_SHARED, ROAD_LANES, ROAD_MOTORWAY = 0, 1, 2, 3
 
 
 def ss(z):
@@ -84,6 +99,14 @@ def gap_for_speed(v_ego: float, low: float, high: float) -> float:
   return float(np.interp(v_ego, GAP_SPEEDS, (low, high)))
 
 
+def motion_predict(y_prev: np.ndarray, vx0: float, yaw_rate: float, dt: float, scale: float = 1.0) -> np.ndarray:
+  """Own-motion prediction of a lateral position profile into the next car frame (B2): shifted by the model's v_x(0) dt, rotated by the
+  yaw step, with the device's lever arm and the rear axle's own arc.  Shared by the input filters and the ground-fixed target.
+  scale = vEgo / v_x(0): the lines' x axis carries the model's distance scale (x_model = x_true v_x(0) / vEgo), so the rotation acts at the
+  true distance x_model * scale + l_d + vEgo dt / 2 (DESIGN check 19; for scale = 1 this is the formula of B2 verbatim)."""
+  return quad_interp(X_IDXS + vx0 * dt, X_IDXS, y_prev) - yaw_rate * dt * (X_IDXS * scale + L_D + vx0 * scale * dt / 2)
+
+
 class ConfGate:
   """Confidence gate with hysteresis: rising branch ss((q - 0.4) / 0.2), falling branch ss((q - 0.3) / 0.2) (B3)."""
   def __init__(self):
@@ -95,7 +118,8 @@ class ConfGate:
 
 
 class InputFilter:
-  """Motion compensated first order filter of one 33 point lateral position (B2)."""
+  """Motion compensated first order filter of one 33 point lateral position (B2).  Rev 5 (K1): the shift is the model's own speed
+  v_x(0) of the raw plan times the true frame interval dt (the lane lines' x axis carries the model's distance scale)."""
   def __init__(self, tau: float = MEAS_TAU):
     self.tau = tau
     self.y = np.zeros(NX)
@@ -107,17 +131,16 @@ class InputFilter:
     self.coast = False
     self.reinit = False
 
-  def predict(self, v_ego: float, yaw_rate: float) -> np.ndarray:
-    dt = DT_MDL
-    return quad_interp(X_IDXS + v_ego * dt, X_IDXS, self.y) - yaw_rate * dt * (X_IDXS + L_D + v_ego * dt / 2)
+  def predict(self, vx0: float, yaw_rate: float, dt: float = DT_MDL, scale: float = 1.0) -> np.ndarray:
+    return motion_predict(self.y, vx0, yaw_rate, dt, scale)
 
-  def update(self, y_meas: np.ndarray, q_meas: float, v_ego: float, yaw_rate: float) -> tuple[np.ndarray, float]:
-    dt = DT_MDL
+  def update(self, y_meas: np.ndarray, q_meas: float, vx0: float, yaw_rate: float, dt: float = DT_MDL,
+             scale: float = 1.0) -> tuple[np.ndarray, float]:
     q_meas = float(np.clip(q_meas, 0.0, 1.0))
     self.reinit = False
     alpha = dt / (dt + self.tau)
     if self.initialized:
-      pred = self.predict(v_ego, yaw_rate)
+      pred = self.predict(vx0, yaw_rate, dt, scale)
       self.y_pred = pred
       self.innovation = y_meas - pred
       if q_meas >= COAST_Q:
@@ -146,6 +169,36 @@ class InputFilter:
     return self.y, self.q
 
 
+class GroundTarget:
+  """Ground-fixed, rate-limited target (B5, C1, R5-3).  Last frame's limited target is predicted into the new car frame with the filters'
+  motion model and then moves toward the raw target by at most rate x dt per point: to the right (the move to the right-hand position)
+  MOVE_RATE_RIGHT, to the left TARGET_RATE_LEFT.  Where it lags the raw target by more than LAG_BOUND the rate rises to LAG_RATE (still
+  glide-limited), so a systematic prediction error cannot make it drift away.  Points beyond the last frame's horizon take the raw
+  target.  Its own state cannot jump: a flickering or re-indexed reference moves it by at most rate x dt per point and frame."""
+  def __init__(self):
+    self.t: np.ndarray | None = None
+    self.lag = np.zeros(NX)
+
+  def reset(self):
+    self.t = None
+    self.lag = np.zeros(NX)
+
+  def update(self, t_raw: np.ndarray, vx0: float, yaw_rate: float, dt: float, scale: float = 1.0) -> np.ndarray:
+    if self.t is None:
+      self.t = np.array(t_raw, dtype=float)
+      self.lag = np.zeros(NX)
+      return self.t.copy()
+    pred = motion_predict(self.t, vx0, yaw_rate, dt, scale)
+    pred = np.where(X_IDXS + vx0 * dt > X_IDXS[-1], t_raw, pred)
+    diff = t_raw - pred  # > 0: the raw target is further right
+    big = np.abs(diff) > LAG_BOUND
+    up = np.where(big, LAG_RATE, MOVE_RATE_RIGHT) * dt
+    down = np.where(big, LAG_RATE, TARGET_RATE_LEFT) * dt
+    self.t = pred + np.clip(diff, -down, up)
+    self.lag = t_raw - self.t
+    return self.t.copy()
+
+
 class Authority:
   """a follows a* with a dead band, a dwell, rate limits and a re-entry hold (B5, check 12)."""
   def __init__(self):
@@ -171,7 +224,7 @@ class Authority:
 
 
 class Timed:
-  """Boolean that turns on at once and off only after `off_time` of the condition being false."""
+  """Boolean that turns on after `on_time` of the condition being true and off only after `off_time` of it being false."""
   def __init__(self, off_time: float = 0.0, on_time: float = 0.0):
     self.off_time, self.on_time = off_time, on_time
     self.state, self.t_on, self.t_off = False, 0.0, 0.0
@@ -186,6 +239,58 @@ class Timed:
       if self.t_off >= self.off_time:
         self.state = False
     return self.state
+
+
+class JumpDetector:
+  """Per-input jump detection (B5 table, C6): the innovation at x = L of the right line (threshold 0.6 m) or right edge (1.2 m) above its
+  threshold for JUMP_FRAMES frames in a row, only on a candidate whose weight in the reference is >= 0.5 (and a confident input); the
+  trip is held for JUMP_HOLD."""
+  def __init__(self):
+    self.count = [0, 0]
+    self.hold = 0.0
+
+  def update(self, innovations: tuple[float, float], weights: tuple[float, float], confident: tuple[bool, bool], dt: float = DT_MDL) -> bool:
+    tripped = False
+    for i, thr in enumerate((JUMP_LINE, JUMP_EDGE)):
+      over = abs(innovations[i]) > thr and weights[i] >= JUMP_WEIGHT and confident[i]
+      self.count[i] = self.count[i] + 1 if over else 0
+      tripped |= self.count[i] >= JUMP_FRAMES
+    self.hold = JUMP_HOLD if tripped else max(0.0, self.hold - dt)
+    return self.hold > 0.0
+
+
+class RoadClass:
+  """Road class with hysteresis and a 5 s dwell (B5 table, C4); it resets no estimator.  Classes: edges only (no line), shared (narrow),
+  lanes, motorway.  Thresholds: width 3.0 +- 0.15 m (motorway 3.3 +- 0.15 m), speed 22 +- 1 m/s, line quality 0.3 (enter) / 0.4 (leave)."""
+  def __init__(self):
+    self.cls: int | None = None
+    self.cand: int | None = None
+    self.t = 0.0
+
+  def raw(self, v: float, q_l: float, q_r: float, width: float) -> int:
+    cur = self.cls
+    thr_q = 0.4 if cur == ROAD_EDGES else 0.3
+    if q_l < thr_q and q_r < thr_q:
+      return ROAD_EDGES
+    if width < (3.15 if cur == ROAD_SHARED else 2.85):
+      return ROAD_SHARED
+    fast = v > (21.0 if cur == ROAD_MOTORWAY else 23.0)
+    wide = width > (3.15 if cur == ROAD_MOTORWAY else 3.45)
+    return ROAD_MOTORWAY if fast and wide else ROAD_LANES
+
+  def update(self, v: float, q_l: float, q_r: float, width: float, dt: float = DT_MDL) -> int:
+    new = self.raw(v, q_l, q_r, width)
+    if self.cls is None:
+      self.cls = new
+    elif new == self.cls:
+      self.cand, self.t = None, 0.0
+    else:
+      if new != self.cand:
+        self.cand, self.t = new, 0.0
+      self.t += dt
+      if self.t >= ROAD_DWELL:
+        self.cls, self.cand, self.t = new, None, 0.0
+    return int(self.cls)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -204,273 +309,211 @@ def bend_score(x: np.ndarray, y_right: np.ndarray, y_ref: np.ndarray, v_ego: flo
   return float(alpha), float(beta), float(psi_end), float(b)
 
 
-def divergence_start(x: np.ndarray, y_right: np.ndarray, y_ref: np.ndarray, v_ego: float) -> float | None:
-  """x_d: first point where the right line leaves the reference: local relative curvature > 1/60 over >= 3 points, or angle > theta."""
-  look = max(1.5 * v_ego, MIN_LOOKAHEAD)
-  m = (x >= 2.0) & (x <= max(1.5 * look, 25.0))
-  xm, d = x[m], (y_right - y_ref)[m]
-  slope = np.gradient(d, xm)
-  curv = np.gradient(slope, xm)
-  th = np.tan(np.radians(float(np.interp(v_ego * 3.6, (50.0, 100.0), (10.0, 3.0)))))
-  hit = (curv > 1 / 60) | (np.abs(slope - slope[0]) > th)
-  run = np.convolve(hit.astype(int), np.ones(3, dtype=int), mode='valid') >= 3
-  if np.any(run):
-    return float(xm[int(np.argmax(run))])
-  return float(xm[int(np.argmax(hit))]) if np.any(hit & (np.abs(slope - slope[0]) > th)) else None
+def cue_window(v_ego: float) -> tuple[float, float]:
+  """The window of the in-frame widening and edge divergence cues: x = 0.25 L .. 1.5 L, or [5, 60] m while L sits at its floor (low speed)."""
+  look = max(v_ego * LOOKAHEAD_TIME, MIN_LOOKAHEAD)
+  if v_ego * LOOKAHEAD_TIME <= MIN_LOOKAHEAD:
+    return 5.0, 60.0
+  return 0.25 * look, 1.5 * look
 
 
-def split_pattern(near_now: float, far_now: float, near_old: float, p_near: float, p_far: float) -> bool:
-  """Index shift of the four lines: the new near right line sits 2 .. 4.5 m left of the old one and the new far right line where the old
-  near right line was (+- 0.5 m)."""
-  return bool(p_near > 0.5 and p_far > 0.5 and -4.5 <= near_now - near_old <= -2.0 and abs(far_now - near_old) < 0.5)
+def growth(x: np.ndarray, d: np.ndarray, xa: float, xb: float) -> float:
+  """d(xb) - d(xa) of a profile d(x)."""
+  return float(np.interp(xb, x, d) - np.interp(xa, x, d))
 
 
-def gore_distance(x: np.ndarray, near: np.ndarray, far: np.ndarray) -> float | None:
-  """Distance to where the dividing (near right) line and the far right line meet, from a straight fit of their separation."""
-  sep = far - near
-  m = (x >= 5.0) & (x <= 100.0) & (sep > 0.3) & (sep < 4.0)
-  if np.sum(m) < 4:
+def cue_widening_frame(x: np.ndarray, y_l: np.ndarray, y_r: np.ndarray, v_ego: float) -> float:
+  """Cue 1: growth of the lane width between the references along x, within the frame (no memory needed)."""
+  xa, xb = cue_window(v_ego)
+  return growth(x, y_r - y_l, xa, xb)
+
+
+def cue_edge_divergence(x: np.ndarray, line_r: np.ndarray | None, edge_r: np.ndarray, y_l: np.ndarray | None, v_ego: float) -> tuple[float, float]:
+  """Cue 3: how far the right road edge diverges (to the right) from the right line or from the left reference over the window; returns
+  (growth in m, relative angle in degrees)."""
+  xa, xb = cue_window(v_ego)
+  g = [growth(x, edge_r - ref, xa, xb) for ref in (line_r, y_l) if ref is not None]
+  best = max(g) if g else 0.0
+  return best, float(np.degrees(np.arctan(best / (xb - xa))))
+
+
+def cue_gore(x: np.ndarray, near: np.ndarray, far: np.ndarray) -> float | None:
+  """Cue 4a: V shape.  The separation of the right line and the far-right line (or the right edge) falls to its minimum and rises again; the
+  minimum (m) is returned when the separation has fallen by >= CUE_GORE_SPREAD to it and risen by >= CUE_GORE_SPREAD beyond it, else None."""
+  m = (x >= 5.0) & (x <= 100.0)
+  sep = (far - near)[m]
+  i = int(np.argmin(sep))
+  if i == 0 or i == len(sep) - 1:
     return None
-  slope, icpt = np.polyfit(x[m], sep[m], 1)
-  if slope < 0.01:
-    return None
-  return float(-icpt / slope)
+  smin = float(sep[i])
+  if np.max(sep[:i]) - smin >= CUE_GORE_SPREAD and np.max(sep[i + 1:]) - smin >= CUE_GORE_SPREAD:
+    return smin
+  return None
 
 
-def split_score(feat: dict) -> float:
-  """Classifier on a ramp: turn-lane evidence (parallel then bends / ends 0.3, short pocket 0.2, edge cornering 0.2) against split evidence
-  (both branches at moderate curvature 0.3, gore with full-width lanes 0.3, edge following the outer branch 0.2).  Map weight 0."""
-  turn = 0.3 * bool(feat.get('parallel_then_bend')) + 0.2 * bool(feat.get('short_pocket')) + 0.2 * bool(feat.get('edge_cornering'))
-  split = 0.3 * bool(feat.get('both_moderate')) + 0.3 * bool(feat.get('gore_full_lanes')) + 0.2 * bool(feat.get('edge_follows_outer'))
-  return float(np.clip(0.5 + split - turn, 0.0, 1.0))
+def cue_kink(x: np.ndarray, y_r: np.ndarray, y_ref: np.ndarray, v_ego: float) -> float:
+  """Cue 4b: kink (deg) of the right line relative to the reference between two neighbouring windows [5 m, xm] and [xm, x_end]."""
+  look = max(v_ego * LOOKAHEAD_TIME, MIN_LOOKAHEAD)
+  x_end = max(1.5 * look, 25.0)
+  xm = 0.5 * (5.0 + x_end)
+  d = y_r - y_ref
+  slopes = []
+  for lo, hi in ((5.0, xm), (xm, x_end)):
+    k = (x >= lo) & (x <= hi)
+    slopes.append(float(np.polyfit(x[k], d[k], 1)[0]))
+  return float(np.degrees(np.arctan(slopes[1]) - np.arctan(slopes[0])))
 
 
-class JunctionLogic:
-  """Junction episodes, road context (main road / exit ramp), the split classifier's hysteresis, the commit latch (B7).
-  mode: None outside an episode, 'hold' (keep the through lane) or 'follow' (follow the right line)."""
+class WidthMemory:
+  """Short width memory for the 'widening over time' cue only (B7, C2).  Low-passes the measured width (tau 10 s) whenever both references
+  are clear and no episode runs; decreases are always accepted.  Stale after 20 s without an update (cue off while stale).  After an episode,
+  when stale, or on a change of the reference type (lines / edges) it is re-measured: the median of the next 2 s of clear measurements."""
   def __init__(self):
-    self.width = FirstOrderFilter(LANE_WIDTH_DEFAULT, 10.0, DT_MDL, initialized=False)
-    self.single = Timed(off_time=5.0, on_time=3.0)
+    self.w = 0.0
+    self.age = 0.0
+    self.armed = False
+    self.key = None
+    self.buf: list[float] = []
+
+  def remeasure(self):
+    self.armed, self.buf = False, []
+
+  def end_of_episode(self):
+    self.remeasure()
+
+  @property
+  def stale(self) -> bool:
+    return self.armed and self.age > WIDTH_STALE
+
+  def update(self, width: float, clear: bool, episode: bool, key, dt: float = DT_MDL) -> None:
+    if key != self.key:
+      self.key = key
+      self.remeasure()
+    self.age += dt
+    if self.stale:
+      self.remeasure()
+    if not clear or episode:
+      return
+    width = float(np.clip(width, *WIDTH_RANGE))
+    if not self.armed:
+      self.buf.append(width)
+      if len(self.buf) * dt >= WIDTH_REMEASURE - 1e-9:
+        self.w, self.armed, self.age, self.buf = float(np.median(self.buf)), True, 0.0, []
+    else:
+      self.w += (width - self.w) * dt / (dt + WIDTH_TAU)
+      self.age = 0.0
+
+  def excess(self, width: float) -> float | None:
+    """Width minus the memory (cue 2), or None while the memory is not armed or stale."""
+    return None if (not self.armed or self.stale) else float(width - self.w)
+
+
+class JunctionEpisodes:
+  """Junction episode state (B7): starts when any cue has held for 0.2 s; ends after no cue for 2 s and 30 m, or when no cue is active and
+  the widening has been below 0.15 m for 1 s, or after 300 m (then the cues must clear once before a new episode can start)."""
+  def __init__(self):
     self.reset()
 
   def reset(self):
     self.episode = False
-    self.mode: str | None = None
-    self.latched = False
-    self.ep_dist = 0.0
-    self.quiet = 0.0
-    self.split_seen = False
-    self.followed = False
-    self.rebase_width = False
-    self.gore_x: float | None = None
-    self.score_state = 'uncertain'
-    self.score = 0.5
-    self.blink_latched = False
-    self.choice_follow = False
-    self.ramp = False
-    self.ramp_dist = 0.0
-    self.left_lane_t = 0.0
-    self.turn_buf: deque = deque()
-    self.single.state = False
+    self.cue_t = 0.0
+    self.quiet_t = self.quiet_d = self.low_t = 0.0
+    self.dist = 0.0
+    self.blocked = False
+    self.ended = END_NONE
+    self.model_alone_time = 0.0
 
-  @property
-  def width_m(self) -> float:
-    return float(self.width.x)
-
-  def update_width(self, width: float, ok: bool):
-    if self.rebase_width and ok and not self.episode:  # the widened lane stays: it is the new through lane
-      self.width.x, self.rebase_width = float(np.clip(width, *WIDTH_RANGE)), False
-    elif not self.width.initialized:
-      if ok:  # remembered through-lane width starts from the first confident, plausible measurement
-        self.width.update(float(np.clip(width, *WIDTH_RANGE)))
-    elif ok and not self.episode and abs(width - self.width.x) < EPISODE_START:
-      self.width.update(float(np.clip(width, *WIDTH_RANGE)))
-
-  def _context(self, v: float, yaw_rate: float, ds: float, left_lane: bool, single_now: bool):
-    single = self.single.update(single_now)
-    self.turn_buf.append((ds, yaw_rate * DT_MDL))
-    while self.turn_buf and sum(d for d, _ in self.turn_buf) - self.turn_buf[0][0] >= HEADING_WINDOW:
-      self.turn_buf.popleft()
-    tight = abs(sum(p for _, p in self.turn_buf)) > HEADING_LIMIT
-    if not self.ramp:
-      return
-    self.ramp_dist += ds
-    self.left_lane_t = self.left_lane_t + DT_MDL if left_lane else 0.0
-    if v < 2.0 or tight:
-      self.ramp = False
-    elif not single and (self.ramp_dist > RAMP_N or self.left_lane_t >= 5.0):
-      self.ramp = False
-
-  def update(self, v: float, yaw_rate: float, div: float | None, split_now: bool, gore: float | None, score: float | None,
-             right_blinker: bool, left_blinker: bool, left_lane: bool, single_now: bool) -> None:
-    ds = v * DT_MDL
-    self._context(v, yaw_rate, ds, left_lane, single_now)
+  def update(self, cue: bool, widening: float | None, v: float, dt: float = DT_MDL) -> bool:
+    ds = max(v, 0.0) * dt
+    self.ended = END_NONE
     if not self.episode:
-      if split_now or (div is not None and div > EPISODE_START):
-        self.reset_episode_state()
-        self.episode, self.split_seen = True, split_now
-      else:
-        self.mode = None
-        return
+      if self.blocked:
+        if not cue:
+          self.blocked = False
+        self.cue_t = 0.0
+        return False
+      self.cue_t = self.cue_t + dt if cue else 0.0
+      if self.cue_t >= EPISODE_ON_TIME - 1e-9:
+        self.episode, self.dist, self.quiet_t, self.quiet_d, self.low_t = True, 0.0, 0.0, 0.0, 0.0
+      return self.episode
+    self.dist += ds
+    self.model_alone_time += dt
+    if cue:
+      self.quiet_t = self.quiet_d = 0.0
     else:
-      self.ep_dist += ds
-      self.split_seen |= split_now
-    # gore bookkeeping
-    if gore is not None:
-      self.gore_x = gore
-    elif self.gore_x is not None:
-      self.gore_x -= ds
-    # classifier hysteresis (ramp only): >= 0.7 split (leave < 0.6), <= 0.3 turn lane (leave > 0.4)
-    if score is not None:
-      self.score = score
-      s = self.score_state
-      if s == 'split':
-        s = 'split' if score >= 0.6 else 'uncertain'
-      elif s == 'turn':
-        s = 'turn' if score <= 0.4 else 'uncertain'
-      if s == 'uncertain':
-        s = 'split' if score >= 0.7 else ('turn' if score <= 0.3 else 'uncertain')
-      self.score_state = s
-    # the choice, then the commit latch: inside x_commit it is frozen until the gore is 20 m behind
-    if not self.latched:
-      self.choice_follow = right_blinker or (self.ramp and self.score_state == 'split')
-    if self.split_seen and not self.latched:
-      x_commit = (self.width_m / SPLIT_RATE + 1.0) * v
-      if self.gore_x is None or self.gore_x <= x_commit:
-        self.latched = True
-        self.blink_latched = right_blinker
-    self.mode = 'follow' if self.choice_follow else 'hold'
-    if self.mode == 'follow' and self.split_seen:
-      self.followed = True
-    # end of episode
-    if div is not None and div < EPISODE_END and not self.split_seen:
-      self.quiet += DT_MDL
-    else:
-      self.quiet = 0.0
-    gore_passed = self.gore_x is not None and self.gore_x <= -PAST_GORE
-    if self.quiet >= 1.0 or self.ep_dist > EPISODE_MAX or gore_passed:
-      if self.followed and self.split_seen:  # the car took the branch: it is on a ramp now
-        self.ramp, self.ramp_dist, self.left_lane_t = True, 0.0, 0.0
-      self.episode, self.mode, self.latched, self.rebase_width = False, None, False, True
-      self.split_seen, self.followed, self.gore_x = False, False, None
-
-  def reset_episode_state(self):
-    self.ep_dist, self.quiet, self.latched = 0.0, 0.0, False
-    self.followed, self.gore_x, self.choice_follow = False, None, False
-    self.score_state, self.score, self.blink_latched = 'uncertain', 0.5, False
+      self.quiet_t, self.quiet_d = self.quiet_t + dt, self.quiet_d + ds
+    self.low_t = self.low_t + dt if (not cue and widening is not None and widening < EPISODE_WIDENING) else 0.0
+    if self.dist >= EPISODE_MAX:
+      self.ended, self.blocked = END_MAX, True
+    elif self.quiet_t >= EPISODE_QUIET_TIME and self.quiet_d >= EPISODE_QUIET_DIST:
+      self.ended = END_QUIET
+    elif self.low_t >= EPISODE_WIDENING_TIME - 1e-9:
+      self.ended = END_WIDENING
+    if self.ended != END_NONE:
+      self.episode, self.cue_t = False, 0.0
+    return self.episode
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
-class YieldEstimator:
-  """Car-referenced yield trigger with the model's expected return (B6): p_exp = -rho_hat car + b_hat, rho_hat in [0, 1] per speed band
-  (RLS, 2 s forgetting, |d rho_hat / dt| <= 0.2 /s), b_hat learned only on a steady car, p_exp within 0.1 m of the onset-start prediction
-  during an onset.  p = plan endpoint relative to the car in lane coordinates, car = the car's offset right of the lane centre."""
-  def __init__(self, prior=RHO_PRIOR):
-    self.prior = tuple(prior)
+class EndpointGap:
+  """Model-independent yield trigger (B6, C7, R5-4).  x = Y_ref(L) - plan_y(L): the plan endpoint's gap to a reference (right reference, else
+  left reference, else the plan alone: x = -plan_y); x grows when the plan moves left, shrinks when the car moves right.  Smoothed 0.25 s.
+  Reference R_P: during a move to the right the running minimum of the 0.5 s median of x since the move started (not updated on jump frames
+  or frames with a candidate weight change > 0.1); otherwise x low-passed 10 s (20 s while going around), like upstream's usual.
+  q = |x - R_P| - 0.25 |k_m| L^2 / 2; departure = x - R_P (> 0: the model moves left of its usual place: obstacle on the right)."""
+  def __init__(self):
     self.reset()
 
   def reset(self):
-    self.rho = list(self.prior)
-    self.established = [None] * len(self.rho)
-    self.b = 0.0
-    self.pr = 1.0
-    self.car_prev: float | None = None
+    self.source: int | None = None
     self.ps: float | None = None
-    self.onset = False
-    self.r0 = self.b0 = 0.0
-    self.onset_car = 0.0
-    self.t = 0.0
+    self.hist: deque = deque()
+    self.rp = 0.0
+    self.moving = False
     self.q = 0.0
-    self.p_exp = 0.0
     self.departure = 0.0
 
-  @staticmethod
-  def band(v: float) -> int:
-    return int(np.searchsorted(np.array(RHO_BANDS_KMH) / 3.6, v))
-
-  def is_established(self, v: float) -> bool:
-    t = self.established[self.band(v)]
-    return t is not None and self.t - t < ESTABLISH_TTL
-
-  def road_type_changed(self):
-    self.established = [None] * len(self.rho)
-
-  def rho_hat(self, v: float) -> float:
-    return self.rho[self.band(v)]
-
-  def update(self, car: float, p: float, v: float, allowance: float, going_around: bool) -> float:
-    dt = DT_MDL
-    self.t += dt
-    k = self.band(v)
-    rh = self.rho[k]
-    ps_prev = self.ps
-    pl = car + p
-    self.ps = pl if self.ps is None else self.ps + (pl - self.ps) * dt / (dt + 1.0)
-    left = ps_prev is not None and (self.ps - ps_prev) / dt < -0.05
-    do = 0.0 if self.car_prev is None else (car - self.car_prev) / dt
-    self.car_prev = car
-    moving = abs(do) > 0.05
-    if moving and not self.onset:
-      self.onset, self.r0, self.b0, self.onset_car = True, rh, self.b, car
-    ended = self.onset and not moving
-    praw = -rh * car + self.b
-    base = -self.r0 * car + self.b0
-    p_exp = base + float(np.clip(praw - base, -ABSORB, ABSORB)) if self.onset else praw
-    q = abs(p - p_exp) - allowance
-    if ended:
-      self.onset = False
-      if abs(car - self.onset_car) > 0.2 and abs(p - p_exp) < ESTABLISH_RESIDUAL:
-        self.established[k] = self.t
-    if q < Q_NO_GROWTH:
-      lam = float(np.exp(-dt / 2.0))
-      if moving and not left:
-        kk = self.pr * car / (lam + car * self.pr * car)
-        new = rh + kk * (-(p - self.b) - rh * car)
-        self.rho[k] = float(np.clip(rh + np.clip(new - rh, -0.2 * dt, 0.2 * dt), 0.0, 1.0))
-        self.pr = (self.pr - kk * car * self.pr) / lam
-      if not moving:
-        self.b += ((p + self.rho[k] * car) - self.b) * dt / (dt + (20.0 if going_around else 10.0))
-    self.q, self.p_exp = float(q), float(p_exp)
-    self.departure = float(p_exp - p)  # > 0: the model moves left of what it was expected to do (obstacle on the right)
+  def update(self, x: float, source: int, moving: bool, skip: bool, allowance: float, going_around: bool, dt: float = DT_MDL) -> float:
+    n_med = max(1, int(round(GAP_MEDIAN_S / dt)))
+    if source != self.source or self.ps is None:
+      self.source, self.ps, self.rp, self.moving = source, x, x, False
+      self.hist = deque([x], maxlen=n_med)
+    else:
+      self.ps += (x - self.ps) * dt / (dt + GAP_SMOOTH_TAU)
+      self.hist.append(self.ps)
+    med = float(np.median(self.hist))
+    if moving:
+      if not self.moving:
+        self.rp = med
+      elif not skip:
+        self.rp = min(self.rp, med)
+    elif not skip:
+      tau = USUAL_TAU_AROUND if going_around else USUAL_TAU
+      self.rp += (self.ps - self.rp) * dt / (dt + tau)
+    self.moving = moving
+    self.departure = float(self.ps - self.rp)
+    self.q = float(abs(self.departure) - allowance)
     return self.q
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
-# Junction policy (B7): the ONLY place that decides what a junction episode does to the correction.  Episode detection, the road context
-# and logging live in JunctionLogic; a policy change (e.g. "inside an episode both corrections fade and the model drives alone") touches
-# junction_mode() / junction_policy() and their tests only.
+# Junction policy (B7, owner 20:55 and Q10): the ONLY place that decides what a junction episode does to the correction.
 @dataclass
 class PolicyWeights:
   w_rl: float = 0.0  # right-line part
   w_up: float = 0.0  # upstream part (reference instance)
-  w_hold: float = 0.0  # hold part (through lane measured from the left reference)
 
   def total(self) -> float:
-    return self.w_rl + self.w_up + self.w_hold
+    return self.w_rl + self.w_up
 
 
-def junction_mode(episode: bool, mode: str | None, right_ok: bool, left_blinker_low_speed: bool, latched: bool, left_ref_ok: bool) -> tuple[str | None, bool]:
-  """Effective mode inside an episode and the model-alone flag.  Every request that would hand over to Regular becomes hold: a lost or
-  implausible right reference, a jump, and the left blinker below 32 km/h (not inside the latch).  No usable left reference: model alone."""
-  if not episode:
-    return None, False
-  if mode == 'follow' and not right_ok:
-    mode = 'hold'
-  if left_blinker_low_speed and not latched:
-    mode = 'hold'
-  return mode, (mode == 'hold' and not left_ref_ok)
-
-
-def junction_policy(episode: bool, mode: str | None, a: float, model_alone: bool) -> PolicyWeights:
-  """Per-frame split of the correction: k0 = w_rl k0_rl + w_up k0_up + w_hold k0_hold.  Outside an episode the right-line authority a
-  blends with regular upstream; inside, the (1 - a) share is the hold correction and never the upstream one (review C1)."""
-  if not episode:
-    return PolicyWeights(a, 1.0 - a, 0.0)
-  if model_alone:
+def junction_policy(episode: bool, a: float, right_line_mode: bool = True) -> PolicyWeights:
+  """Per-frame split of the correction: k0 = w_rl k0_rl + w_up k0_up.  Outside an episode the right-line authority a blends with regular
+  upstream.  Inside an episode, in mode Right line only (Q10: Regular unchanged), both fade out through the final limiter and the model
+  steers alone: no Regular, no hold."""
+  if episode and right_line_mode:
     return PolicyWeights()
-  if mode == 'hold':
-    return PolicyWeights(0.0, 0.0, 1.0)
-  return PolicyWeights(a, 0.0, 1.0 - a)
+  return PolicyWeights(a, 1.0 - a)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -483,7 +526,11 @@ class RightInputs:
   c_applied: float = 0.0  # the offset actually applied to the model frame
   left_blinker: bool = False
   right_blinker: bool = False
+  frame_dt: float = DT_MDL  # true interval between model frames (timestampEof), s
   ref_going_around: bool = False  # the reference instance's going-around yield latch
+  ref_yield_fade: float = 1.0  # the reference instance's going-around / away fade (< 1: upstream sees an obstacle)
+  ref_lane_width: float = LANE_WIDTH_DEFAULT  # the reference instance's filtered lane width (left limit with one reference)
+  building: bool = False  # last frame's final limiter was still building the correction toward the right
 
 
 @dataclass
@@ -491,9 +538,10 @@ class RightResult:
   k0: float = 0.0  # profile amplitude before the yield cap and the final limiter
   fading: bool = False
   yield_active: bool = False
+  no_growth: bool = False  # q >= 0.1 or a yield is active: the cap logic of BlendfulCorrection acts
   yield_q: float = 0.0
-  yield_side: int = 0  # +1: obstacle on the right (model moves left), -1: obstacle on the left
-  model_alone: bool = False
+  yield_side: int = 0  # +1: obstacle on the right (model moves left), -1: obstacle on the left; latched at the start of a yield
+  episode: bool = False
   log: dict = field(default_factory=dict)
 
 
@@ -513,22 +561,22 @@ class RightLineBlendful:
     self.edge_q = FirstOrderFilter(np.zeros(2), 0.5, DT_MDL)
     self.quality_gate = ConfGate()
     self.authority = Authority()
-    self.junction = JunctionLogic()
-    self.yields = YieldEstimator()
-    self.h_lim: float | None = None
+    self.episodes = JunctionEpisodes()
+    self.width_mem = WidthMemory()
+    self.ground = GroundTarget()
+    self.gap = EndpointGap()
+    self.jumps = JumpDetector()
+    self.road = RoadClass()
     self.bend_active = Timed(off_time=1.0)
-    self.jump_hold = 0.0
     self.blink_on = Timed(off_time=1.0, on_time=0.3)
     self.f_blink = 1.0
     self.yield_latch = Timed(off_time=1.0)
     self.ref_yield_latch = Timed(off_time=1.0)
-    self.road_type: str | None = None
-    self.far_prev = None
-    self.q_prev = {}
-    self.a_star = 0.0
-    self.last_q_right = 0.0
-    self.prev_a_cmd = 0.0
-    self.pred_old = None
+    self.yield_phase = False
+    self.yield_side = 1
+    self.moving_t = 0.0
+    self.w_prev = None
+    self.no_growth_prev = False
 
   @property
   def a(self) -> float:
@@ -543,26 +591,24 @@ class RightLineBlendful:
     w /= w.sum(axis=0)
     return (w * ys).sum(axis=0), (w * np.asarray(qs)[:, None]).sum(axis=0), w
 
-  def _classify_road(self, v: float, q_l: float, q_r: float, width: float) -> str:
-    if q_l < 0.3 and q_r < 0.3:
-      return 'edges'
-    if width < 3.0:
-      return 'shared'
-    return 'motorway' if v > 22.0 and width > 3.3 else 'lanes'
-
   def _correction(self, target: np.ndarray, plan_x, plan_y, v: float, strength: float):
+    """Profile-basis fit (B4); the fitted amplitude D is clipped at D_MAX (C9).  Returns (D, strength k0, k0, D was clipped)."""
     la = approach_length(max(v, 1.0))
     l_c = profile_length(max(v, 1.0))
     win = (X_IDXS >= FIT_WINDOW[0] * la) & (X_IDXS <= FIT_WINDOW[1] * la)
     x = X_IDXS[win]
     err = np.clip(target[win] - np.interp(x, plan_x, plan_y), -ERROR_CLIP, ERROR_CLIP)
-    d, k = fit_amplitude(x, err, 1.0, l_c)
-    return d, strength * k, k
+    d, _ = fit_amplitude(x, err, 1.0, l_c)
+    clipped = abs(d) > D_MAX
+    d = float(np.clip(d, -D_MAX, D_MAX))
+    k = 6.0 * d / l_c ** 2
+    return d, strength * k, k, clipped
 
   def update(self, mo: dict, v_ego: float, active: bool, model_curvature: float, k0_up: float, p: RightInputs,
              force_regular: bool = False) -> RightResult:
+    """force_regular: mode Regular (hand-back window): a* = 0 and the junction policy does not act (Q10)."""
     t0 = time.perf_counter()
-    dt = DT_MDL
+    dt = float(p.frame_dt) if 0.2 * DT_MDL <= p.frame_dt <= 5.0 * DT_MDL else DT_MDL
     v = max(float(v_ego), 0.0)
     fading = (not active) or v < MIN_SPEED
     look = max(v * LOOKAHEAD_TIME, MIN_LOOKAHEAD)
@@ -572,6 +618,10 @@ class RightLineBlendful:
     plan = mo['plan'][0]
     plan_x, plan_y = plan[:, 0], plan[:, 1]
     yaw_rate = float(plan[0, Plan.ORIENTATION_RATE.start + 2])
+    vx0 = float(plan[0, Plan.VELOCITY.start])  # the model's own speed: the x axis of the lines carries its distance scale (K1, C11)
+    if not np.isfinite(vx0) or vx0 < 1.0:
+      vx0 = max(v, 0.0)
+    scale = float(np.clip(v / vx0, 0.8, 1.25)) if (v >= 1.0 and vx0 >= 1.0) else 1.0  # vEgo / v_x(0): the true distance per model-axis metre
     probs_raw = mo['lane_lines_prob'][0, 1::2]
     probs = self.line_probs.update(probs_raw[1:3])
     l_q = float(probs[0] * np.interp(np.interp(0.5 * look, X_IDXS, lstds[1]), LINE_STD, [1.0, 0.0]))
@@ -582,7 +632,6 @@ class RightLineBlendful:
       eq_raw = np.array([np.interp(np.interp(0.5 * look, X_IDXS, estds[i]), (0.3, 1.0), (0.8, 0.0)) for i in range(2)])
     else:
       edges = np.stack([np.full(NX, -1e3), np.full(NX, 1e3)])  # absent: far outside whatever the road does
-      estds = np.ones((2, NX))
       eq_raw = np.zeros(2)
     e_q = self.edge_q.update(eq_raw)
     # --- B2: the four filters (left line, left edge, right line, right edge)
@@ -590,7 +639,7 @@ class RightLineBlendful:
     qraw = [l_q, float(e_q[0]), r_q, float(e_q[1])]
     filt, qf = [], []
     for f, y, q in zip(self.filters, raw, qraw, strict=True):
-      yy, qq = f.update(y, q, v, yaw_rate)
+      yy, qq = f.update(y, q, vx0, yaw_rate, dt, scale)
       filt.append(yy.copy())
       qf.append(qq)
     t_filter = (time.perf_counter() - t0) * 1e3
@@ -613,105 +662,105 @@ class RightLineBlendful:
     if both and not (WIDTH_RANGE[0] <= width_now <= WIDTH_RANGE[1]):
       bad = True
     f_plaus_t = 0.0 if bad else 1.0
-    # --- jump (innovation of the right line / edge) and split pattern
-    inno = max([abs(float(np.interp(iL, X_IDXS, self.filters[i].innovation))) for i in (2, 3) if qf[i] > 0.5] or [0.0])
-    near_now, far_now = float(np.interp(iL, X_IDXS, lines[2])), float(np.interp(iL, X_IDXS, lines[3]))
-    near_old = float(np.interp(iL, X_IDXS, self.filters[2].y_pred)) if self.filters[2].initialized else near_now
-    split_now = split_pattern(near_now, far_now, near_old, float(probs_raw[2]), float(probs_raw[3]))
-    if inno > 0.5 and not split_now:
-      self.jump_hold = 2.0
-    else:
-      self.jump_hold = max(0.0, self.jump_hold - dt)
-    f_jump_t = 0.0 if self.jump_hold > 0.0 else 1.0
-    # --- lane width and centre (left limit)
-    ok_w = both and not bad
-    self.junction.update_width(width_now, ok_w)
-    hw_known = self.junction.width_m / 2
+    # --- jumps (C6): per-input thresholds, 2-frame persistence, only on a candidate with weight >= 0.5
+    w_at = (float(np.interp(iL, X_IDXS, w_r[0])), float(np.interp(iL, X_IDXS, w_r[1])))
+    inno = tuple(float(np.interp(iL, X_IDXS, self.filters[i].innovation)) for i in (2, 3))
+    jump_on = self.jumps.update(inno, w_at, (qf[2] > 0.5, qf[3] > 0.5), dt)
+    f_jump_t = 0.0 if jump_on else 1.0
+    cand_changed = self.w_prev is not None and max(abs(w_at[0] - self.w_prev[0]), abs(w_at[1] - self.w_prev[1])) > CAND_CHANGE
+    self.w_prev = w_at
+    # --- left limit T_C': the centre between the references (unclipped width with two references, upstream's filtered width with one)
     if both:
       hw = (y_r - y_l) / 2
       c_ctr, _ = Blendful.centre_and_weight(y_l, y_r, lstds[1], lstds[2], max(q_L, 1e-4), max(q_R, 1e-4), hw)
     elif q_R >= q_L:
-      c_ctr = y_r - hw_known
+      c_ctr = y_r - p.ref_lane_width / 2
     else:
-      c_ctr = y_l + hw_known
-    # --- B7 shape detectors
+      c_ctr = y_l + p.ref_lane_width / 2
+    # --- B7 shape detectors and cues
     use_left = q_L > 0.5
     y_ref = y_l if use_left else np.interp(X_IDXS, plan_x, plan_y)
     _, beta, _, b = bend_score(X_IDXS, y_r, y_ref, max(v, 1.0))
     bend_on = self.bend_active.update(b > 0.5 if not self.bend_active.state else b >= 0.2)
     f_bend_t = 0.0 if bend_on else 1.0
-    x_d = divergence_start(X_IDXS, y_r, y_ref, max(v, 1.0)) if b > 0.0 or bend_on else None
-    y_r_g = y_r.copy()
-    if x_d is not None:
-      k = X_IDXS >= x_d
-      y_r_g[k] = np.interp(x_d, X_IDXS, y_r) + (y_ref[k] - np.interp(x_d, X_IDXS, y_ref))
-    # --- junction logic
-    div = (float(np.interp(iL, X_IDXS, y_r - y_l)) - self.junction.width_m) if (both and self.junction.width.initialized) else None
-    gore = gore_distance(X_IDXS, lines[2], lines[3]) if split_now or self.junction.split_seen else None
-    feat = self._features(X_IDXS, lines, edges, probs_raw, lstds, y_l, max(v, 1.0))
-    score = split_score(feat) if self.junction.ramp else None
-    left_lane = float(probs_raw[0]) > 0.5
-    single_now = (float(probs_raw[0]) < 0.3 and qf[1] > 0.5 and 0.0 <= float(np.interp(iL, X_IDXS, filt[0] - filt[1])) <= 1.0)
-    self.junction.update(v, yaw_rate, div, split_now, gore, score, p.right_blinker, p.left_blinker, left_lane, single_now)
-    jn = self.junction
+    vv = max(v, 1.0)
+    clear_r = q_R > 0.5
+    key = ('lines' if w_at[0] >= 0.5 else 'edge', 'lines' if float(np.interp(iL, X_IDXS, w_l[0])) >= 0.5 else 'edge')
+    width_mid = float(np.interp(0.5 * look, X_IDXS, y_r - y_l))
+    self.width_mem.update(width_mid, both and not bad, self.episodes.episode, key, dt)
+    c1 = cue_widening_frame(X_IDXS, y_l, y_r, vv) if both else None
+    c2 = self.width_mem.excess(width_mid) if both else None
+    ed_g, ed_a = (0.0, 0.0)
+    ed_ok = qf[3] > 0.5 and (qf[2] > 0.5 or q_L > 0.5)
+    if ed_ok:
+      ed_g, ed_a = cue_edge_divergence(X_IDXS, filt[2] if qf[2] > 0.5 else None, filt[3], y_l if q_L > 0.5 else None, vv)
+    gore_min = None
+    if float(probs_raw[2]) > 0.5 and float(probs_raw[3]) > 0.5:
+      gore_min = cue_gore(X_IDXS, lines[2], lines[3])
+    if gore_min is None and qf[2] > 0.5 and qf[3] > 0.5:
+      gore_min = cue_gore(X_IDXS, lines[2], edges[1])
+    kink = cue_kink(X_IDXS, filt[2], y_ref, vv) if clear_r else 0.0
+    cue_flags = (c1 is not None and c1 > CUE_WIDEN_FRAME, c2 is not None and c2 > CUE_WIDEN_TIME,
+                 ed_ok and (ed_g > CUE_EDGE_DIV or ed_a > CUE_EDGE_ANGLE),
+                 (gore_min is not None and gore_min < CUE_GORE_SEP) or abs(kink) > CUE_KINK, clear_r and b >= CUE_BEND)
+    cue_any = any(cue_flags)
+    widening_vals = [c for c in (c1, c2, ed_g if ed_ok else None) if c is not None]
+    widening = max(widening_vals) if widening_vals else None
+    was_episode = self.episodes.episode
+    in_episode = self.episodes.update(cue_any, widening, v, dt)
+    if was_episode and not in_episode:  # the episode ended: re-measure the width, restart the target from the raw target
+      self.width_mem.end_of_episode()
+      self.ground.reset()
+    jn_active = in_episode and not force_regular
     # --- blinker fade (left blinker hands back to upstream; B9)
     lb = self.blink_on.update(p.left_blinker)
     self.f_blink = max(0.0, self.f_blink - dt) if lb else min(1.0, self.f_blink + dt)
-    # --- road type (resets the established flags of the yield estimator)
-    rt = self._classify_road(v, q_L, q_R, width_now)
-    if self.road_type is not None and rt != self.road_type:
-      self.yields.road_type_changed()
-    self.road_type = rt
-    # --- targets (B1, B8)
+    # --- road class (log / reports only; resets no estimator)
+    road = self.road.update(v, q_L, q_R, width_now, dt)
+    # --- targets (B1, B8): references -> raw target -> rate limit -> bounds
     g = gap_for_speed(v, p.gap_low, p.gap_high)
     win_ref = (X_IDXS >= 0.5 * look) & (X_IDXS <= 1.5 * look)
-    k_ref = 2.0 * float(np.polyfit(X_IDXS[win_ref], y_r_g[win_ref], 2)[0])
+    k_ref = 2.0 * float(np.polyfit(X_IDXS[win_ref], y_r[win_ref], 2)[0])
     off_track = L_D ** 2 * max(k_ref, 0.0) / 2
     dc = p.c_set - p.c_applied
-    hold_line = (y_l + jn.width_m) if use_left else None
-    right_ok = q_R >= 0.3 and f_jump_t >= 1.0 and f_plaus_t >= 1.0
-    mode, model_alone = junction_mode(jn.episode, jn.mode, right_ok, p.left_blinker and v < BLINKER_MAX_SPEED, jn.latched, hold_line is not None)
-    y_eff = hold_line if (jn.episode and mode == 'hold' and hold_line is not None) else y_r_g
-    # C_stable: the centre from the left reference and the remembered width; unlike c_ctr it does not move when the right reference
-    # jumps or the right line widens, so the rate limit below acts on the target's own motion (implementation choice, IMPL.md)
-    c_stable = (y_l + jn.width_m / 2) if q_L >= 0.3 else c_ctr
-    c_use = c_stable if (y_eff is hold_line and hold_line is not None) else c_ctr
-    t_r_line = y_eff - W_R - g - off_track - dc
-    t_raw = np.maximum(t_r_line, c_use)
-    t_bound_line = y_eff - W_R - LINE_BOUND - off_track - dc
+    t_r_line = y_r - W_R - g - off_track - dc
+    t_raw = np.maximum(t_r_line, c_ctr)
+    t_lim = self.ground.update(t_raw, vx0, yaw_rate, dt, scale)
+    t_left = np.maximum(t_lim, c_ctr)  # the left limit acts after the rate limit
+    t_bound_line = y_r - W_R - LINE_BOUND - off_track - dc
     w_e = float(ss((qf[3] - 0.4) / 0.2))
     t_bound_edge = filt[3] - W_R - EDGE_BOUND - off_track - dc
-    t_bounded = np.minimum(t_raw, t_bound_line)
-    t_bounded = t_bounded - w_e * np.maximum(0.0, t_bounded - t_bound_edge)
-    bound_active = bool(np.any(t_bounded < t_raw - 1e-9))
-    # --- target offset rate (glides at splits, line <-> edge)
-    h_raw = float(np.interp(iL, X_IDXS, t_bounded - c_stable))
-    first_move = not self.yields.is_established(max(v, 1.0))
-    rate = SPLIT_RATE if (jn.episode and mode == 'follow') else (FIRST_MOVE_RATE if first_move else TARGET_RATE)
-    if self.h_lim is None:
-      self.h_lim = h_raw
-    self.h_lim = float(np.clip(h_raw, self.h_lim - rate * dt, self.h_lim + rate * dt))
-    target = t_bounded - (h_raw - self.h_lim)
+    t_bounded = np.minimum(t_left, t_bound_line)
+    target = t_bounded - w_e * np.maximum(0.0, t_bounded - t_bound_edge)
+    bound_active = bool(np.any(target < t_left - 1e-9))
+    lag_L = float(np.interp(iL, X_IDXS, self.ground.lag))
     # --- correction (B4)
     w_c = float(np.interp(abs(model_curvature) * v ** 2, [0.18, 0.53], [STRENGTH_RIGHT_ONLY, 1.0])) if self.strength_rising else STRENGTH_RIGHT_ONLY
     s_r = 1.0 - (1.0 - l_q) * (1.0 - w_c * q_R)
-    d_rl, k0_rl, k_fit = self._correction(target, plan_x, plan_y, v, s_r)
-    # hold correction: the through lane position measured from the left reference
-    if hold_line is not None:
-      th = np.minimum(np.maximum(hold_line - W_R - g - off_track - dc, c_stable), hold_line - W_R - LINE_BOUND - off_track - dc)
-      _, k0_hold, _ = self._correction(th, plan_x, plan_y, v, s_r)
+    d_rl, k0_rl, k_fit, d_clipped = self._correction(target, plan_x, plan_y, v, s_r)
+    # --- yields (B6, C7, C8): the endpoint-gap trigger on the right reference, else the left one, else the plan alone
+    if q_R >= 0.3:
+      src, ref_L = 1, float(np.interp(look, X_IDXS, y_r))
+    elif q_L >= 0.3:
+      src, ref_L = 2, float(np.interp(look, X_IDXS, y_l))
     else:
-      k0_hold = 0.0
-    # --- yields (B6)
-    c0 = -float(np.interp(0.0, X_IDXS, c_ctr))  # the car's offset right of the lane centre
-    p_lane = float(np.interp(look, plan_x, plan_y) - np.interp(look, X_IDXS, c_ctr))
+      src, ref_L = 0, 0.0
+    x_gap = ref_L - float(np.interp(look, plan_x, plan_y))
     allow = 0.25 * abs(model_curvature) * look ** 2 / 2
-    valid_y = q_R >= 0.3 and not fading
-    q_y = self.yields.update(c0, p_lane - c0, max(v, 1.0), allow, p.ref_going_around) if valid_y else 0.0
-    side = 1 if self.yields.departure > 0 else -1
+    move_now = (not self.no_growth_prev) and (lag_L > MOVE_LAG_EPS or self.authority.a < self.authority.a_cmd - 1e-6 or p.building)
+    self.moving_t = MOVE_SETTLE if move_now else max(0.0, self.moving_t - dt)
+    skip = (not f_jump_t) or cand_changed
+    q_y = self.gap.update(x_gap, src, self.moving_t > 0.0, bool(skip), allow, self.ref_around(p), dt) if not fading else 0.0
+    dep = self.gap.departure
     car_trig = self.yield_latch.update(q_y > Q_CAP_FULL if not self.yield_latch.state else q_y >= Q_RELEASE)
-    ref_trig = self.ref_yield_latch.update(p.ref_going_around)
-    yield_active = bool(car_trig or ref_trig) and valid_y
+    ref_trig = self.ref_yield_latch.update(self.ref_around(p))
+    yield_active = bool(car_trig or ref_trig) and not fading
+    no_growth = bool(q_y >= Q_NO_GROWTH or yield_active) and not fading
+    if no_growth and not self.yield_phase:  # the obstacle side is latched at the start of a yield and kept until it ends
+      self.yield_side = 1 if dep > 0 else -1
+    self.yield_phase = no_growth
+    self.no_growth_prev = no_growth
+    side = self.yield_side
     q_eff = max(q_y, Q_CAP_FULL) if ref_trig else q_y
     f_yl = 0.0 if (yield_active and side > 0) else 1.0
     f_yr = float(np.interp(q_eff, (0.2, 0.45), (1.0, 0.0))) if (yield_active and side < 0) else 1.0
@@ -719,58 +768,51 @@ class RightLineBlendful:
     # --- authority (B5)
     qa = self.quality_gate.update(q_R)
     a_star = float(qa)
-    f_split = 0.0 if (jn.episode and jn.split_seen and mode == 'hold') else 1.0
-    a_star *= f_bend_t * f_split * f_jump_t * f_plaus_t * self.f_blink * f_yl
+    f_ep = 0.0 if jn_active else 1.0
+    a_star *= f_bend_t * f_jump_t * f_plaus_t * self.f_blink * f_yl * f_ep
     if force_regular or fading:
       a_star = 0.0
     if q_y >= Q_NO_GROWTH:
       a_star = min(a_star, self.authority.a_cmd)
     a = self.authority.update(a_star)
-    wts = junction_policy(jn.episode, mode, a, model_alone)
-    k0 = wts.w_rl * k0_rl + wts.w_up * k0_up + wts.w_hold * k0_hold
+    wts = junction_policy(in_episode, a, right_line_mode=not force_regular)
+    k0 = wts.w_rl * k0_rl + wts.w_up * k0_up
     if fading:
       k0 = 0.0
     right_only = bool(q_R > 0.5 and l_q < 0.3)
     gap_now = float(np.interp(0.0, X_IDXS, y_r) - W_R)
+    em = self.episodes
+    cue_bits = sum(int(f) << i for i, f in enumerate(cue_flags))
+    wm = self.width_mem
     log = {
       'applied': a > 0.0, 'gap': g, 'gap_now': gap_now, 'q_R': q_R, 'q_L': q_L, 'a': a, 'a_star': a_star,
-      'f_bend': f_bend_t, 'f_split': f_split, 'f_yl': f_yl, 'f_yr': f_yr, 'f_jump': f_jump_t, 'f_plaus': f_plaus_t, 'f_blink': self.f_blink,
-      'away_car': q_y, 'rho': self.yields.rho_hat(max(v, 1.0)), 'bias': self.yields.b, 's_r': s_r, 'w_c': w_c, 'right_only': right_only,
+      'f_bend': f_bend_t, 'f_yl': f_yl, 'f_yr': f_yr, 'f_jump': f_jump_t, 'f_plaus': f_plaus_t, 'f_blink': self.f_blink,
+      'away_car': q_y, 's_r': s_r, 'w_c': w_c, 'right_only': right_only,
       'curve_accel': abs(model_curvature) * v ** 2, 'yield_active': yield_active, 'bound_active': bound_active,
-      'k_rl': k0_rl, 'weights': (wts.w_rl, wts.w_up, wts.w_hold), 'l_c': profile_length(max(v, 1.0)), 'd': d_rl, 'filter_ms': t_filter,
+      'k_rl': k0_rl, 'weights': (wts.w_rl, wts.w_up), 'l_c': profile_length(max(v, 1.0)), 'd': d_rl, 'd_clipped': d_clipped, 'filter_ms': t_filter,
       'filtered': np.concatenate([[np.interp(xq, X_IDXS, f) for xq in (0.0, 0.5 * look, look, 1.5 * look)] for f in filt]),
       'raw': np.concatenate([[np.interp(xq, X_IDXS, r_) for xq in (0.0, 0.5 * look, look, 1.5 * look)] for r_ in raw]),
       'filter_offset': np.array([float(np.interp(iL, X_IDXS, f - r_)) for f, r_ in zip(filt, raw, strict=True)]),
       'confidence': np.array(qf), 'state': np.array([int(f.coast) | (int(f.reinit) << 1) for f in self.filters]),
       'cand_conf': np.array([c_l[0], c_l[1], c_r[0], c_r[1]]),
-      'cand_weight': np.array([w_l[0][int(np.searchsorted(X_IDXS, iL))], w_l[1][int(np.searchsorted(X_IDXS, iL))],
-                               w_r[0][int(np.searchsorted(X_IDXS, iL))], w_r[1][int(np.searchsorted(X_IDXS, iL))]]),
+      'cand_weight': np.array([float(np.interp(iL, X_IDXS, w_l[0])), float(np.interp(iL, X_IDXS, w_l[1])), w_at[0], w_at[1]]),
       'reference': np.array([np.interp(iL, X_IDXS, y_l), np.interp(iL, X_IDXS, y_r)]), 'target': target,
-      'episode': jn.episode, 'latched': jn.latched, 'ramp': jn.ramp, 'hold': bool(jn.episode and mode == 'hold'), 'score': jn.score,
-      'c_ctr': c_ctr, 'c_stable': c_stable, 'y_r': y_r, 'y_l': y_l, 'hold_line': hold_line, 'k0_hold': k0_hold, 'split_now': split_now, 'beta': beta,
+      'episode': in_episode, 'episode_ended': em.ended, 'episode_dist': em.dist if in_episode else 0.0, 'model_alone_time': em.model_alone_time,
+      'cues': cue_bits, 'cue_values': np.array([c1 if c1 is not None else 0.0, c2 if c2 is not None else 0.0, ed_g if ed_ok else 0.0, ed_a if ed_ok else 0.0,
+                                                 gore_min if gore_min is not None else 0.0, kink, b]),
+      'widening': widening if widening is not None else 0.0,
+      'width_mem': wm.w if wm.armed else 0.0, 'width_age': wm.age, 'width_state': int(wm.armed) | (int(wm.stale) << 1) | (int(not wm.armed) << 2),
+      'road_class': road, 'frame_dt': dt, 'plan_speed': vx0, 'target_lag': lag_L,
+      'yield_side': side if no_growth else 0, 'yield_source': src, 'yield_moving': self.moving_t > 0.0,
+      't_raw': t_raw, 't_lim': t_lim, 'y_edge_r': filt[3], 'c_ctr': c_ctr, 'y_r': y_r, 'y_l': y_l, 'beta': beta, 'jump_inno': np.array(inno),
     }
-    return RightResult(k0=float(k0), fading=fading, yield_active=yield_active, yield_q=float(q_eff), yield_side=side,
-                       model_alone=model_alone, log=log)
+    return RightResult(k0=float(k0), fading=fading, yield_active=yield_active, no_growth=no_growth, yield_q=float(q_eff), yield_side=side,
+                       episode=in_episode, log=log)
 
   @staticmethod
-  def _features(x, lines, edges, probs_raw, lstds, y_l, v) -> dict:
-    """Geometric evidence for the split classifier from the raw lines (B7); the short pocket uses the far right line's std growth."""
-    near, far = lines[2], lines[3]
-    feat: dict = {}
-    try:
-      _, b_near, _, bn = bend_score(x, near, y_l, v)
-      _, b_far, _, bf = bend_score(x, far, y_l, v)
-      feat['both_moderate'] = 1 / 1000 < b_near < 1 / 60 and 1 / 1000 < b_far < 1 / 60
-      feat['parallel_then_bend'] = bn < 0.2 and bf >= 0.5
-    except np.linalg.LinAlgError:
-      pass
-    sep = far - near
-    feat['gore_full_lanes'] = bool(np.interp(60.0, x, sep) >= 2.6 and np.interp(60.0, x, near - y_l) >= 2.6)
-    feat['short_pocket'] = bool(np.interp(120.0, x, lstds[3]) > 0.6)
-    ed = edges[1]
-    feat['edge_follows_outer'] = bool(np.std((ed - far)[(x > 5) & (x < 80)]) < 0.5)
-    feat['edge_cornering'] = bool(np.interp(80.0, x, ed) - np.interp(10.0, x, ed) - (np.interp(80.0, x, far) - np.interp(10.0, x, far)) > 2.0)
-    return feat
+  def ref_around(p: RightInputs) -> bool:
+    """The reference instance sees an obstacle: its going-around latch, or its going-around / away fade below 1 (C8)."""
+    return bool(p.ref_going_around or p.ref_yield_fade < 1.0)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -786,10 +828,11 @@ class BlendfulCorrection:
     self.gain = 1.0
     self.k_up = 0.0
     self.result = RightResult()
-    self.cap_latch = 0.0
+    self.cap_mem: float | None = None  # the toward-obstacle correction at the no-growth point; lives as long as the yield (C8)
     self.cap_active = False
     self.release_window = False
-    self.last_s_c = 0.0
+    self.building = False
+    self.right_idle = True
 
   @property
   def releasing(self) -> bool:
@@ -807,7 +850,7 @@ class BlendfulCorrection:
     """Returns k0.  mode MODE_OFF only releases a remaining correction (2.0 m/s^3) and then resets the instances."""
     p = p or RightInputs()
     v_eff = max(v_ego, 1.0)
-    self.gain = instant_gain(v_eff, lat_action_t)
+    self.gain = instant_gain(v_eff, lat_action_t, mo['plan'][0][:, Plan.VELOCITY.start])  # F per frame with the plan's own v_x (C11)
     f = self.gain
     if mode == MODE_OFF:
       self.reference.update(mo, v_ego, active, model_curvature, enabled=False)
@@ -817,21 +860,29 @@ class BlendfulCorrection:
       self.result = RightResult()
       if self.c == 0.0:
         self.right.reset()
+        self.right_idle = True
       self.mode = mode
       return self.k0
     if self.mode == MODE_OFF:
       self.right.reset()
     if mode == MODE_REGULAR and self.mode == MODE_RIGHT:
-      self.right.junction.reset()
+      self.right.episodes.reset()
     self.mode = mode
     self.k_up = self.reference.update(mo, v_ego, active, model_curvature, enabled=True)
     k0_up = self.k_up / f
     p.ref_going_around = self.reference.going_around
+    p.ref_yield_fade = self.reference.yield_fade
+    p.ref_lane_width = float(self.reference.lane_width.x)
+    p.building = self.building
     res = RightResult()
     if mode == MODE_RIGHT or (mode == MODE_REGULAR and self.right.a > 0.0):
+      if self.right_idle:  # the instance was not running (Regular with a = 0): its filters are stale
+        self.right.reset()
+      self.right_idle = False
       res = self.right.update(mo, v_ego, active, model_curvature, k0_up, p, force_regular=(mode == MODE_REGULAR))
       k0_target = res.k0
     else:
+      self.right_idle = True
       k0_target = k0_up
       res.fading = (not active) or v_ego < MIN_SPEED
     self.result = res
@@ -839,26 +890,26 @@ class BlendfulCorrection:
     release = FADING_RELEASE if res.fading else RELEASE
     self.cap_active = False
     self.release_window = False
-    if mode == MODE_RIGHT and res.yield_active:
+    if mode == MODE_RIGHT and res.no_growth:
       s, q = res.yield_side, res.yield_q
       toward, prev = s * c_target, max(s * self.c, 0.0)
-      if q < Q_NO_GROWTH:
-        self.cap_latch = 0.0
-      if q >= Q_NO_GROWTH and toward > prev:
+      if self.cap_mem is None:
+        self.cap_mem = prev
+      self.cap_mem = min(self.cap_mem, prev)  # non-increasing: no latched remainder can come back
+      if toward > prev:  # no growth toward the obstacle from q = 0.1 m
         toward, self.cap_active = prev, True
-      if q >= Q_CAP_START:
-        if self.cap_latch == 0.0:
-          self.cap_latch = prev
-        x_cap = self.cap_latch * float(np.clip((Q_CAP_FULL - q) / (Q_CAP_FULL - Q_CAP_START), 0.0, 1.0))
-        if toward > x_cap:
-          toward, self.cap_active = x_cap, True
-        if q >= Q_CAP_FULL and s * self.c > x_cap + 1e-12:
-          release, self.release_window = SWERVE_RELEASE, True
+      x_cap = self.cap_mem * float(np.clip((Q_CAP_FULL - q) / (Q_CAP_FULL - Q_CAP_START), 0.0, 1.0))
+      if toward > x_cap:
+        toward, self.cap_active = x_cap, True
+      if q >= Q_CAP_FULL and s * self.c > x_cap + 1e-12:
+        release, self.release_window = SWERVE_RELEASE, True
       if self.cap_active:
         c_target = s * toward if s * c_target > toward else c_target
-    elif not res.yield_active:
-      self.cap_latch = 0.0
-    self.c = self._limit(c_target, v_ego, release)
+    else:
+      self.cap_mem = None
+    c_new = self._limit(c_target, v_ego, release)
+    self.building = (c_target - c_new) > 1e-9  # still building toward the right
+    self.c = c_new
     self.k0 = self.c / f
     return self.k0
 
@@ -884,7 +935,8 @@ def apply_correction(mo: dict, k0: float, v_ego: float) -> dict:
 
 
 def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
-  """Additive modelDataV2SP fields (DESIGN D logging)."""
+  """Additive modelDataV2SP fields (DESIGN D logging).  Fields of the first implementation that no longer have a meaning (rho, bias, split
+  score, latch / ramp / hold, split fade) are kept in the schema (additive only) and written as constants."""
   builder.blendfulMode = int(mode)
   builder.blendfulGainF = float(ctl.gain)
   builder.blendfulKappaUp = float(ctl.k_up)
@@ -895,19 +947,29 @@ def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
     return
   builder.blendfulRightApplied = bool(lg['applied'])
   for name, key in (('RightGap', 'gap'), ('RightGapNow', 'gap_now'), ('RightQuality', 'q_R'), ('LeftRefQuality', 'q_L'), ('Authority', 'a'),
-                    ('AuthorityTarget', 'a_star'), ('FadeBend', 'f_bend'), ('FadeSplit', 'f_split'), ('FadeYieldLeft', 'f_yl'),
+                    ('AuthorityTarget', 'a_star'), ('FadeBend', 'f_bend'), ('FadeYieldLeft', 'f_yl'),
                     ('FadeYieldRight', 'f_yr'), ('FadeJump', 'f_jump'), ('FadePlausibility', 'f_plaus'), ('FadeBlinker', 'f_blink'),
-                    ('AwayCar', 'away_car'), ('Rho', 'rho'), ('Bias', 'bias'), ('Strength', 's_r'), ('StrengthWeight', 'w_c'),
+                    ('AwayCar', 'away_car'), ('Strength', 's_r'), ('StrengthWeight', 'w_c'),
                     ('CurveAccel', 'curve_accel'), ('KappaRL', 'k_rl'), ('ProfileLength', 'l_c'), ('ProfileShift', 'd'),
-                    ('FilterTime', 'filter_ms'), ('SplitScore', 'score')):
-    setattr(builder, 'blendful' + name, float(lg[key]))
+                    ('FilterTime', 'filter_ms'), ('JunctionEpisodeDistance', 'episode_dist'), ('JunctionWidening', 'widening'),
+                    ('WidthMemory', 'width_mem'), ('WidthMemoryAge', 'width_age'), ('ModelAloneTime', 'model_alone_time'),
+                    ('FrameDt', 'frame_dt'), ('PlanSpeed', 'plan_speed'), ('TargetLag', 'target_lag')):
+    setattr(builder, 'blendful' + name, float(lg.get(key, 0.0)))
+  builder.blendfulCapMemory = float(ctl.cap_mem or 0.0)
+  builder.blendfulFadeSplit = 1.0  # superseded (junction rev 5): no split fade
   builder.blendfulRightOnly = bool(lg['right_only'])
   builder.blendfulYieldActive = bool(lg['yield_active'])
   builder.blendfulBoundActive = bool(lg['bound_active'])
   builder.blendfulJunctionEpisode = bool(lg['episode'])
-  builder.blendfulJunctionLatched = bool(lg['latched'])
-  builder.blendfulJunctionRamp = bool(lg['ramp'])
-  builder.blendfulJunctionHold = bool(lg['hold'])
+  builder.blendfulDClipped = bool(lg['d_clipped'])
+  builder.blendfulYieldMoving = bool(lg['yield_moving'])
+  builder.blendfulJunctionCues = int(lg['cues'])
+  builder.blendfulJunctionEnded = int(lg['episode_ended'])
+  builder.blendfulWidthMemoryState = int(lg['width_state'])
+  builder.blendfulRoadClass = int(lg['road_class'])
+  builder.blendfulYieldSide = int(lg['yield_side'])
+  builder.blendfulYieldSource = int(lg['yield_source'])
+  builder.blendfulJunctionCueValues = [float(x) for x in lg['cue_values']]
   builder.blendfulInputFiltered = [float(x) for x in lg['filtered']]
   builder.blendfulInputRaw = [float(x) for x in lg['raw']]
   builder.blendfulFilterOffset = [float(x) for x in lg['filter_offset']]

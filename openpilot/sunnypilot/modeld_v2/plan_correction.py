@@ -72,7 +72,12 @@ def shift_plan(plan: np.ndarray, k0: float, v_ego: float, approach_time: float =
   return out
 
 
-def instant_gain(v_ego: float, lat_action_t: float, approach_time: float = APPROACH_TIME) -> float:
-  """F: the instantaneous desired-curvature correction per unit profile amplitude, through get_curvature_from_plan itself."""
+def instant_gain(v_ego: float, lat_action_t: float, plan_vx: np.ndarray | None = None, approach_time: float = APPROACH_TIME) -> float:
+  """F: the instantaneous desired-curvature correction per unit profile amplitude, through get_curvature_from_plan itself.
+
+  plan_vx is the raw plan's own v_x(t) (rev 5, C11): the shifted plan carries orientation rate v_x(t) dk(t), so the rate term of
+  get_curvature_from_plan is v_x(0) dk(0) / vEgo, i.e. F = 2 dpsi1(t_a) / (vEgo t_a) - v_x(0) dk1(0) / vEgo, per frame.  Without a plan
+  (None) the plan speed is taken to be vEgo."""
   _, dpsi, dk = profile(1.0, v_ego, approach_time)
-  return float(get_curvature_from_plan(dpsi, v_ego * dk, T_IDXS, v_ego, lat_action_t))
+  vx = np.full(len(T_IDXS), v_ego) if plan_vx is None else np.asarray(plan_vx, dtype=float)
+  return float(get_curvature_from_plan(dpsi, vx * dk, T_IDXS, v_ego, lat_action_t))

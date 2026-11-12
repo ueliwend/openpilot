@@ -1,6 +1,6 @@
 """
 Tests of the Blendful plan shift (plan_correction.py) and of its delivery in ModelState.get_action_from_model (modes Off / Regular).
-Design: inster-dev results/2026-11-12_a8_right_line_blendful/DESIGN.md rev 4.3, section C and E3.
+Design: inster-dev results/2026-11-12_a8_right_line_blendful/DESIGN.md rev 5.1, section C and E3 (implementation round 2).
 """
 import importlib.abc
 import importlib.machinery
@@ -108,6 +108,64 @@ class TestPlanShift:
 
   def test_gain_value_at_two_second_approach(self):
     assert abs(instant_gain(15.0, LAT_T) - 0.821) < 0.005  # DESIGN check 13: F = 0.821 at L_a = 2.0 s, above the 10 m floor
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# C11 (rev 5): F per frame with the plan's own v_x(0); a pure numpy path (no modeld, no msgq), so it is never skipped
+def vx_plan(v, scale, wobble=0.0):
+  """The plan's own speed profile: v_x(0) = scale x vEgo, optionally varying along t."""
+  return v * scale * (1.0 + wobble * np.sin(T_IDXS / 2.0))
+
+
+def plan_with_speed(plan, v, scale, wobble):
+  out = np.array(plan, copy=True)
+  out[:, Plan.VELOCITY.start] = vx_plan(v, scale, wobble)
+  out[:, Plan.ORIENTATION_RATE.start + 2] = out[:, Plan.VELOCITY.start] * plan[:, Plan.ORIENTATION_RATE.start + 2] / v
+  return out
+
+
+class TestFramewiseGain:
+  @pytest.mark.parametrize("scale", [1.0, 1.08, 0.967])
+  def test_f_formula(self, scale):
+    v = 15.0
+    vx = vx_plan(v, scale)
+    _, dpsi, dk = profile(1.0, v)
+    psi_ta = (LAT_T / 0.3) * np.interp(0.3, T_IDXS, dpsi)  # t_a < 0.3 s: get_curvature_from_plan's own branch
+    want = 2.0 * psi_ta / (v * LAT_T) - vx[0] * dk[0] / v
+    assert abs(instant_gain(v, LAT_T, vx) - want) < 1e-12
+    assert abs(instant_gain(v, LAT_T) - instant_gain(v, LAT_T, np.full(33, v))) < 1e-15  # without a plan: v_x = vEgo
+
+  def test_vego_scaling_would_be_wrong_by_the_speed_ratio(self):
+    v = 15.0
+    assert abs(instant_gain(v, LAT_T, vx_plan(v, 1.08)) / instant_gain(v, LAT_T) - 1.0) > 0.03  # the first implementation's 0.954 x error
+
+  @pytest.mark.parametrize("scale", [1.08, 0.967, 1.0])
+  @pytest.mark.parametrize("wobble", [0.0, 0.04])
+  @pytest.mark.parametrize("v", [8.0, 15.0, 25.0])
+  def test_regular_delivery_equals_upstream_and_mpc_row_gains_exactly_dk(self, scale, wobble, v):
+    from openpilot.sunnypilot.modeld_v2.blendful_right import MODE_REGULAR, BlendfulCorrection
+    from openpilot.sunnypilot.modeld_v2.tests.test_blendful_right import Scene
+    ctl, ref = BlendfulCorrection(), Blendful()
+    worst_gain = worst_row = 0.0
+    nonzero = 0
+    for i in range(200):
+      sc = Scene(v=v, center=0.5 if i < 120 else -0.3, k=0.0 if i < 60 else 1 / 150, edges=False)
+      mo = sc.model_output()
+      mo['plan'][0] = plan_with_speed(mo['plan'][0], v, scale, wobble)
+      plan_before = mo['plan'][0].copy()
+      k_m = curvature(plan_before, v)  # the model's own curvature, as get_action_from_model passes it on
+      k0 = ctl.update(mo, v, True, k_m, LAT_T, MODE_REGULAR)
+      up = ref.update(sc.model_output(), v, True, k_m, enabled=True)
+      shifted = shift_plan(plan_before, k0, v)
+      gain = curvature(shifted, v) - curvature(plan_before, v)  # what desiredCurvature gains from the shifted plan
+      worst_gain = max(worst_gain, abs(gain - up))
+      nonzero += abs(up) > 1e-6
+      row = lambda p: p[:, Plan.ORIENTATION_RATE][:, 2] / p[:, Plan.VELOCITY][:, 0]  # noqa: E731
+      _, _, dk = profile(k0, v)
+      worst_row = max(worst_row, float(np.max(np.abs(row(shifted) - row(plan_before) - dk))))
+    assert nonzero > 50  # the fixture really exercises a correction
+    assert worst_gain <= 1e-9  # delivered = today's add-on (E1-12), whatever v_x(0) / vEgo
+    assert worst_row <= 1e-12  # the MPC row gains exactly the curvature change
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------

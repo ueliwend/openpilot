@@ -1,9 +1,9 @@
 """
-Unit tests of Right-line Blendful (blendful_right.py): measurement filter, references, correction law, yields, junctions, bounds, blinkers,
-transitions, logging and the three modes.  Design: inster-dev results/2026-11-12_a8_right_line_blendful/DESIGN.md rev 4.3, section E3.
+Unit tests of Right-line Blendful (blendful_right.py): measurement filter, references, correction law, ground-fixed target, yields, junction
+episodes (model alone), bounds, blinkers, transitions, logging and the three modes.  Design: inster-dev
+results/2026-11-12_a8_right_line_blendful/DESIGN.md rev 5.1, section E3 (implementation round 2).
 Signs: model frame y > 0 is right, curvature > 0 is a right turn.  Offline only; not validated on the car.
 """
-import copy
 from dataclasses import dataclass
 
 import numpy as np
@@ -12,9 +12,9 @@ import pytest
 from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.modeld_v2 import blendful_right as br
 from openpilot.sunnypilot.modeld_v2.blendful import Blendful
-from openpilot.sunnypilot.modeld_v2.blendful_right import (MODE_OFF, MODE_REGULAR, MODE_RIGHT, BlendfulCorrection, ConfGate, InputFilter, JunctionLogic,
-                                                           RightInputs, RightLineBlendful, YieldEstimator, bend_score, junction_mode,
-                                                           junction_policy, mode_from_params, selection_to_params, split_score)
+from openpilot.sunnypilot.modeld_v2.blendful_right import (MODE_OFF, MODE_REGULAR, MODE_RIGHT, BlendfulCorrection, ConfGate, EndpointGap, GroundTarget,
+                                                           InputFilter, JumpDetector, JunctionEpisodes, RightInputs, RightLineBlendful, RoadClass,
+                                                           WidthMemory, bend_score, junction_policy, mode_from_params, selection_to_params)
 from openpilot.sunnypilot.modeld_v2.constants import ModelConstants, Plan
 from openpilot.sunnypilot.modeld_v2.plan_correction import shift_plan
 
@@ -33,6 +33,8 @@ class Scene:
   pl: float = 0.9  # left / right near line probabilities
   pr: float = 0.9
   std: float = 0.1
+  lever: bool = False  # lines and plan follow the circle seen from the device, l_d ahead of the rear axle (consistent with the filters' motion model)
+  vx_scale: float = 1.0  # the plan's own v_x(0) / vEgo (the model's distance scale, C11 / K1)
   plan: float = 0.0  # plan lateral offset reached at 10 m (model plan, relative to the road)
   widen: float = 0.0  # extra distance of the right line (a widening)
   far_pr: float = 0.0  # far right line probability
@@ -48,7 +50,8 @@ class Scene:
   far_at: float | None = None  # ... and the new far right line where the old near right line was (absolute, relative to the centre)
 
   def model_output(self):
-    road = self.k * X ** 2 / 2
+    xt = X / self.vx_scale  # true distance of a model-axis point (the model's distance scale, C11 / K1)
+    road = self.k * xt ** 2 / 2 + (br.L_D * self.k * xt if self.lever else 0.0)
     hw = self.width / 2
     lines = np.zeros((1, 4, 33, 2))
     stds = np.ones((1, 4, 33, 2))
@@ -67,7 +70,7 @@ class Scene:
     plan = np.zeros((1, 33, 15))
     plan[0, :, 0] = X
     plan[0, :, 1] = road + self.plan * np.clip(X / 10, 0, 1)
-    plan[0, :, 3] = self.v
+    plan[0, :, 3] = self.v * self.vx_scale
     plan[0, 0, Plan.ORIENTATION_RATE.start + 2] = self.v * self.k if self.yaw_rate is None else self.yaw_rate
     mo = {'lane_lines': lines, 'lane_lines_stds': stds, 'lane_lines_prob': probs, 'plan': plan}
     if self.edges:
@@ -244,6 +247,12 @@ class TestReferences:
     y, _, _ = RightLineBlendful._reference(np.array([[1.6] * 33, [1.8] * 33]), [0.9, 0.9], [conf, 1.0], +1)
     assert abs(y[5] - expected) < 0.02
 
+  @staticmethod
+  def _moves(tg, v=20.0):
+    """Per frame, per point: the target's change relative to its own-motion prediction (the ground-fixed part removed)."""
+    inside = X + v * DT_MDL <= X[-1]
+    return np.concatenate([(b - br.motion_predict(a, v, 0.0, DT_MDL))[inside] for a, b in zip(tg[:-1], tg[1:], strict=True)])
+
   def _edge_line_run(self, prob_fn, frames=80):
     """Right edge at 1.9 m (counted 1.8 m), an inner right line at 1.6 m whose probability follows prob_fn(t)."""
     rl = RightLineBlendful()
@@ -257,19 +266,21 @@ class TestReferences:
       res = rl.update(sc_mo, 20.0, True, 0.0, 0.0, RightInputs())
       if i >= 0:
         refs.append(res.log['reference'][1])
-        targets.append(target_at(res.log, 20.0) - float(np.interp(20.0, X, res.log['c_stable'])))  # h: the target's offset from the stable centre
+        targets.append(res.log['t_lim'].copy())  # the ground-fixed, rate-limited target
     return np.array(refs), np.array(targets)
 
   def test_inner_line_fading_in_glides(self):
     refs, tg = self._edge_line_run(lambda t: 0.05 if t < 1.0 else float(np.clip(0.05 + (t - 1.0), 0, 0.9)), 120)
     assert abs(refs[0] - 1.8) < 0.05 and abs(refs[-1] - 1.6) < 0.05
-    assert np.max(np.abs(np.diff(tg))) <= br.FIRST_MOVE_RATE * DT_MDL + 1e-9  # the offset rate limit turns it into a glide
+    d = self._moves(tg)
+    assert d.min() >= -br.TARGET_RATE_LEFT * DT_MDL - 1e-9 and d.max() <= br.MOVE_RATE_RIGHT * DT_MDL + 1e-9  # the rate limit turns it into a glide
 
   def test_inner_line_fading_out_and_vanishing_glide(self):
     for prob in (lambda t: 0.9 if t < 1.0 else float(np.clip(0.9 - (t - 1.0) / 0.3, 0.0, 0.9)), lambda t: 0.9 if t < 1.0 else 0.0):
       refs, tg = self._edge_line_run(prob, 120)
       assert abs(refs[10] - 1.6) < 0.05 and abs(refs[-1] - 1.8) < 0.05
-      assert np.max(np.abs(np.diff(tg))) <= br.FIRST_MOVE_RATE * DT_MDL + 1e-9
+      d = self._moves(tg)
+      assert d.min() >= -br.TARGET_RATE_LEFT * DT_MDL - 1e-9 and d.max() <= br.MOVE_RATE_RIGHT * DT_MDL + 1e-9
 
   def test_inner_line_flicker_at_threshold_changes_nothing(self):
     refs, tg = self._edge_line_run(lambda t: 0.35 + 0.1 * np.sin(2 * np.pi * 3 * t), 120)
@@ -370,8 +381,8 @@ class TestCorrectionLaw:
   def test_a_equals_zero_matches_the_reference_instance_through_the_pipeline(self):
     ctl, ref = BlendfulCorrection(), Blendful()
     worst = 0.0
-    for i in range(200):
-      sc = Scene(v=15.0, center=0.5 if i < 120 else -0.3, k=0.0 if i < 60 else 1 / 150, pr=0.0)
+    for _ in range(200):
+      sc = Scene(v=15.0, center=0.5, k=1 / 150, pr=0.0, lever=True)  # a steady circle: consistent with the car's own motion
       ctl.update(sc.model_output(), 15.0, True, sc.k, LAT_T, MODE_RIGHT)
       up = ref.update(sc.model_output(), 15.0, True, sc.k, enabled=True)
       worst = max(worst, abs(ctl.c - up))
@@ -420,9 +431,9 @@ class TestCorrectionLaw:
 
   def test_gap_of_point_two_target_and_bound_coincide(self):
     for v, k in ((10.0, 0.0), (20.0, 0.0), (10.0, 1 / 30), (25.0, 1 / 150)):
-      rl, res = steady(v=v, k=k, width=4.5, frames=300, rl_kwargs={'inputs': RightInputs(gap_low=0.2, gap_high=0.2)})
+      rl, res = steady(v=v, k=k, width=4.5, lever=True, frames=300, rl_kwargs={'inputs': RightInputs(gap_low=0.2, gap_high=0.2)})
       assert not res.log['bound_active']  # the bound term never acts beyond the target: no sign change, no oscillation
-      rl2, res2 = run_rl([Scene(v=v, k=k, width=4.5)] * 100, inputs=RightInputs(gap_low=0.2, gap_high=0.2), rl=rl)
+      rl2, res2 = run_rl([Scene(v=v, k=k, width=4.5, lever=True)] * 100, inputs=RightInputs(gap_low=0.2, gap_high=0.2), rl=rl)
       assert np.ptp([target_at(r.log, v) for r in res2]) < 1e-6
 
   def test_rear_wheel_bounds_on_lineless_narrow_road(self):
@@ -433,13 +444,13 @@ class TestCorrectionLaw:
 
   def test_right_curve_off_tracking_in_gap_and_bound(self):
     k = 1 / 30
-    rl, res = steady(v=10.0, k=k, width=4.5, frames=300)
+    rl, res = steady(v=10.0, k=k, width=4.5, lever=True, frames=300)
     look = max(1.5 * 10.0, 10.0)
     right_line = float(np.interp(look, X, res.log['y_r']))
     off = br.L_D ** 2 * k / 2
     assert abs((right_line - (target_at(res.log, 10.0) + W_R)) - (br.gap_for_speed(10.0, 0.5, 1.0) + off)) < 0.02
     # the model cutting the inside does not move the bound
-    rl2, res2 = run_rl([Scene(v=10.0, k=k, width=4.5, plan=0.8)] * 100, rl=rl)
+    rl2, res2 = run_rl([Scene(v=10.0, k=k, width=4.5, plan=0.8, lever=True)] * 100, rl=rl)
     t2 = target_at(res2[-1].log, 10.0)
     assert t2 <= right_line - W_R - br.LINE_BOUND - off + 1e-6
 
@@ -452,121 +463,6 @@ class TestCorrectionLaw:
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
-def upstream_from_centre_trigger(sw_start, sw_T, T=60.0, noise=0.03, seed=1):
-  rng = np.random.default_rng(seed)
-  usual, tt = 0.0, None
-  for i in range(int(T / DT_MDL)):
-    t = i * DT_MDL
-    sw = 0.8 * np.clip((t - sw_start) / sw_T, 0, 1) if t >= sw_start else 0.0
-    off = -sw + noise * rng.standard_normal()
-    if t >= sw_start and tt is None and abs(off - usual) > 0.2:
-      tt = t - sw_start
-    usual += (off - usual) * DT_MDL / (DT_MDL + 10.0)
-  return tt
-
-
-def sim_estimator(rho, prior, sw_start, sw_T, rate, seed=1, T=60.0, noise=0.03, hmax=1.0):
-  """Closed loop of check 17: the car moves to the held offset (rate, 1.5 s lag), the model plans back with return fraction rho."""
-  est = YieldEstimator(prior=(prior,) * 5)
-  rng = np.random.default_rng(seed)
-  h = o = 0.0
-  t10 = t20 = None
-  maxq = -9.0
-  qs = []
-  for i in range(int(T / DT_MDL)):
-    t = i * DT_MDL
-    sw = 0.8 * np.clip((t - sw_start) / sw_T, 0, 1) if t >= sw_start else 0.0
-    p = -rho * o - sw + noise * rng.standard_normal()
-    h = min(hmax, h + rate * DT_MDL)
-    o += (h - o) * DT_MDL / 1.5
-    q = est.update(o, p, 15.0, 0.0, False)
-    qs.append(q)
-    if t < sw_start:
-      maxq = max(maxq, q)
-    else:
-      if t10 is None and q >= 0.1:
-        t10 = t - sw_start
-      if t20 is None and q >= 0.2:
-        t20 = t - sw_start
-  return est, maxq, t10, t20
-
-
-class TestYieldEstimator:
-  def test_rho_stays_in_range_and_zero_has_no_singularity(self):
-    for rho in (0.0, 1.0):
-      est, maxq, _, _ = sim_estimator(rho, 0.5, 99.0, 1.0, 0.25, T=40.0)
-      assert 0.0 <= est.rho[est.band(15.0)] <= 1.0 and np.isfinite(est.pr) and np.isfinite(est.b) and np.isfinite(maxq)
-      # (a prior this far off, 0.5, is outside the E1 gate of +- 0.1: false triggers are expected there, DESIGN check 17)
-
-  def test_hold_onsets_do_not_trigger(self):
-    for rho in (0.3, 0.5, 0.8, 1.0):
-      for prior_err in (-0.1, 0.0, 0.1):
-        prior = float(np.clip(rho + prior_err, 0, 1))
-        _, maxq, _, _ = sim_estimator(rho, prior, 99.0, 1.0, 0.1 if prior_err else 0.25, T=40.0)
-        assert maxq < 0.15  # the early cap (from 0.15 m) does not engage
-
-  def test_bias_is_frozen_during_onsets_and_expectation_is_bounded(self):
-    est = YieldEstimator(prior=(0.5,) * 5)
-    rng = np.random.default_rng(3)
-    h = o = 0.0
-    b_at_onset = None
-    for i in range(1200):
-      t = i * DT_MDL
-      p = -0.8 * o + 0.03 * rng.standard_normal()
-      h = min(1.0, h + 0.25 * DT_MDL) if t > 20 else 0.0
-      o += (h - o) * DT_MDL / 1.5
-      est.update(o, p, 15.0, 0.0, False)
-      if est.onset:
-        b_at_onset = est.b0 if b_at_onset is None else b_at_onset
-        assert est.b == est.b0  # b-hat frozen during an onset
-        assert abs(est.p_exp - (-est.r0 * o + est.b0)) <= br.ABSORB + 1e-12  # within 0.1 m of the onset-start prediction
-    assert b_at_onset is not None
-
-  @pytest.mark.parametrize("sw_T", [0.5, 3.0, 10.0])
-  @pytest.mark.parametrize("sw_start", [0.0, 2.0, 5.0, 30.0])
-  @pytest.mark.parametrize("rho", [0.3, 0.8, 1.0])
-  def test_swerves_established_band(self, rho, sw_start, sw_T):
-    tu = upstream_from_centre_trigger(sw_start, sw_T)
-    _, _, t10, t20 = sim_estimator(rho, rho, sw_start, sw_T, 0.25)
-    assert t10 is not None and t20 is not None
-    assert t10 - tu <= 0.05 + 1e-9  # no growth from 0.1 m: no later than upstream-from-centre (one frame)
-    assert t20 - tu <= 1.75 + 0.05  # full cap
-
-  @pytest.mark.parametrize("sw_T", [0.5, 3.0, 10.0])
-  @pytest.mark.parametrize("sw_start", [0.0, 2.0, 5.0, 30.0])
-  @pytest.mark.parametrize("err", [-0.1, 0.1])
-  def test_swerves_first_onset_with_prior_error(self, err, sw_start, sw_T):
-    rho = 0.8
-    tu = upstream_from_centre_trigger(sw_start, sw_T)
-    _, maxq, t10, t20 = sim_estimator(rho, rho + err, sw_start, sw_T, 0.1)
-    assert t10 is not None and t20 is not None and maxq < 0.2
-    assert t10 - tu <= 0.2 + 0.05
-    assert t20 - tu <= 2.25 + 0.05
-
-  def test_established_flag_and_expiry(self):
-    est = YieldEstimator(prior=(0.5,) * 5)
-    assert not est.is_established(15.0)
-    rng = np.random.default_rng(1)
-    h = o = 0.0
-    for i in range(900):
-      t = i * DT_MDL
-      p = -0.5 * o + 0.01 * rng.standard_normal()
-      h = min(1.0, h + 0.1 * DT_MDL) if t > 2 else 0.0
-      o += (h - o) * DT_MDL / 1.5
-      est.update(o, p, 15.0, 0.0, False)
-    assert est.is_established(15.0) and not est.is_established(30.0)  # per speed band
-    est.t += br.ESTABLISH_TTL + 1.0
-    assert not est.is_established(15.0)  # expires
-    est.established[est.band(15.0)] = est.t
-    est.road_type_changed()
-    assert not est.is_established(15.0)  # a road type change clears it
-
-  def test_first_move_uses_the_slow_target_offset_rate(self):
-    rl = RightLineBlendful()
-    assert not rl.yields.is_established(20.0)
-    rl.yields.established[rl.yields.band(20.0)] = rl.yields.t
-    assert rl.yields.is_established(20.0)
-
 
 def swerve_run(side=+1, k0_up=0.0, frames_hold=100, frames_total=260, depth=0.8, swerve_T=0.5, ref=True):
   """Controller in Right line mode: the car is at the lane centre and pulled right (the target is right of the centre); then the model
@@ -639,311 +535,725 @@ class TestYieldCap:
     assert max(qs) > 0.0
 
 
+
 # ---------------------------------------------------------------------------------------------------------------------------------
-def js(jn, n=1, v=20.0, yaw_rate=0.0, div=None, split_now=False, gore=None, score=None, right_blinker=False, left_blinker=False,
-       left_lane=True, single_now=False):
-  for _ in range(n):
-    jn.update(v, yaw_rate, div, split_now, gore, score, right_blinker, left_blinker, left_lane, single_now)
+# rev 5: ground-fixed target, bounds order, width memory, junction episodes (model alone), road class, jumps, endpoint-gap trigger, D clip
+def moves_of(tgs, v=20.0, dt=DT_MDL, vx_scale=1.0):
+  """Per frame and point: the change of the rate-limited target relative to its own-motion prediction."""
+  inside = X + v * vx_scale * dt <= X[-1]
+  return np.concatenate([(b - br.motion_predict(a, v * vx_scale, 0.0, dt))[inside] for a, b in zip(tgs[:-1], tgs[1:], strict=True)])
 
 
-class TestJunctionPolicy:
-  """The isolated junction policy: weight split of the right-line, upstream and hold parts."""
-  @pytest.mark.parametrize("a", [0.0, 0.3, 0.5, 1.0])
-  def test_outside_an_episode_a_blends_with_upstream(self, a):
-    w = junction_policy(False, None, a, False)
-    assert (w.w_rl, w.w_up, w.w_hold) == (a, 1.0 - a, 0.0) and abs(w.total() - 1.0) < 1e-12
-
-  @pytest.mark.parametrize("a", [0.0, 0.5, 1.0])
-  @pytest.mark.parametrize("mode", ['hold', 'follow'])
-  def test_inside_an_episode_the_upstream_share_is_never_used(self, a, mode):
-    w = junction_policy(True, mode, a, False)
-    assert w.w_up == 0.0 and abs(w.total() - 1.0) < 1e-12
-    assert (w.w_hold == 1.0) if mode == 'hold' else (w.w_rl == a and abs(w.w_hold - (1 - a)) < 1e-12)
-
-  def test_model_alone_fades_both(self):
-    w = junction_policy(True, 'hold', 1.0, True)
-    assert w.total() == 0.0
-
-  def test_mode_demotions_become_hold_never_regular(self):
-    assert junction_mode(True, 'follow', False, False, False, True) == ('hold', False)  # right reference lost / jump / implausible
-    assert junction_mode(True, 'follow', True, True, False, True) == ('hold', False)  # left blinker below 32 km/h
-    assert junction_mode(True, 'follow', True, True, True, True) == ('follow', False)  # not inside the latch
-    assert junction_mode(True, 'follow', False, False, False, False) == ('hold', True)  # no left reference: the model alone
-    assert junction_mode(False, None, False, True, False, False) == (None, False)
+def frames_of(scenes, rl=None, inputs=None, k0_up=0.0):
+  rl = rl or RightLineBlendful()
+  logs = []
+  for sc in scenes:
+    res = rl.update(sc.model_output(), sc.v, True, sc.k, k0_up, inputs or RightInputs())
+    logs.append(res.log)
+  return rl, logs
 
 
-class TestJunctionLogic:
-  def test_episode_start_and_main_road_holds(self):
-    jn = JunctionLogic()
-    js(jn, 5, div=0.1)
-    assert not jn.episode and jn.mode is None
-    js(jn, 1, div=0.6)
-    assert jn.episode and jn.mode == 'hold'  # a widening on a main road: keep the through lane
-    js(jn, 1, div=0.6, right_blinker=True)
-    assert jn.mode == 'follow'  # right blinker: follow the right line
+class TestGroundFixedTarget:
+  @pytest.mark.parametrize("centre", [0.3, 0.5])
+  def test_no_target_jump_under_left_quality_flicker_at_threshold(self, centre):
+    # narrow lane (2.6 m), the left line's quality flickers across 0.3 (the replay's C1 trigger: 9-13 crossings per minute) and across
+    # 0.5 (where this implementation's centre limit changes from two references to one and the RAW target jumps): the rate-limited
+    # target must not jump in either case
+    scenes = []
+    for i in range(600):
+      t = max(i - 100, 0) * DT_MDL
+      scenes.append(Scene(v=20.0, width=2.6, pl=0.9 if i < 100 else centre + 0.2 * np.sin(2 * np.pi * 1.0 * t), pr=0.9, std=0.1))
+    rl, logs = frames_of(scenes)
+    logs = logs[100:]
+    raw = np.array([lg['t_raw'] for lg in logs[100:]])
+    if centre == 0.5:
+      assert np.max(np.abs(np.diff(raw, axis=0))) > 0.2  # the flicker really moves the raw target (the old anchor jumped up to 5.5 m)
+    tgs = [lg['t_lim'] for lg in logs[100:]]
+    d = moves_of(tgs)
+    assert d.min() >= -br.TARGET_RATE_LEFT * DT_MDL - 1e-9 and d.max() <= br.MOVE_RATE_RIGHT * DT_MDL + 1e-9
+    qs = np.array([lg['q_L'] for lg in logs[100:]])
+    assert qs.min() < centre < qs.max()
 
-  def test_split_pattern_starts_an_episode(self):
-    jn = JunctionLogic()
-    js(jn, 1, split_now=True, gore=150.0)
-    assert jn.episode and jn.split_seen and jn.mode == 'hold'
+  def test_own_motion_prediction_exact_on_a_steady_circle(self):
+    for vx_scale in (1.0, 1.08, 0.967):
+      sc = Scene(v=14.0, k=1 / 50, width=3.5, lever=True, vx_scale=vx_scale)
+      rl, logs = frames_of([sc] * 300)
+      lg = logs[-1]
+      assert np.max(np.abs(lg['t_lim'] - lg['t_raw'])[X < 60]) < 2e-3  # the target stays on the ground-fixed circle: no drift
 
-  def test_episode_ends_when_divergence_is_back_for_one_second(self):
-    jn = JunctionLogic()
-    js(jn, 3, div=0.8)
-    js(jn, 15, div=0.1)
-    assert jn.episode
-    js(jn, 6, div=0.1)
-    assert not jn.episode
+  def test_line_edge_switch_and_reindex_move_by_the_rate_only(self):
+    # the right line is re-indexed 3.5 m to the right (far line takes the near line's place) at frame 200
+    scenes = [Scene(v=20.0, width=3.5)] * 200 + [Scene(v=20.0, width=3.5, widen=3.5)] * 200
+    rl, logs = frames_of(scenes)
+    tgs = [lg['t_lim'] for lg in logs]
+    d = moves_of(tgs[190:])
+    assert d.max() <= br.LAG_RATE * DT_MDL + 1e-9 and d.min() >= -br.LAG_RATE * DT_MDL - 1e-9
+    # on a re-index to the LEFT (inward) the target glides at the left rate, not at once
+    scenes = [Scene(v=20.0, width=3.5)] * 200 + [Scene(v=20.0, width=3.5, widen=-0.4)] * 60
+    rl, logs = frames_of(scenes)
+    d = moves_of([lg['t_lim'] for lg in logs[190:]])
+    assert d.min() >= -br.TARGET_RATE_LEFT * DT_MDL - 1e-9
 
-  def test_episode_ends_at_the_maximum_length(self):
-    jn = JunctionLogic()
-    js(jn, 1, div=0.8)
-    js(jn, 301, div=0.8)  # 1 m per frame: ends at 301 m
-    assert not jn.episode
+  def test_rate_limits_by_direction_and_lag_bound(self):
+    gt = GroundTarget()
+    raw0 = np.zeros(br.NX)
+    gt.update(raw0, 20.0, 0.0, DT_MDL)
+    t = gt.update(raw0 + 0.5, 20.0, 0.0, DT_MDL)  # the raw target 0.5 m to the right: moves right at 0.05 m/s
+    assert abs(t[5] - br.MOVE_RATE_RIGHT * DT_MDL) < 1e-12
+    gt = GroundTarget()
+    gt.update(raw0, 20.0, 0.0, DT_MDL)
+    t = gt.update(raw0 - 0.5, 20.0, 0.0, DT_MDL)  # to the left at 0.25 m/s
+    assert abs(t[5] + br.TARGET_RATE_LEFT * DT_MDL) < 1e-12
+    gt = GroundTarget()
+    gt.update(raw0, 20.0, 0.0, DT_MDL)
+    t = gt.update(raw0 + 1.5, 20.0, 0.0, DT_MDL)  # a lag above 1.0 m: the rate rises to 0.5 m/s, still glide limited
+    assert abs(t[5] - br.LAG_RATE * DT_MDL) < 1e-12
 
-  def test_gore_passed_ends_the_episode(self):
-    jn = JunctionLogic()
-    js(jn, 1, split_now=True, gore=30.0, v=10.0)
-    js(jn, 90, v=10.0, split_now=False)  # 45 m: the gore (30 m) is 15 m behind
-    assert jn.episode
-    js(jn, 20, v=10.0)
-    assert not jn.episode
+  def test_lag_bound_holds_under_a_systematic_prediction_error(self):
+    # a yaw rate bias makes the own-motion prediction wrong by up to 0.015 m per frame in the far field (and the near field inherits it
+    # through the shift): more than the 0.0125 m the rate allows, less than the 0.025 m of the lag-bound rate
+    for bias in (0.0015, -0.0015):
+      gt = GroundTarget()
+      raw = np.full(br.NX, 0.3)
+      worst = 0.0
+      for _ in range(600):
+        gt.update(raw, 20.0, bias, DT_MDL)
+        worst = max(worst, float(np.max(np.abs(gt.lag))))
+      assert worst <= br.LAG_BOUND + br.LAG_RATE * DT_MDL + 1e-6  # bounded
+      if bias > 0:  # the drift is to the right, where the nominal rate is only 0.05 m/s: it runs into the bound and stays there
+        assert worst > 0.9
 
-  def test_ramp_context_starts_after_following_a_branch_and_ends_at_N(self):
-    jn = JunctionLogic()
-    js(jn, 1, split_now=True, gore=60.0, right_blinker=True, left_lane=False)
-    js(jn, 90, right_blinker=True, left_lane=False)
-    assert not jn.episode and jn.ramp  # the car took the branch
-    js(jn, int(1400 / (20.0 * DT_MDL)), left_lane=False)
-    assert jn.ramp
-    js(jn, int(150 / (20.0 * DT_MDL)), left_lane=False)
-    assert not jn.ramp  # N = 1500 m
-
-  def _ramp(self):
-    jn = JunctionLogic()
-    jn.ramp = True
-    return jn
-
-  def test_ramp_ends_at_a_stop_a_tight_turn_and_with_a_lane_to_the_left(self):
-    jn = self._ramp()
-    js(jn, 5, v=1.0, left_lane=False)
-    assert not jn.ramp  # stop
-    jn = self._ramp()
-    js(jn, 60, yaw_rate=20.0 * 0.05, left_lane=False)  # R = 20 m: > 60 degrees within 40 m
-    assert not jn.ramp
-    jn = self._ramp()
-    js(jn, int(5.5 / DT_MDL), left_lane=True)
-    assert not jn.ramp  # 5 s with a lane to the left
-    jn = self._ramp()
-    js(jn, int(3.0 / DT_MDL), left_lane=True)
-    assert jn.ramp
-
-  def test_loop_ramp_does_not_reset(self):
-    jn = self._ramp()
-    steps = int((1.5 * np.pi * 40.0) / (20.0 * DT_MDL))  # 270 degrees at R = 40 m
-    js(jn, steps, yaw_rate=20.0 / 40.0, left_lane=False)
-    assert jn.ramp
-
-  def test_single_lane_alone_never_starts_a_ramp_but_extends_one(self):
-    jn = JunctionLogic()
-    js(jn, 2000, single_now=True, left_lane=False)
-    assert not jn.ramp and jn.single.state
-    jn = self._ramp()
-    js(jn, 100, single_now=True, left_lane=False)  # three seconds in
-    js(jn, int(2000 / (20.0 * DT_MDL)), single_now=True, left_lane=False)
-    assert jn.ramp  # N and the left-lane rule do not end it while the single lane persists
-    js(jn, 5, v=1.0, single_now=True, left_lane=False)
-    assert not jn.ramp  # a stop does
-
-  def test_classifier_hysteresis(self):
-    jn = self._ramp()
-    js(jn, 1, div=1.0, score=0.75)
-    assert jn.score_state == 'split' and jn.mode == 'follow'
-    js(jn, 1, div=1.0, score=0.65)
-    assert jn.score_state == 'split'  # leaves below 0.6
-    js(jn, 1, div=1.0, score=0.55)
-    assert jn.score_state == 'uncertain' and jn.mode == 'hold'
-    js(jn, 1, div=1.0, score=0.65)
-    assert jn.score_state == 'uncertain'  # enters at 0.7
-    js(jn, 1, div=1.0, score=0.25)
-    assert jn.score_state == 'turn' and jn.mode == 'hold'  # turn lane: through lane
-    js(jn, 1, div=1.0, score=0.35)
-    assert jn.score_state == 'turn'  # leaves above 0.4
-    js(jn, 1, div=1.0, score=0.45)
-    assert jn.score_state == 'uncertain'
-
-  def test_split_score_evidence(self):
-    assert split_score({}) == 0.5
-    assert split_score({'both_moderate': True, 'gore_full_lanes': True, 'edge_follows_outer': True}) >= 0.7
-    assert split_score({'parallel_then_bend': True, 'short_pocket': True, 'edge_cornering': True}) <= 0.3
-
-  def test_gore_distance_unknown_latches_at_once_and_keeps_the_choice(self):
-    jn = self._ramp()
-    js(jn, 1, div=1.0, score=0.5)
-    js(jn, 1, split_now=True, gore=None, score=0.5)
-    assert jn.latched and jn.mode == 'hold'  # hold unless a split was already being followed
-    jn = self._ramp()
-    js(jn, 1, div=1.0, score=0.8)
-    assert jn.mode == 'follow'
-    js(jn, 1, split_now=True, gore=None, score=0.8)
-    assert jn.latched and jn.mode == 'follow'
-
-  def test_commit_latch_blocks_reversals_and_late_blinker(self):
-    jn = self._ramp()
-    v = 10.0
-    js(jn, 1, v=v, split_now=True, gore=200.0, score=0.8)
-    assert jn.mode == 'follow' and not jn.latched
-    js(jn, 1, v=v, split_now=True, gore=120.0, score=0.8)
-    assert not jn.latched
-    js(jn, 1, v=v, split_now=True, gore=80.0, score=0.8)  # x_commit = (3.6 / 0.5 + 1) * 10 = 82 m
-    assert jn.latched and jn.mode == 'follow'
-    for sc, rb in ((0.1, False), (0.8, True), (0.5, False)):  # classifier and blinker changes have no effect inside the latch
-      js(jn, 1, v=v, score=sc, right_blinker=rb)
-      assert jn.mode == 'follow'
-    jn2 = self._ramp()
-    js(jn2, 1, v=v, split_now=True, gore=80.0, score=0.5)
-    assert jn2.latched and jn2.mode == 'hold'
-    js(jn2, 3, v=v, right_blinker=True, score=0.8)
-    assert jn2.mode == 'hold'  # a blinker switched on inside x_commit does not start a change
-    js(jn2, int(105 / (v * DT_MDL)), v=v)
-    assert not jn2.episode  # the latch ends 20 m behind the gore
-
-  def test_late_split_is_taken_left(self):
-    jn = self._ramp()
-    js(jn, 1, v=20.0, split_now=True, gore=100.0, score=0.8)  # x_commit = 164 m: the choice is made at once, but only 'follow' from the score
-    assert jn.latched
+  def test_far_points_beyond_the_last_horizon_take_the_raw_target(self):
+    gt = GroundTarget()
+    gt.update(np.zeros(br.NX), 30.0, 0.0, DT_MDL)
+    raw = np.full(br.NX, 0.4)
+    t = gt.update(raw, 30.0, 0.0, DT_MDL)
+    assert t[-1] == 0.4 and abs(t[0] - br.MOVE_RATE_RIGHT * DT_MDL) < 1e-12
 
 
-def episode_scenes(n_normal=150, n_wide=40, widen=0.8, **kw):
-  return [Scene(pl=1.0, pr=1.0, **kw)] * n_normal + [Scene(pl=1.0, pr=1.0, widen=widen, **kw)] * n_wide
+class TestBoundOrder:
+  def test_bounds_act_after_the_rate_limit_and_the_target_never_passes_them_in_a_glide(self):
+    # the right line moves 1.0 m inward at frame 150: the raw target follows, the rate-limited one glides, the bound must cut it at once
+    scenes = [Scene(v=13.0, width=4.5)] * 150 + [Scene(v=13.0, width=4.5, widen=-1.0)] * 150
+    rl, logs = frames_of(scenes)
+    glided = False
+    for lg in logs[150:]:
+      bound = lg['y_r'] - W_R - br.LINE_BOUND
+      assert np.all(lg['target'] <= bound + 1e-9)
+      glided |= bool(np.any(lg['t_lim'] > bound + 1e-3))
+    assert glided  # the rate limited target alone WOULD have passed the bound: the order matters
+
+  def test_edge_bound_after_the_rate_limit(self):
+    # a road without lines whose edges close in by 1.2 m at frame 200: the glide would carry the target past the 0.3 m edge bound
+    wide = Scene(v=13.0, pl=0.0, pr=0.0, edges=True, edge_half=2.4, edge_std=0.3)
+    narrow = Scene(v=13.0, pl=0.0, pr=0.0, edges=True, edge_half=1.2, edge_std=0.3)
+    rl, logs = frames_of([wide] * 200 + [narrow] * 100)
+    glided = False
+    for lg in logs[200:]:
+      bound = lg['y_edge_r'] - W_R - br.EDGE_BOUND
+      assert np.all(lg['target'][(X > 3) & (X < 60)] <= bound[(X > 3) & (X < 60)] + 1e-6)
+      glided |= bool(np.any(lg['t_lim'][(X > 3) & (X < 60)] > bound[(X > 3) & (X < 60)] + 1e-3))
+    assert glided
+
+  def test_left_limit_acts_after_the_rate_limit(self):
+    # the lane centre moves 1.0 m to the right (the car is left of it): the target may glide right only at 0.05 m/s, but is never left of
+    # the centre limit
+    scenes = [Scene(v=13.0, width=2.6, center=0.0)] * 150 + [Scene(v=13.0, width=2.6, center=0.8)] * 100
+    rl, logs = frames_of(scenes)
+    lagged = False
+    for lg in logs[150:]:
+      assert np.all(lg['target'] >= lg['c_ctr'] - 1e-9)
+      lagged |= bool(np.any(lg['t_lim'] < lg['c_ctr'] - 1e-3))
+    assert lagged
 
 
-class TestJunctionIntegration:
-  def test_widening_on_a_main_road_is_not_followed(self):
-    rl, res = run_rl(episode_scenes(), k0_up=0.5)  # a distinctive upstream amplitude: it must never be used
-    last = res[-1].log
-    assert last['episode'] and last['hold']
-    t = target_at(last, 20.0)
-    # the through-lane position: the right wheel gap g to the PRE-widening right line (1.75 m)
-    assert abs((1.75 - (t + W_R)) - br.gap_for_speed(20.0, 0.5, 1.0)) < 0.02
-    assert all(r.log['weights'][1] == 0.0 for r in res[150:] if r.log['episode'])
+class TestWidthMemory:
+  def test_symmetric_update_and_narrower_lane_accepted(self):
+    wm = WidthMemory()
+    for _ in range(80):
+      wm.update(3.5, True, False, 'lines')
+    assert wm.armed and abs(wm.w - 3.5) < 1e-9
+    for _ in range(600):  # 30 s at a narrower lane: the memory comes down (no |delta| gate)
+      wm.update(3.0, True, False, 'lines')
+    assert abs(wm.w - 3.0) < 0.05 and wm.excess(3.0) is not None and abs(wm.excess(3.0)) < 0.05
 
-  def test_right_blinker_follows_the_widening(self):
-    rl, res = run_rl(episode_scenes(n_wide=250), inputs=lambda i: RightInputs(right_blinker=i >= 150))
-    t = target_at(res[-1].log, 20.0)
-    assert abs((1.75 + 0.8 - (t + W_R)) - br.gap_for_speed(20.0, 0.5, 1.0)) < 0.03  # follows the widened right line (glide <= 0.5 m/s)
-    assert res[-1].log['hold'] is False
+  def test_measures_the_median_of_two_seconds_first(self):
+    wm = WidthMemory()
+    vals = [3.5] * 38 + [6.0, 6.0]  # two outliers inside the 2 s: the median ignores them
+    for v in vals[:-1]:
+      wm.update(v, True, False, 'lines')
+    assert not wm.armed and wm.excess(3.5) is None
+    wm.update(vals[-1], True, False, 'lines')
+    assert wm.armed and abs(wm.w - 3.5) < 1e-9
 
-  def test_ramp_classifier_split_follows_turn_lane_holds(self, monkeypatch):
-    for score, follow in ((0.9, True), (0.1, False)):
-      monkeypatch.setattr(br, 'split_score', lambda feat, s=score: s)
-      rl = RightLineBlendful()
-      rl.junction.ramp = True
-      _, res = run_rl(episode_scenes(n_wide=250), rl=rl)
-      t = target_at(res[-1].log, 20.0)
-      expected = 1.75 + (0.8 if follow else 0.0)
-      assert abs((expected - (t + W_R)) - br.gap_for_speed(20.0, 0.5, 1.0)) < 0.03
+  def test_stale_after_twenty_seconds_and_remeasured(self):
+    wm = WidthMemory()
+    for _ in range(80):
+      wm.update(3.5, True, False, 'lines')
+    for _ in range(int(20.5 / DT_MDL)):  # no clear measurement for 20.5 s
+      wm.update(3.5, False, False, 'lines')
+    assert wm.stale or not wm.armed
+    assert wm.excess(5.0) is None  # cue 2 is off while stale
+    for _ in range(39):
+      wm.update(4.0, True, False, 'lines')
+    assert wm.excess(4.0) is None
+    wm.update(4.0, True, False, 'lines')
+    assert wm.armed and abs(wm.w - 4.0) < 1e-9  # re-measured from the 2 s median
 
-  def test_follow_glide_rate_is_at_most_half_a_metre_per_second(self, monkeypatch):
-    monkeypatch.setattr(br, 'split_score', lambda feat: 0.9)
-    rl = RightLineBlendful()
-    rl.junction.ramp = True
-    _, res = run_rl(episode_scenes(n_wide=300, widen=2.0), rl=rl)
-    tg = np.array([target_at(r.log, 20.0) for r in res[100:]])
-    assert np.max(np.abs(np.diff(tg))) <= br.SPLIT_RATE * DT_MDL + 1e-9
+  def test_remeasured_after_an_episode_and_on_a_type_change(self):
+    wm = WidthMemory()
+    for _ in range(80):
+      wm.update(3.5, True, False, 'lines')
+    wm.end_of_episode()
+    assert not wm.armed
+    for _ in range(40):
+      wm.update(4.2, True, False, 'lines')
+    assert wm.armed and abs(wm.w - 4.2) < 1e-9
+    wm.update(4.2, True, False, 'edges')  # a change of the reference type re-measures
+    assert not wm.armed
+    for _ in range(40):
+      wm.update(5.0, True, False, 'edges')
+    assert wm.armed and abs(wm.w - 5.0) < 1e-9
 
-  def _fade_cases(self):
-    base = {'pl': 1.0, 'pr': 1.0}
-    out = {}
-    out['bend'] = (lambda i: Scene(widen=0.8, bend_x0=15.0, bend_R=30.0, **base), None)
-    out['split'] = (lambda i: Scene(widen=0.0, shift_near=-3.0, far_at=1.75, far_pr=0.9, **base) if i == 0 else Scene(widen=0.8, **base), None)
-    out['yield'] = (lambda i: Scene(widen=0.8, **base), RightInputs(ref_going_around=True))
-    out['jump'] = (lambda i: Scene(widen=0.8, center=0.0 if i < 3 else 1.0, **base), None)
-    out['plausibility'] = (lambda i: Scene(widen=0.8, edges=i >= 15, edge_right=1.2, **base), None)  # the line ends up outside its edge
-    out['quality'] = (lambda i: Scene(widen=0.8, pl=1.0, pr=max(0.0, 0.9 - 0.02 * i)), None)
-    out['left blinker'] = (lambda i: Scene(widen=0.8, v=8.0, **base), RightInputs(left_blinker=True))
+  def test_frozen_during_an_episode_and_detection_only(self):
+    wm = WidthMemory()
+    for _ in range(80):
+      wm.update(3.5, True, False, 'lines')
+    for _ in range(100):
+      wm.update(4.5, True, True, 'lines')  # inside an episode: no update
+    assert abs(wm.w - 3.5) < 1e-9
+    # it is used for detection only: the target does not depend on it (same scene, memory armed or not)
+    rl_a, res_a = steady(width=4.5, frames=200)
+    rl_b = RightLineBlendful()
+    rl_b.width_mem.w, rl_b.width_mem.armed = 2.5, True
+    _, res_b = run_rl([Scene(width=4.5)] * 200, rl=rl_b)
+    np.testing.assert_allclose(res_a.log['t_raw'], res_b[-1].log['t_raw'], atol=1e-6)
+
+
+class TestJunctionEpisodes:
+  @staticmethod
+  def feed(ep, n, cue, widening=None, v=20.0):
+    out = []
+    for _ in range(n):
+      out.append(ep.update(cue, widening, v))
     return out
 
-  @pytest.mark.parametrize("name", ['bend', 'split', 'yield', 'jump', 'plausibility', 'quality', 'left blinker'])
-  def test_c1_every_fade_inside_an_episode_never_uses_upstream(self, name):
-    make, inputs = self._fade_cases()[name]
-    v = 8.0 if name == 'left blinker' else 20.0
+  def test_start_after_a_cue_held_for_0_2_s(self):
+    ep = JunctionEpisodes()
+    assert not any(self.feed(ep, 3, True))
+    assert self.feed(ep, 1, True)[0]  # the 4th frame = 0.2 s
+    ep = JunctionEpisodes()
+    self.feed(ep, 3, True)
+    self.feed(ep, 1, False)
+    assert not any(self.feed(ep, 3, True))  # a gap resets the hold
+
+  def test_end_after_two_seconds_and_thirty_metres_without_a_cue(self):
+    ep = JunctionEpisodes()
+    self.feed(ep, 10, True)
+    assert ep.episode
+    out = self.feed(ep, 39, False, widening=0.3)
+    assert all(out) and ep.episode  # 1.95 s: not yet
+    self.feed(ep, 1, False, widening=0.3)
+    assert not ep.episode and ep.ended == br.END_QUIET
+    # low speed: 2 s is only 10 m at 5 m/s, so it takes 30 m = 6 s
+    ep = JunctionEpisodes()
+    self.feed(ep, 10, True, v=5.0)
+    out = self.feed(ep, 140, False, widening=0.3, v=5.0)
+    n = next(i for i, e in enumerate(out) if not e) + 1
+    assert abs(n * DT_MDL - 6.0) <= DT_MDL + 1e-9
+
+  def test_end_when_the_widening_is_gone_for_one_second(self):
+    ep = JunctionEpisodes()
+    self.feed(ep, 10, True)
+    out = self.feed(ep, 19, False, widening=0.1)
+    assert all(out)
+    self.feed(ep, 1, False, widening=0.1)
+    assert not ep.episode and ep.ended == br.END_WIDENING
+    # a cue still active, or a widening above 0.15 m, keeps it going
+    ep = JunctionEpisodes()
+    self.feed(ep, 10, True)
+    assert all(self.feed(ep, 60, True, widening=0.0, v=5.0)[:30])
+    assert all(self.feed(ep, 60, False, widening=0.2, v=20.0)[:30])
+
+  def test_end_at_three_hundred_metres_then_rearm_only_after_the_cues_clear(self):
+    ep = JunctionEpisodes()
+    n = 0
+    self.feed(ep, 4, True)
+    assert ep.episode
+    while ep.episode:
+      ep.update(True, 1.0, 20.0)  # 20 m/s: 1 m per frame
+      n += 1
+      assert n < 1000
+    assert ep.ended == br.END_MAX and 299 <= n <= 301
+    assert not any(self.feed(ep, 20, True))  # cues still on: blocked
+    assert not any(self.feed(ep, 1, False))  # clears once
+    assert not any(self.feed(ep, 3, True))
+    assert self.feed(ep, 1, True)[0]  # and a new episode after 0.2 s
+
+  def test_model_alone_time_counts_the_episode(self):
+    ep = JunctionEpisodes()
+    self.feed(ep, 4, True)
+    self.feed(ep, 20, True)
+    assert abs(ep.model_alone_time - 20 * DT_MDL) < 1e-9
+
+
+def tapered(sc, slope=1 / 15.0, start=5.0):
+  mo = sc.model_output()
+  mo['lane_lines'][0, 2, :, 0] += np.clip(X - start, 0, None) * slope
+  return mo
+
+
+def with_far_line_v(sc):
+  mo = Scene(**{**sc.__dict__, 'far_pr': 0.9}).model_output()
+  sep = 0.4 + 0.05 * np.abs(X - 40.0)  # the far-right line approaches the right line to 0.4 m at 40 m and separates beyond: a gore
+  mo['lane_lines'][0, 3, :, 0] = mo['lane_lines'][0, 2, :, 0] + sep
+  return mo
+
+
+def kinked(sc, deg=12.0, at=25.0):  # the filtered line smears a kink fixed in the car frame by about v tau: 12 deg measured gives ~7 deg
+  mo = sc.model_output()
+  mo['lane_lines'][0, 2, :, 0] += np.clip(X - at, 0, None) * np.tan(np.radians(deg))
+  return mo
+
+
+def edge_diverging(sc):
+  mo = Scene(**{**sc.__dict__, 'edges': True}).model_output()
+  mo['road_edges'][0, 1, :, 0] += np.clip(X - 5.0, 0, None) / 10.0
+  return mo
+
+
+def bend_away(sc):
+  return Scene(**{**sc.__dict__, 'bend_x0': 15.0, 'bend_R': 30.0}).model_output()
+
+
+def width_step(sc):
+  return Scene(**{**sc.__dict__, 'widen': 0.9}).model_output()
+
+
+CUES = [  # name, scene builder, cue bit
+  ('widening in frame', tapered, 0), ('widening over time', width_step, 1), ('edge divergence', edge_diverging, 2),
+  ('gore V shape', with_far_line_v, 3), ('kink', kinked, 3), ('sharp bend', bend_away, 4)]
+
+
+class TestJunctionCues:
+  @pytest.mark.parametrize("name,build,bit", CUES, ids=[c[0] for c in CUES])
+  def test_each_cue_starts_an_episode_after_0_2_s(self, name, build, bit):
     rl = RightLineBlendful()
-    for _ in range(150):
-      rl.update(Scene(v=v, pl=1.0, pr=1.0).model_output(), v, True, 0.0, 0.0, RightInputs())
-    rl_b = RightLineBlendful()
-    rl_b = copy.deepcopy(rl)
-    seen_episode = False
-    for i in range(60):
-      sc = make(i)
-      sc.v = v
-      p = inputs or RightInputs()
-      r1 = rl.update(sc.model_output(), v, True, 0.0, 0.7, p)
-      r2 = rl_b.update(sc.model_output(), v, True, 0.0, -0.7, p)  # a different upstream amplitude
-      if r1.log['episode']:
-        seen_episode = True
-        assert r1.log['weights'][1] == 0.0  # the (1 - a) share is never the upstream one
-        assert r1.k0 == r2.k0  # and the result does not depend on it
-    assert seen_episode
+    base = Scene(v=20.0, width=3.5, pl=0.9, pr=0.9, edges=name == 'edge divergence')
+    for _ in range(150):  # clear measurements: the width memory arms, the filters settle
+      rl.update(base.model_output(), 20.0, True, 0.0, 0.0, RightInputs())
+    assert not rl.episodes.episode and rl.width_mem.armed
+    first = first_any = start = None
+    for i in range(80):
+      res = rl.update(build(base), 20.0, True, 0.0, 0.0, RightInputs())
+      if first is None and (res.log['cues'] >> bit) & 1:
+        first = i
+      if first_any is None and res.log['cues']:
+        first_any = i
+      if start is None and res.episode:
+        start = i
+    assert first is not None, f"cue {name} never fired"
+    assert start is not None and start - first_any == 3  # held for 0.2 s (4 frames) before the episode starts
 
-  def test_episode_starting_at_a_half_replaces_the_upstream_share_through_the_limiter(self):
+  def test_no_cue_on_a_plain_road(self):
+    rl, logs = frames_of([Scene(v=20.0, width=3.5, edges=True, edge_half=3.5, k=1 / 300, lever=True)] * 400)
+    assert all(lg['cues'] == 0 and not lg['episode'] for lg in logs)
+
+  def test_curve_alone_gives_no_widening_or_kink(self):
+    rl, logs = frames_of([Scene(v=14.0, width=3.5, k=1 / 60, lever=True)] * 300)
+    assert all(lg['cues'] == 0 for lg in logs[100:])
+
+  def test_low_speed_window_uses_five_to_sixty_metres(self):
+    assert br.cue_window(5.0) == (5.0, 60.0)
+    xa, xb = br.cue_window(20.0)
+    assert abs(xa - 7.5) < 1e-9 and abs(xb - 45.0) < 1e-9
+
+  def test_edge_divergence_angle_cue_alone(self):
+    x = X
+    edge = np.full(33, 3.0) + np.clip(x - 5.0, 0, None) * 0.05  # 0.05 slope: 2.9 deg, over 37.5 m = 1.9 m
+    g, ang = br.cue_edge_divergence(x, np.full(33, 1.75), edge, None, 20.0)
+    assert g > br.CUE_EDGE_DIV and abs(ang - np.degrees(np.arctan(g / 37.5))) < 1e-9
+
+  def test_gore_needs_both_flanks(self):
+    near = np.full(33, 1.75)
+    only_separating = near + np.clip(0.3 + 0.05 * (X - 5.0), 0.3, 4.0)
+    assert br.cue_gore(X, near, only_separating) is None  # no approach: not a V
+    v = near + 0.4 + 0.05 * np.abs(X - 40.0)
+    assert br.cue_gore(X, near, v) < br.CUE_GORE_SEP  # the model grid is coarse at 40 m: the sampled minimum is a little above 0.4 m
+    assert br.cue_gore(X, near, near + 3.5) is None  # parallel lines
+
+
+class TestInsideAnEpisode:
+  def _episode_run(self, mode=MODE_RIGHT, k0_up_scene=0.3, right_blinker=False):
     ctl = BlendfulCorrection()
-    scenes = [Scene(pl=1.0, pr=1.0)] * 400
-    i = 0
-    while ctl.right.a < 0.5 and i < 400:
-      ctl.update(scenes[i].model_output(), 20.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
-      i += 1
-    assert 0.45 < ctl.right.a < 0.6
-    cs = [ctl.c]
-    for _ in range(80):
-      ctl.update(Scene(pl=1.0, pr=1.0, widen=0.8).model_output(), 20.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
+    rows = []
+    for i in range(400):
+      base = Scene(v=20.0, width=3.5, center=0.0, pl=0.9, pr=0.9)
+      sc = base if i < 200 else Scene(v=20.0, width=3.5, pl=0.9, pr=0.9, bend_x0=15.0, bend_R=30.0)
+      ctl.update(sc.model_output(), 20.0, True, 0.0, LAT_T, mode, RightInputs(right_blinker=right_blinker))
+      rows.append((ctl.c, ctl.k0, ctl.result.episode, ctl.result.log.get('weights'), ctl.k_up, ctl.right.a, ctl.release_window))
+    return ctl, rows
+
+  def test_both_corrections_fade_to_zero_through_the_limiter_with_no_regular_and_no_hold(self):
+    ctl, rows = self._episode_run()
+    ep = [i for i, r in enumerate(rows) if r[2]]
+    assert ep, "no episode"
+    assert all(rows[i][3] == (0.0, 0.0) for i in ep)  # neither the right-line nor the upstream part: no Regular, no hold
+    cs = np.array([r[0] for r in rows])
+    # the fade is the limiter's: never faster than the 2.0 m/s^3 release (upstream's own)
+    rate = np.abs(np.diff(cs)) * 20.0 ** 2 / DT_MDL
+    window = np.array([r[6] for r in rows[1:]])  # a cap-release window (the junction's bend also looks like a swerve to the yield trigger) may use 5 m/s^3
+    assert rate[~window].max() <= br.RELEASE + 1e-6 and rate.max() <= br.SWERVE_RELEASE + 1e-6
+    assert abs(cs[ep[-1]]) < abs(cs[ep[0]]) + 1e-12 or abs(cs[ep[-1]]) < 1e-9
+    # and the correction really got to zero inside the episode (after the fade), while upstream's output stays non-zero somewhere
+    assert abs(cs[ep[-1]]) < 1e-9 or len(ep) < 40
+
+  def test_the_right_blinker_changes_nothing_inside_an_episode(self):
+    _, a = self._episode_run(right_blinker=False)
+    _, b = self._episode_run(right_blinker=True)
+    assert [r[0] for r in a] == [r[0] for r in b] and [r[2] for r in a] == [r[2] for r in b]
+
+  def test_regular_mode_is_unchanged_by_junctions(self):
+    ctl, ref = BlendfulCorrection(), Blendful()
+    for i in range(400):
+      sc = Scene(v=20.0, width=3.5, pl=0.9, pr=0.9) if i < 200 else Scene(v=20.0, width=3.5, pl=0.9, pr=0.9, bend_x0=15.0, bend_R=30.0)
+      ctl.update(sc.model_output(), 20.0, True, 0.0, LAT_T, MODE_REGULAR)
+      up = ref.update(sc.model_output(), 20.0, True, 0.0, enabled=True)
+      assert abs(ctl.c - up) <= 1e-12 and not ctl.result.episode
+
+  def test_junction_policy_is_the_only_place_and_has_no_branch_logic(self):
+    w = junction_policy(True, 0.7)
+    assert (w.w_rl, w.w_up) == (0.0, 0.0)
+    w = junction_policy(True, 0.7, right_line_mode=False)  # Regular: unchanged
+    assert (w.w_rl, w.w_up) == (0.7, pytest.approx(0.3))
+    w = junction_policy(False, 0.4)
+    assert (w.w_rl, w.w_up) == (0.4, pytest.approx(0.6))
+    # Appendix J (hold, latch, ramp context, split classifier) is documentation only: none of it exists in the module
+    for name in ('JunctionLogic', 'junction_mode', 'split_score', 'split_pattern', 'gore_distance', 'divergence_start', 'YieldEstimator'):
+      assert not hasattr(br, name)
+    assert not hasattr(br.PolicyWeights(), 'w_hold')
+
+  def test_a_rises_normally_after_the_episode(self):
+    ctl, rows = self._episode_run()
+    a = np.array([r[5] for r in rows])
+    ep = np.array([r[2] for r in rows])
+    assert a[ep].min() < 0.3 or ep.sum() < 20  # authority went down inside the episode ...
+    assert np.max(np.diff(a)) <= br.A_IN * DT_MDL + 1e-9  # ... and never rises faster than 0.5 /s
+
+
+class TestRoadClass:
+  def test_hysteresis_and_five_second_dwell(self):
+    rc = RoadClass()
+    assert rc.update(15.0, 0.9, 0.9, 3.5) == br.ROAD_LANES
+    n = 0
+    for n in range(1, 400):  # noqa: B007
+      if rc.update(15.0, 0.9, 0.9, 2.6) == br.ROAD_SHARED:
+        break
+    assert abs(n * DT_MDL - br.ROAD_DWELL) <= 2 * DT_MDL  # the new class is held for 5 s first
+
+  def test_one_hertz_flicker_does_not_change_the_class(self):
+    rc = RoadClass()
+    rc.update(15.0, 0.9, 0.9, 3.5)
+    for i in range(1200):
+      t = i * DT_MDL
+      w = 3.0 + 0.4 * np.sin(2 * np.pi * 1.0 * t)  # across the width threshold at 1 Hz
+      q = 0.35 + 0.1 * np.sin(2 * np.pi * 1.0 * t)  # and across the quality hysteresis
+      rc.update(15.0, q, q, w)
+      assert rc.cls == br.ROAD_LANES
+
+  def test_hysteresis_band(self):
+    rc = RoadClass()
+    rc.cls = br.ROAD_SHARED
+    assert rc.raw(15.0, 0.9, 0.9, 3.1) == br.ROAD_SHARED  # inside 3.0 +- 0.15
+    rc.cls = br.ROAD_LANES
+    assert rc.raw(15.0, 0.9, 0.9, 2.9) == br.ROAD_LANES
+    assert rc.raw(15.0, 0.9, 0.9, 2.8) == br.ROAD_SHARED
+    rc.cls = br.ROAD_EDGES
+    assert rc.raw(15.0, 0.35, 0.35, 3.5) == br.ROAD_EDGES  # quality 0.3 / 0.4
+    assert rc.raw(15.0, 0.45, 0.35, 3.5) == br.ROAD_LANES
+    rc.cls = br.ROAD_LANES
+    assert rc.raw(15.0, 0.35, 0.35, 3.5) == br.ROAD_LANES
+    assert rc.raw(15.0, 0.25, 0.25, 3.5) == br.ROAD_EDGES
+    assert rc.raw(22.5, 0.9, 0.9, 3.8) == br.ROAD_LANES and rc.raw(23.5, 0.9, 0.9, 3.8) == br.ROAD_MOTORWAY
+    rc.cls = br.ROAD_MOTORWAY
+    assert rc.raw(21.5, 0.9, 0.9, 3.8) == br.ROAD_MOTORWAY and rc.raw(20.5, 0.9, 0.9, 3.8) == br.ROAD_LANES
+
+  def test_it_resets_no_estimator(self):
+    rl, _ = frames_of([Scene(v=15.0)] * 50)
+    state = (rl.gap.rp, rl.gap.ps, rl.width_mem.w)
+    rl.road.cls = br.ROAD_SHARED
+    rl.road.update(15.0, 0.9, 0.9, 3.5)
+    assert (rl.gap.rp, rl.gap.ps, rl.width_mem.w) == state
+
+
+class TestJumps:
+  def test_edge_innovation_of_one_metre_does_not_trip(self):
+    jd = JumpDetector()
+    for _ in range(10):
+      assert not jd.update((0.0, 1.0), (0.0, 1.0), (False, True))
+
+  def test_line_innovation_of_0_7_m_for_two_frames_trips(self):
+    jd = JumpDetector()
+    assert not jd.update((0.7, 0.0), (1.0, 0.0), (True, False))  # one frame: not yet
+    assert jd.update((0.7, 0.0), (1.0, 0.0), (True, False))
+    for _ in range(30):  # held 2 s
+      still = jd.update((0.0, 0.0), (1.0, 0.0), (True, False))
+    assert still
+    for _ in range(12):
+      still = jd.update((0.0, 0.0), (1.0, 0.0), (True, False))
+    assert not still
+
+  def test_persistence_is_per_input_and_consecutive(self):
+    jd = JumpDetector()
+    jd.update((0.7, 0.0), (1.0, 0.0), (True, False))
+    assert not jd.update((0.3, 0.0), (1.0, 0.0), (True, False))  # interrupted
+    assert not jd.update((0.7, 0.0), (1.0, 0.0), (True, False))
+
+  def test_edge_trips_above_1_2_m(self):
+    jd = JumpDetector()
+    jd.update((0.0, 1.3), (0.0, 1.0), (False, True))
+    assert jd.update((0.0, 1.3), (0.0, 1.0), (False, True))
+
+  def test_a_candidate_with_weight_below_half_never_trips(self):
+    jd = JumpDetector()
+    for _ in range(20):
+      assert not jd.update((3.0, 3.0), (0.49, 0.2), (True, True))
+
+  def test_integration_a_shifted_right_line_trips_and_fades_the_authority(self):
+    scenes = [Scene(v=20.0, width=3.5)] * 150 + [Scene(v=20.0, width=3.5, widen=0.9)] * 6
+    rl, logs = frames_of(scenes)
+    assert logs[149]['f_jump'] == 1.0
+    assert any(lg['f_jump'] == 0.0 for lg in logs[150:])
+    # a faint edge candidate (weight < 0.5 next to a clear line) jumping by 2 m never trips
+    near = Scene(v=20.0, width=3.5, edges=True, edge_half=3.5, edge_right=2.6)
+    far = Scene(v=20.0, width=3.5, edges=True, edge_half=3.5, edge_right=4.6)
+    scenes = [near] * 150 + [far] * 10
+    rl, logs = frames_of(scenes)
+    assert all(lg['f_jump'] == 1.0 for lg in logs)
+
+
+def upstream_from_centre_trigger(sw_start, sw_T, T=60.0, noise=0.03, seed=1):
+  rng = np.random.default_rng(seed)
+  usual, tt = 0.0, None
+  for i in range(int(T / DT_MDL)):
+    t = i * DT_MDL
+    sw = 0.8 * np.clip((t - sw_start) / sw_T, 0, 1) if t >= sw_start else 0.0
+    off = -sw + noise * rng.standard_normal()
+    if t >= sw_start and tt is None and abs(off - usual) > 0.2:
+      tt = t - sw_start
+    usual += (off - usual) * DT_MDL / (DT_MDL + 10.0)
+  return tt
+
+
+def sim_endpoint_gap(rho, sw_start, sw_T, rate=br.MOVE_RATE_RIGHT, hmax=1.0, T=60.0, noise=0.03, seed=1, settle=br.MOVE_SETTLE):
+  """Closed loop of DESIGN check 18: the car moves to the held offset hmax (target glide `rate`, 1.5 s lag), the model plans back with the
+  return fraction rho; x = Y_R(L) - plan_y(L) = 2 - (car + p)."""
+  gap = EndpointGap()
+  rng = np.random.default_rng(seed)
+  h = o = 0.0
+  t10 = t20 = None
+  qs = []
+  moving_t = 0.0
+  for i in range(int(T / DT_MDL)):
+    t = i * DT_MDL
+    sw = 0.8 * np.clip((t - sw_start) / sw_T, 0, 1) if t >= sw_start else 0.0
+    p = -rho * o - sw + noise * rng.standard_normal()
+    building = h < hmax - 1e-9
+    h = min(hmax, h + rate * DT_MDL)
+    o += (h - o) * DT_MDL / 1.5
+    moving_t = settle if building else max(0.0, moving_t - DT_MDL)
+    q = gap.update(2.0 - (o + p), 1, moving_t > 0.0, False, 0.0, False)
+    qs.append(q)
+    if t >= sw_start:
+      if t10 is None and q >= 0.1:
+        t10 = t - sw_start
+      if t20 is None and q >= 0.2:
+        t20 = t - sw_start
+  return np.array(qs), t10, t20
+
+
+class TestEndpointGapTrigger:
+  @pytest.mark.parametrize("rho", [-0.2, 0.0, 0.3, 0.5, 0.9])
+  def test_steady_hold_and_move_give_no_false_trigger_for_any_rho(self, rho):
+    for seed in (1, 2):
+      qs, _, _ = sim_endpoint_gap(rho, 999.0, 1.0, T=60.0, seed=seed)
+      assert qs.max() < br.Q_NO_GROWTH  # check 18: max q <= 0.04 m (here with 0.03 m plan noise, inside the no-growth point)
+
+  @pytest.mark.parametrize("rho", [0.0, 0.5, 0.9])
+  @pytest.mark.parametrize("sw_T", [0.5, 3.0, 10.0])
+  def test_swerve_on_a_steady_hold_triggers_with_upstream_from_centre(self, rho, sw_T):
+    _, t10, t20 = sim_endpoint_gap(rho, 40.0, sw_T)  # the move to 1.0 m at 0.05 m/s takes 20 s: steady from 40 s on
+    tu = upstream_from_centre_trigger(40.0, sw_T)
+    assert t10 is not None and t10 <= tu + 0.25 + 1e-9  # no-growth point up to about 0.2 s after upstream-from-centre (I1)
+
+  def test_running_minimum_is_not_updated_on_skip_frames(self):
+    g = EndpointGap()
+    for _ in range(20):
+      g.update(2.0, 1, True, False, 0.0, False)
+    rp = g.rp
+    for _ in range(20):
+      g.update(1.0, 1, True, True, 0.0, False)  # a jump: ignored
+    assert g.rp == rp
+
+  def test_median_stops_a_single_dip_from_lowering_the_minimum(self):
+    g = EndpointGap()
+    for _ in range(40):
+      g.update(2.0, 1, True, False, 0.0, False)
+    g.update(1.0, 1, True, False, 0.0, False)  # one frame with the reference flickering inward
+    assert g.rp > 1.9
+
+  def test_reference_switch_reinitialises(self):
+    g = EndpointGap()
+    for _ in range(40):
+      g.update(2.0, 1, False, False, 0.0, False)
+    q = g.update(5.0, 2, False, False, 0.0, False)  # right -> left reference: no false trigger
+    assert q == 0.0 and g.source == 2
+
+  def test_usual_follows_slowly_and_tau_doubles_while_going_around(self):
+    g1, g2 = EndpointGap(), EndpointGap()
+    for _ in range(10):
+      g1.update(2.0, 1, False, False, 0.0, False)
+      g2.update(2.0, 1, False, False, 0.0, True)
+    for _ in range(200):
+      g1.update(2.5, 1, False, False, 0.0, False)
+      g2.update(2.5, 1, False, False, 0.0, True)
+    assert g1.rp > g2.rp > 2.0
+
+
+class TestYieldRules:
+  def test_trigger_works_with_a_weak_right_reference(self):
+    # right reference gone (q_R < 0.3): the left reference carries the trigger, a swerve is still seen (C8: no q_R gate)
+    ctl = BlendfulCorrection()
+    q = []
+    for i in range(300):
+      sw = 0.0 if i < 150 else min(0.8, 0.8 * (i - 150) * DT_MDL / 0.5)
+      ctl.update(Scene(v=13.0, pr=0.0, plan=-sw).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
+      q.append((ctl.result.yield_q, ctl.result.log['yield_source'], ctl.result.yield_active))
+    assert q[-1][1] == 2 and q[-1][2] and max(x[0] for x in q) > 0.2 and not any(x[2] for x in q[:150])
+
+  def test_upstream_away_fade_counts_as_a_trigger(self):
+    rl = RightLineBlendful()
+    res = rl.update(Scene(v=13.0).model_output(), 13.0, True, 0.0, 0.0, RightInputs(ref_yield_fade=0.5))
+    assert RightLineBlendful.ref_around(RightInputs(ref_yield_fade=0.5)) and not RightLineBlendful.ref_around(RightInputs())
+    for _ in range(5):
+      res = rl.update(Scene(v=13.0).model_output(), 13.0, True, 0.0, 0.0, RightInputs(ref_yield_fade=0.5))
+    assert res.yield_active and res.no_growth
+
+  def test_obstacle_side_is_latched_at_the_start_of_the_yield(self):
+    ctl = BlendfulCorrection()
+    sides = []
+    for i in range(400):
+      if i < 150:
+        plan = 0.0
+      elif i < 250:
+        plan = -0.8  # swerve left: obstacle on the right (+1)
+      else:
+        plan = 0.8 * (1 if i < 300 else 1)  # the plan then crosses to the other side while the yield still holds: the side must not flip
+      ctl.update(Scene(v=13.0, plan=plan).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
+      if ctl.result.yield_active:
+        sides.append(ctl.result.yield_side)
+    assert sides and sides[0] == 1
+    first_flip = next((i for i, s in enumerate(sides) if s != 1), None)
+    assert first_flip is None or first_flip > 60  # not flipped while the first yield is still active
+
+  def test_cap_memory_lives_with_the_yield_and_never_grows(self):
+    ctl, rows = swerve_run(+1, swerve_T=3.0, frames_total=400)
+    mems = []
+    ctl2 = BlendfulCorrection()
+    for i in range(400):
+      sw = 0.0 if i < 100 else min(0.8, 0.8 * (i - 100) * DT_MDL / 3.0)
+      ctl2.update(Scene(v=13.0, plan=-sw).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
+      mems.append(ctl2.cap_mem)
+    m = [x for x in mems if x is not None]
+    assert m and all(b <= a + 1e-15 for a, b in zip(m[:-1], m[1:], strict=True))  # non-increasing for as long as it lives
+    # the swerve ends: the memory is released with the yield (None again once the latch released)
+    for _ in range(1500):  # the usual follows the swerve with tau 10 s, so the yield ends within about a minute
+      ctl2.update(Scene(v=13.0, plan=0.0).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
+    assert ctl2.cap_mem is None
+
+  def test_no_growth_toward_the_obstacle_between_q_0_1_and_0_2(self):
+    ctl = BlendfulCorrection()
+    prev = None
+    worst = 0.0
+    for i in range(500):
+      sw = 0.0 if i < 100 else min(0.35, 0.35 * (i - 100) * DT_MDL / 6.0) if i < 300 else max(0.0, 0.35 - 0.35 * (i - 300) * DT_MDL / 6.0)
+      ctl.update(Scene(v=13.0, plan=-sw).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
+      s_c = ctl.result.yield_side * ctl.c
+      if ctl.result.no_growth and prev is not None and ctl.result.yield_q < br.Q_CAP_FULL:
+        worst = max(worst, s_c - max(prev, 0.0))
+      prev = s_c
+    assert worst <= 1e-12
+
+
+class TestDClip:
+  def test_saturated_error_is_clipped_at_one_metre(self):
+    rl = RightLineBlendful()
+    la = br.approach_length(20.0)
+    plan_x, plan_y = X, np.zeros(33)
+    d, k, k_fit, clipped = rl._correction(np.full(33, 3.0), plan_x, plan_y, 20.0, 1.0)  # error clipped at 1 m: the fit would give 1.46 .. 1.64 m
+    assert clipped and d == 1.0
+    assert abs(k - 6.0 * 1.0 / br.profile_length(20.0) ** 2) < 1e-15
+    d, k, _, clipped = rl._correction(np.full(33, -3.0), plan_x, plan_y, 20.0, 1.0)
+    assert clipped and d == -1.0
+    d, _, _, clipped = rl._correction(np.full(33, 0.2), plan_x, plan_y, 20.0, 1.0)
+    assert not clipped and 0.0 < d < 0.4 and la > 0
+
+  def test_integration_never_exceeds_one_metre(self):
+    rl, logs = frames_of([Scene(v=20.0, width=8.0)] * 300)  # a very wide lane: saturated error
+    assert max(abs(lg['d']) for lg in logs) <= br.D_MAX + 1e-12
+    assert any(lg['d_clipped'] for lg in logs)
+
+
+class TestHandBackWindow:
+  def test_r1_after_the_window_exact_and_decaying_inside(self):
+    # both lines clear: a rises to 1; then the right line vanishes: a falls at 1 /s, the shared limiter carries the remainder to upstream's value
+    ctl = BlendfulCorrection()
+    ref = Blendful()
+    cs, ups, a = [], [], []
+    for i in range(500):
+      sc = Scene(v=13.0, center=0.5, pl=1.0, pr=1.0) if i < 250 else Scene(v=13.0, center=0.5, pl=1.0, pr=0.0)
+      ctl.update(sc.model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT)
+      ups.append(ref.update(Scene(v=13.0, center=0.5, pl=1.0, pr=1.0 if i < 250 else 0.0).model_output(), 13.0, True, 0.0, enabled=True))
       cs.append(ctl.c)
-      assert ctl.result.log['weights'][1] == 0.0 if ctl.result.log['episode'] else True
-    assert ctl.result.log['episode']
-    assert np.abs(np.diff(cs)).max() * 400.0 / DT_MDL <= br.RELEASE + 1e-6  # no step: the limiter takes the share over
+      a.append(ctl.right.a)
+    a, cs, ups = np.array(a), np.array(cs), np.array(ups)
+    zero = 250 + int(np.argmax(a[250:] == 0.0))
+    assert a[zero] == 0.0
+    diff = np.abs(cs - ups)
+    after = zero + int(2.0 / DT_MDL) + 1
+    # outside the 2 s window the replayed correction equals the reference instance's (upstream sees the same raw lines; a = 0, no yield)
+    assert np.max(diff[after:]) <= 1e-9 or np.max(diff[after:]) < 2e-6
+    inside = diff[zero:after]
+    assert np.all(np.diff(inside) <= 1e-12)  # decays monotonically inside the window
 
-  def test_c2_episode_end_is_graceful_at_the_target_offset_rate(self):
-    rl, res = run_rl(episode_scenes(n_wide=60) + [Scene(pl=1.0, pr=1.0, widen=0.8)] * 150)  # the widened line stays: a new lane
-    h = np.array([target_at(r.log, 20.0) - float(np.interp(20.0, X, r.log['c_stable'])) for r in res[140:]])
-    assert np.max(np.abs(np.diff(h))) <= br.TARGET_RATE * DT_MDL + 1e-9
 
-  def test_persistent_widening_ends_at_300_m_and_becomes_the_new_lane(self):
-    rl, res = run_rl(episode_scenes(n_wide=700))
-    eps = [r.log['episode'] for r in res]
-    assert eps[160] and not eps[-1]  # ended at 300 m, no restart
-    t = target_at(res[-1].log, 20.0)
-    assert abs((1.75 + 0.8 - (t + W_R)) - br.gap_for_speed(20.0, 0.5, 1.0)) < 0.03  # now following the widened right line
+class TestFilterScaleK1:
+  def circle_bias(self, s, shift_scale, v=50 / 3.6, R=50.0, q=1.0):
+    k = 1.0 / R
+    ld = br.L_D
+    ytrue = 1.6 + ld * k * (X / s) + k * (X / s) ** 2 / 2  # the lines are reported on the model's x axis: x_m = s x
+    f = InputFilter()
+    f.update(ytrue, 1.0, v * s, v * k)
+    for _ in range(400):
+      y, _ = f.update(ytrue, q, v * shift_scale, v * k, DT_MDL, 1.0 / s if shift_scale == s else 1.0)
+    return float(np.interp([10.0, 20.0, 30.0], X, y - ytrue)[1])
 
-  def test_hold_target_is_continuous_at_the_episode_start(self):
-    rl, res = run_rl(episode_scenes())
-    tg = np.array([target_at(r.log, 20.0) for r in res])
-    assert np.max(np.abs(np.diff(tg[100:]))) <= br.TARGET_RATE * DT_MDL + 1e-9
+  @pytest.mark.parametrize("s", [1.0, 1.05, 0.967, 1.08])
+  def test_the_model_speed_shift_has_no_signed_bias_within_a_few_cm(self, s):
+    assert abs(self.circle_bias(s, s)) < 0.03
 
-  def test_no_left_reference_inside_an_episode_means_the_model_alone(self):
-    scenes = [Scene(pl=1.0, pr=1.0)] * 150 + [Scene(pl=0.0, pr=1.0, widen=0.8)] * 60
-    rl, res = run_rl(scenes, k0_up=0.9)
-    if res[-1].log['episode']:
-      assert res[-1].model_alone and res[-1].k0 == 0.0
+  def test_shifting_by_vego_would_bias_toward_the_outside(self):
+    # (review R5-2) for s > 1 the vEgo shift leaves the estimate on the OUTSIDE of a right curve (y right-positive: y_est - y_true < 0)
+    assert self.circle_bias(1.05, 1.0) < -0.1
 
-  def test_bend_away_detector_and_local_gating(self):
-    base = {'pl': 1.0, 'pr': 1.0}
-    for kw, expect in (({}, 0.0), ({'widen': 0.0, 'bend_x0': 5.0, 'bend_R': 30.0}, 1.0)):
-      sc = Scene(**base, **kw)
-      mo = sc.model_output()
-      _, _, _, b = bend_score(X, mo['lane_lines'][0, 2, :, 0], mo['lane_lines'][0, 1, :, 0], 8.3)
-      assert (b >= 0.9) if expect else (b <= 0.1)
-    # local gating: the target never follows the bending part
-    rl, res = run_rl([Scene(v=8.0, pl=1.0, pr=1.0, bend_x0=10.0, bend_R=12.0)] * 250)
-    y = res[-1].log['target']
-    far = float(np.interp(40.0, X, y))
-    assert far < 1.75 - W_R + 0.5  # not dragged away with the bending line
-
-  def test_widening_followed_linear_not_cut(self):
-    sc = Scene(v=13.0, pl=1.0, pr=1.0)
-    mo = sc.model_output()
-    mo['lane_lines'][0, 2, :, 0] += np.clip(X - 5, 0, None) / 15  # a 1:15 taper
-    _, _, _, b = bend_score(X, mo['lane_lines'][0, 2, :, 0], mo['lane_lines'][0, 1, :, 0], 13.0)
-    assert b <= 0.1
+  def test_true_frame_interval_is_used(self):
+    f, g = InputFilter(), InputFilter()
+    line = np.full(33, 1.7) + 0.02 * X
+    for filt in (f, g):
+      filt.update(line, 1.0, 20.0, 0.0, DT_MDL)
+    pa = f.predict(20.0, 0.0, DT_MDL)
+    pb = g.predict(20.0, 0.0, 0.075)  # a late frame: the shift is v dt with the true interval
+    np.testing.assert_allclose(pb[:20] - pa[:20], 0.02 * 20.0 * (0.075 - DT_MDL), atol=1e-9)
 
 
 def _glide_ok(rows, v):
@@ -974,6 +1284,24 @@ class TestBlinkers:
     rl, res = run_rl([Scene(pl=1.0, pr=1.0)] * 150, k0_up=0.3, inputs=RightInputs(left_blinker=True))
     assert res[-1].log['a'] < 0.05
     assert abs(res[-1].k0 - 0.3) < 0.05
+
+
+class TestIdleInstance:
+  def test_right_line_instance_restarts_when_it_was_idle_in_regular(self):
+    ctl = BlendfulCorrection()
+    sc = Scene(v=13.0, pl=1.0, pr=0.0)  # a = 0 in Regular: the Right line instance does not run, its filters would go stale
+    drive(ctl, [sc] * 200, mode=MODE_REGULAR)
+    assert ctl.right_idle
+    rows = drive(ctl, [Scene(v=13.0, pl=1.0, pr=1.0, center=0.4)] * 40, mode=MODE_RIGHT)
+    assert not ctl.right_idle and ctl.right.filters[2].initialized  # re-initialised from the measurement, not predicted from stale state
+    assert all(r[2]['f_jump'] == 1.0 for r in rows)  # and no jump trip from the stale prediction
+
+
+class TestBendScoreLinearTaper:
+  def test_widening_followed_linear_not_cut(self):
+    mo = tapered(Scene(v=13.0, pl=1.0, pr=1.0))
+    _, _, _, b = bend_score(X, mo['lane_lines'][0, 2, :, 0], mo['lane_lines'][0, 1, :, 0], 13.0)
+    assert b <= 0.1
 
 
 class TestModes:
@@ -1088,6 +1416,23 @@ class TestLogging:
     assert abs(msg.blendfulAuthority - ctl.result.log['a']) < 1e-6
     assert msg.blendfulRightApplied == bool(ctl.result.log['applied'])
     assert abs(msg.blendfulGainF - ctl.gain) < 1e-6
+
+  def test_fill_log_writes_the_episode_and_cue_fields(self):
+    from openpilot.cereal import custom
+    ctl = BlendfulCorrection()
+    drive(ctl, [Scene(v=20.0, width=3.5)] * 150)
+    rows = drive(ctl, [Scene(v=20.0, width=3.5, bend_x0=15.0, bend_R=30.0)] * 30)
+    assert rows[-1][2]['episode']
+    msg = custom.ModelDataV2SP.new_message()
+    br.fill_log(msg, ctl, MODE_RIGHT, 20.0)
+    lg = ctl.result.log
+    assert msg.blendfulJunctionEpisode and msg.blendfulJunctionCues == lg['cues'] and msg.blendfulJunctionCues & 16
+    assert len(msg.blendfulJunctionCueValues) == 7 and abs(msg.blendfulJunctionCueValues[6] - lg['cue_values'][6]) < 1e-6
+    assert abs(msg.blendfulJunctionEpisodeDistance - lg['episode_dist']) < 1e-4 and msg.blendfulJunctionEpisodeDistance > 0.0
+    assert abs(msg.blendfulWidthMemory - lg['width_mem']) < 1e-6 and msg.blendfulWidthMemoryState & 1
+    assert abs(msg.blendfulFrameDt - DT_MDL) < 1e-6 and abs(msg.blendfulPlanSpeed - 20.0) < 1e-6
+    assert msg.blendfulRoadClass == lg['road_class'] and abs(msg.blendfulTargetLag - lg['target_lag']) < 1e-6
+    assert msg.blendfulFadeSplit == 1.0 and not msg.blendfulJunctionHold and not msg.blendfulJunctionLatched  # superseded fields stay constant
 
   def test_fill_log_in_off_writes_only_the_mode_block(self):
     from openpilot.cereal import custom
