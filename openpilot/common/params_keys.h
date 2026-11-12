@@ -262,6 +262,9 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"LaneTurnDesire", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"LaneTurnValue", {PERSISTENT | BACKUP, FLOAT, "19.62"}},
     {"Blendful", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"BlendfulMode", {PERSISTENT | BACKUP, INT, "0"}},  // 0 = Regular, 1 = Right line (used while Blendful is on)
+    {"BlendfulRightGapLow", {PERSISTENT | BACKUP, FLOAT, "0.5"}},  // Right line: right wheel gap to the line at <= 50 km/h (m)
+    {"BlendfulRightGapHigh", {PERSISTENT | BACKUP, FLOAT, "1.0"}},  // Right line: right wheel gap to the line at >= 100 km/h (m)
     {"PlanplusControl", {PERSISTENT | BACKUP, FLOAT, "1.0"}},
 
     // mapd

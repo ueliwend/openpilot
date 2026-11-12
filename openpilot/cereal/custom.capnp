@@ -476,6 +476,55 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   blendfulRightProb @8 :Float32;
   blendfulLaneWidth @9 :Float32;
 
+  # Right-line Blendful (A8), additive. Lists named "input" hold the four inputs in the order
+  # [left line, left edge, right line, right edge]; position lists hold x = 0, 0.5 L, L, 1.5 L per input (L = max(1.5 v, 10 m)).
+  blendfulMode @10 :UInt8;  # 0 off, 1 regular, 2 right line
+  blendfulRightApplied @11 :Bool;
+  blendfulRightGap @12 :Float32;  # g(v), m
+  blendfulRightGapNow @13 :Float32;  # right wheel to the right reference now, m
+  blendfulRightQuality @14 :Float32;  # q_R
+  blendfulLeftRefQuality @15 :Float32;
+  blendfulAuthority @16 :Float32;  # a
+  blendfulAuthorityTarget @17 :Float32;  # a*
+  blendfulFadeBend @18 :Float32;
+  blendfulFadeSplit @19 :Float32;
+  blendfulFadeYieldLeft @20 :Float32;
+  blendfulFadeYieldRight @21 :Float32;
+  blendfulFadeJump @22 :Float32;
+  blendfulFadePlausibility @23 :Float32;
+  blendfulFadeBlinker @24 :Float32;
+  blendfulAwayCar @25 :Float32;  # car-referenced yield trigger quantity, m
+  blendfulRho @26 :Float32;  # rho hat
+  blendfulBias @27 :Float32;  # b hat, m
+  blendfulStrength @28 :Float32;  # s_R
+  blendfulStrengthWeight @29 :Float32;  # w_c
+  blendfulRightOnly @30 :Bool;  # right-only episode: q_R from line or edge with left line quality < 0.3
+  blendfulCurveAccel @31 :Float32;  # |kappa_m| v^2, m/s^2
+  blendfulYieldActive @32 :Bool;
+  blendfulCapActive @33 :Bool;
+  blendfulBoundActive @34 :Bool;
+  blendfulKappaUp @35 :Float32;  # reference instance output (instantaneous)
+  blendfulKappaRL @36 :Float32;  # right-line part, profile amplitude
+  blendfulKappa0 @37 :Float32;  # delivered profile amplitude
+  blendfulGainF @38 :Float32;
+  blendfulProfileLength @39 :Float32;  # L_c, m
+  blendfulProfileShift @40 :Float32;  # D, m
+  blendfulFilterTime @41 :Float32;  # ms per frame
+  blendfulInputFiltered @42 :List(Float32);
+  blendfulInputRaw @43 :List(Float32);
+  blendfulFilterOffset @44 :List(Float32);  # filtered minus raw at x = L, per input
+  blendfulInputConfidence @45 :List(Float32);
+  blendfulInputState @46 :List(UInt8);  # bit 0 coasting, bit 1 re-initialised this frame
+  blendfulCandidateConfidence @47 :List(Float32);  # c_i per input (hysteresis gate)
+  blendfulCandidateWeight @48 :List(Float32);  # softmin weight w_i per input at x = L
+  blendfulReference @49 :List(Float32);  # [left, right] reference at x = L
+  blendfulTarget @50 :List(Float32);  # target lateral position per model x index (right line mode)
+  blendfulJunctionEpisode @51 :Bool;
+  blendfulJunctionLatched @52 :Bool;
+  blendfulJunctionRamp @53 :Bool;  # road context: exit ramp
+  blendfulJunctionHold @54 :Bool;
+  blendfulSplitScore @55 :Float32;
+
   enum TurnDirection {
     none @0;
     turnLeft @1;

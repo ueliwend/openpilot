@@ -9,6 +9,7 @@ import time
 import pyray as rl
 
 from openpilot.cereal import custom
+from openpilot.sunnypilot.modeld_v2.blendful_right import mode_from_params, selection_to_params
 from openpilot.sunnypilot.models.helpers import ACTIVE_BUNDLE_KEYS, get_selected_bundle, resolve_bundle_by_ref
 from openpilot.common.constants import CV
 from openpilot.selfdrive.ui.ui_state import device, ui_state
@@ -23,7 +24,7 @@ from openpilot.system.ui.widgets.toggle import ON_COLOR
 
 from openpilot.system.ui.sunnypilot.lib.styles import style
 from openpilot.system.ui.sunnypilot.lib.utils import NoElideButtonAction, ScrollingButtonAction
-from openpilot.system.ui.sunnypilot.widgets.list_view import ListItemSP, toggle_item_sp, option_item_sp
+from openpilot.system.ui.sunnypilot.widgets.list_view import ListItemSP, toggle_item_sp, option_item_sp, multiple_button_item_sp
 from openpilot.system.ui.sunnypilot.widgets.download_status import download_status_item
 from openpilot.system.ui.sunnypilot.widgets.tree_dialog import TreeOptionDialog, TreeNode, TreeFolder
 
@@ -103,8 +104,17 @@ class ModelsLayout(Widget):
     self.lagd_toggle = toggle_item_sp(tr("Live Learning Steer Delay"), "", param="LagdToggle")
 
     self._blendful_desc = tr("Adds a gentle nudge toward lane center on top of the model's own steering, stronger when lane lines are clear." +
-                             " Yields around obstacles. Not available with the Default model.")
-    self.blendful_toggle = toggle_item_sp(tr("Blendful (Alpha)"), self._blendful_desc, param="Blendful")
+                             " Yields around obstacles. Not available with the Default model. <b>Right line</b> keeps the car to the right of the" +
+                             " lane, following the right line or road edge at the gaps below (never left of the lane center).")
+    self.blendful_selector = multiple_button_item_sp(tr("Blendful (Alpha)"), self._blendful_desc,
+                                                     [tr("Off"), tr("Regular"), tr("Right line")], 0, style.BUTTON_ACTION_WIDTH,
+                                                     callback=self._on_blendful_selected, inline=False)
+
+    gap_desc = tr("Distance from the right wheel to the right line (or road edge) in Right line mode, growing linearly between 50 and 100 km/h.")
+    self.blendful_gap_low = option_item_sp(tr("Right line gap up to 50 km/h"), "BlendfulRightGapLow", 20, 200, gap_desc, 5, None, True, "",
+                                           style.BUTTON_ACTION_WIDTH, None, True, lambda v: f"{v / 100:.2f} m")
+    self.blendful_gap_high = option_item_sp(tr("Right line gap from 100 km/h"), "BlendfulRightGapHigh", 20, 200, gap_desc, 5, None, True, "",
+                                            style.BUTTON_ACTION_WIDTH, None, True, lambda v: f"{v / 100:.2f} m")
 
     self.camera_offset = option_item_sp(tr("Adjust Camera Offset"), "CameraOffset", -35, 35,
                                         tr("Virtually shift camera's perspective to move model's center to Left(+ values) or Right (- values)"),
@@ -112,8 +122,16 @@ class ModelsLayout(Widget):
                                         lambda v: f"{v / 100:.2f} m")
 
     self.items = [self.small_model_item, self.big_model_item, self.cancel_download_item, self.download_item, self.refresh_item, self.clear_cache_item,
-                  self.blendful_toggle, self.lane_turn_desire_toggle, self.lane_turn_value_control, self.lagd_toggle, self.delay_control,
-                  self.camera_offset]
+                  self.blendful_selector, self.blendful_gap_low, self.blendful_gap_high, self.lane_turn_desire_toggle,
+                  self.lane_turn_value_control, self.lagd_toggle, self.delay_control, self.camera_offset]
+
+  @staticmethod
+  def _on_blendful_selected(index: int):
+    """Off / Regular / Right line -> Blendful (BOOL, upstream's key) and BlendfulMode (0 Regular, 1 Right line). Off keeps the last kind."""
+    enabled, kind = selection_to_params(index)
+    ui_state.params.put_bool("Blendful", enabled)
+    if kind is not None:
+      ui_state.params.put("BlendfulMode", kind)
 
   def _update_lagd_description(self, lagd_toggle: bool):
     desc = tr("Enable this for the car to learn and adapt its steering response time. Disable to use a fixed steering response time. " +
@@ -329,18 +347,18 @@ class ModelsLayout(Widget):
     self.lagd_toggle.action_item.set_state(live_delay)
 
     blendful_allowed = ui_state.active_runner_tinygrad
-    if blendful_allowed:
-      self.blendful_toggle.action_item.set_state(ui_state.params.get_bool("Blendful"))
-      self.blendful_toggle.action_item.set_enabled(True)
-    else:
-      self.blendful_toggle.action_item.set_state(False)
-      self.blendful_toggle.action_item.set_enabled(False)
+    selected = mode_from_params(ui_state.params.get_bool("Blendful"), int(ui_state.params.get("BlendfulMode", return_default=True)))
+    self.blendful_selector.action_item.set_selected_button(selected if blendful_allowed else 0)
+    self.blendful_selector.action_item.set_enabled(blendful_allowed)
+    right_line = blendful_allowed and selected == 2
+    self.blendful_gap_low.set_visible(right_line)
+    self.blendful_gap_high.set_visible(right_line)
 
     blendful_desc = self._blendful_desc if blendful_allowed else \
       f"<b>{tr('Select a non-Default model to use Blendful.')}</b><br><br>{self._blendful_desc}"
-    if self.blendful_toggle.description != blendful_desc:
-      self.blendful_toggle.set_description(blendful_desc)
-      self.blendful_toggle.show_description(not blendful_allowed)
+    if self.blendful_selector.description != blendful_desc:
+      self.blendful_selector.set_description(blendful_desc)
+      self.blendful_selector.show_description(not blendful_allowed)
 
     self.delay_control.set_visible(not live_delay and advanced_controls)
     new_step = int(round(100 / CV.MPH_TO_KPH)) if ui_state.is_metric else 100

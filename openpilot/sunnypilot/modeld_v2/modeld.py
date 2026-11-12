@@ -41,6 +41,8 @@ from openpilot.selfdrive.modeld.modeld import ChestnutGpuState
 from openpilot.sunnypilot.modeld_v2.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState, get_curvature_from_output
 from openpilot.sunnypilot.modeld_v2.parse_model_outputs import Parser
 from openpilot.sunnypilot.modeld_v2.blendful import Blendful
+from openpilot.sunnypilot.modeld_v2.blendful_right import (MODE_OFF, BlendfulCorrection, RightInputs, fill_log, mode_from_params)
+from openpilot.sunnypilot.modeld_v2.plan_correction import shift_plan
 from openpilot.sunnypilot.modeld_v2.constants import ModelConstants, Plan
 from openpilot.sunnypilot.modeld_v2.meta_helper import load_meta_constants
 from openpilot.sunnypilot.modeld_v2.camera_offset_helper import CameraOffsetHelper
@@ -232,7 +234,11 @@ class ModelState(ModelStateBase):
 
   def get_action_from_model(self, model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
                             lat_action_t: float, long_action_t: float, v_ego: float,
-                            blendful: Callable[[float], float] | None = None) -> log.ModelDataV2.Action:
+                            blendful: Callable[[float], float] | None = None,
+                            correction: Callable[[float], tuple[float, float]] | None = None) -> log.ModelDataV2.Action:
+    """blendful: today's add-on (mode Off). correction: modes Regular / Right line, called with the model's own curvature, returns the
+    profile amplitude k0 and the instantaneous gain F; the plan in model_output is replaced by the shifted plan (published plan, MPC and
+    UI see the same correction) and desiredCurvature is computed from it."""
     if 'action' not in model_output:
       plan = model_output['plan'][0]
       desired_accel = get_accel_from_plan(plan[:, Plan.VELOCITY][:, 0], plan[:, Plan.ACCELERATION][:, 0], self.constants.T_IDXS,
@@ -241,9 +247,24 @@ class ModelState(ModelStateBase):
       curvature_plan = (plan + (self.PLANPLUS_CONTROL - 1.0) * model_output['planplus'][0]
                         if 'planplus' in model_output and self.PLANPLUS_CONTROL != 1.0 else plan)
       desired_curvature = get_curvature_from_output(model_output, curvature_plan, v_ego, lat_action_t, self.mlsim)
+      if correction is not None:
+        k0, gain = correction(desired_curvature)
+        model_output['plan'] = shift_plan(model_output['plan'][0], k0, max(v_ego, 1.0))[None]
+        if not self.mlsim and model_output.get('desired_curvature'):  # the model's own curvature output does not read the plan
+          desired_curvature += gain * k0
+        else:
+          plan = model_output['plan'][0]
+          curvature_plan = (plan + (self.PLANPLUS_CONTROL - 1.0) * model_output['planplus'][0]
+                            if 'planplus' in model_output and self.PLANPLUS_CONTROL != 1.0 else plan)
+          desired_curvature = get_curvature_from_output(model_output, curvature_plan, v_ego, lat_action_t, self.mlsim)
     else:
       desired_accel = model_output['action'][0, 1]
       desired_curvature = model_output['action'][0, 0] / (max(2.5, v_ego))**2
+      if correction is not None:
+        k0, gain = correction(desired_curvature)
+        if 'plan' in model_output:
+          model_output['plan'] = shift_plan(model_output['plan'][0], k0, max(v_ego, 1.0))[None]
+        desired_curvature += gain * k0
     if blendful is not None:
       desired_curvature += blendful(desired_curvature)
 
@@ -375,8 +396,11 @@ def main(demo=False):
   DH = DesireHelper()
   meta_constants = load_meta_constants()
   RELC = RoadEdgeLaneChangeController()
-  blendful = Blendful()
+  blendful = Blendful()  # regular upstream Blendful: today's add-on in mode Off, the reference instance in Regular / Right line
+  blendful_ctl = BlendfulCorrection(reference=blendful)
   blendful_enabled = False
+  blendful_kind = 0
+  blendful_gaps = (0.5, 1.0)
 
   while True:
     # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
@@ -421,6 +445,8 @@ def main(demo=False):
       model.PLANPLUS_CONTROL = params.get("PlanplusControl", return_default=True)
       camera_offset_helper.set_offset(params.get("CameraOffset", return_default=True))
       blendful_enabled = params.get_bool("Blendful")
+      blendful_kind = int(params.get("BlendfulMode", return_default=True))
+      blendful_gaps = (float(params.get("BlendfulRightGapLow", return_default=True)), float(params.get("BlendfulRightGapHigh", return_default=True)))
     lat_delay = fixed_or_learned(inster_mpc_fixed, 'lat_delay', model.lat_delay) + model.LAT_SMOOTH_SECONDS
     if sm.updated["extrinsicsCalibration"] and sm.seen['narrowRoadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["extrinsicsCalibration"].rpyCalib, dtype=np.float32)
@@ -495,8 +521,20 @@ def main(demo=False):
       if not sm['carControl'].latActive:
         prev_action.desiredCurvature = sm['controlsState'].curvature
       blendful_active = desire == log.Desire.none and DH.lane_change_state == log.LaneChangeState.off
-      action = model.get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego,
-                                           partial(blendful.update, model_output, v_ego, blendful_active, enabled=blendful_enabled))
+      blendful_mode = mode_from_params(blendful_enabled, blendful_kind)
+      if blendful_mode != MODE_OFF or blendful_ctl.releasing:  # a mode switch to Off releases the correction first (2.0 m/s^3)
+        sm_car = sm['carState']
+        rl_inputs = RightInputs(gap_low=blendful_gaps[0], gap_high=blendful_gaps[1], c_set=camera_offset_helper.camera_offset,
+                                c_applied=camera_offset_helper.actual_camera_offset, left_blinker=bool(sm_car.leftBlinker),
+                                right_blinker=bool(sm_car.rightBlinker))
+
+        def _correction(kappa_m, mo=model_output, mode=blendful_mode, inputs=rl_inputs, v=v_ego, act=blendful_active, t_a=lat_action_t):
+          k0 = blendful_ctl.update(mo, v, act, kappa_m, t_a, mode, inputs)
+          return k0, blendful_ctl.gain
+        action = model.get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego, correction=_correction)
+      else:  # Off: today's car, bit for bit
+        action = model.get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego,
+                                             partial(blendful.update, model_output, v_ego, blendful_active, enabled=False))
       prev_action = action
       fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
@@ -520,6 +558,7 @@ def main(demo=False):
       mdv2sp_send.modelDataV2SP.blendfulLeftProb = blendful.l_prob
       mdv2sp_send.modelDataV2SP.blendfulRightProb = blendful.r_prob
       mdv2sp_send.modelDataV2SP.blendfulLaneWidth = float(blendful.lane_width.x)
+      fill_log(mdv2sp_send.modelDataV2SP, blendful_ctl, blendful_mode, v_ego)
       drivingdata_send.drivingModelData.meta.laneChangeState = DH.lane_change_state
       drivingdata_send.drivingModelData.meta.laneChangeDirection = DH.lane_change_direction
 

@@ -32,10 +32,12 @@ class BlendfulRenderer:
 
   def update(self, renderer, max_idx: int, *map_args) -> None:
     blendful = ui_state.sm['modelDataV2SP']
+    right_line = blendful.blendfulMode == 2  # Right line: draw the target T, strength from the right-line part
+    shown = blendful.blendfulAuthority > 0.0 if right_line else blendful.blendfulTrust > 0.0
     if ui_state.sm.updated['modelDataV2SP']:
-      self._alpha.update(float(blendful.blendfulTrust > 0.0))
-      if blendful.blendfulTrust > 0.0:
-        self._trust = blendful.blendfulTrust
+      self._alpha.update(float(shown))
+      if shown:
+        self._trust = max(blendful.blendfulAuthority * blendful.blendfulStrength, 0.05) if right_line else blendful.blendfulTrust
       if self._readout:
         lookahead = max(ui_state.sm['carState'].vEgo * LOOKAHEAD_TIME, MIN_LOOKAHEAD)
         self._pull_display.update(blendful.blendfulCurvature * lookahead ** 2 / 2)
@@ -45,6 +47,13 @@ class BlendfulRenderer:
     stds = list(ui_state.sm['modelV2'].laneLineStds)
     if self._alpha.x < 0.01 or len(left) == 0 or len(right) != len(left) or len(stds) < 3:
       self._center_points = np.empty((0, 2), dtype=np.float32)
+      return
+
+    target = list(blendful.blendfulTarget)
+    if right_line and shown and len(target) == len(left):
+      center = left.copy()
+      center[:, 1] = target
+      self._center_points = renderer._map_line_to_polygon(center, 0.15, 0.0, max_idx, *map_args)
       return
 
     l_prob, r_prob = blendful.blendfulLeftProb, blendful.blendfulRightProb

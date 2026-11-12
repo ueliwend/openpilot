@@ -19,9 +19,21 @@ LINE_STD = (0.2, 0.6)
 POINT_STD = 0.1
 YIELD = (0.2, 0.45)
 X_IDXS = np.array(ModelConstants.X_IDXS)
+SMOOTH_TAU = 0.5  # s, smoothing of the correction target on straights (falls to 0 between 0.18 and 0.53 m/s^2)
 
 
 class Blendful:
+  SMOOTH_TAU = SMOOTH_TAU
+
+  @staticmethod
+  def centre_and_weight(left, right, l_std, r_std, l_prob, r_prob, half_width):
+    """Hook shared with RightLineBlendful: inverse-variance mean of (left + hw) and (right - hw), and its fit weight (blendful.py:103-106)."""
+    l_var = l_std ** 2 / max(l_prob, 1e-4)
+    r_var = r_std ** 2 / max(r_prob, 1e-4)
+    center = (r_var * (left + half_width) + l_var * (right - half_width)) / (l_var + r_var)
+    weight = 1.0 / (l_var * r_var / (l_var + r_var) + POINT_STD ** 2)
+    return center, weight
+
   def __init__(self):
     self.lane_width = FirstOrderFilter(LANE_WIDTH_DEFAULT, 10.0, DT_MDL, initialized=False)
     self.line_gone = FirstOrderFilter(np.zeros(2), 2.0, DT_MDL)
@@ -53,7 +65,8 @@ class Blendful:
       self.lane_width.initialized = False
       self.going_around = False
     target = 0.0 if fading else self._target(model_output, v_ego, model_curvature)
-    target = self.smooth = self.smooth + (target - self.smooth) * DT_MDL / (DT_MDL + np.interp(abs(model_curvature) * v_ego ** 2, [0.18, 0.53], [0.5, 0.0]))
+    tau = np.interp(abs(model_curvature) * v_ego ** 2, [0.18, 0.53], [self.SMOOTH_TAU, 0.0])
+    target = self.smooth = self.smooth + (target - self.smooth) * DT_MDL / (DT_MDL + tau)
     build = 0.5 / max(v_ego, 1.0) ** 2 * DT_MDL  # jerk over 1 second
     release = (0.5 if fading else 2.0) / max(v_ego, 1.0) ** 2 * DT_MDL  # lets go fast, but past zero it builds like any other pull
     k = self.curvature
@@ -100,10 +113,7 @@ class Blendful:
       width = np.interp(lookahead, X_IDXS, lines[2]) - np.interp(lookahead, X_IDXS, lines[1])
       self.lane_width.update(float(np.clip(width, *LANE_WIDTH_CLIP)))
       half_width = np.clip(lines[2, win] - lines[1, win], *LANE_WIDTH_CLIP) / 2
-    l_var = stds[1, win] ** 2 / max(l_prob, 1e-4)
-    r_var = stds[2, win] ** 2 / max(r_prob, 1e-4)
-    center = (r_var * (lines[1, win] + half_width) + l_var * (lines[2, win] - half_width)) / (l_var + r_var)
-    weight = 1.0 / (l_var * r_var / (l_var + r_var) + POINT_STD ** 2)
+    center, weight = self.centre_and_weight(lines[1, win], lines[2, win], stds[1, win], stds[2, win], l_prob, r_prob, half_width)
 
     # Fit curvature to place the plant in center: e ~ dk x^2 / 2
     plan_x = np.interp(x, model_output['plan'][0, :, 0], model_output['plan'][0, :, 1])
