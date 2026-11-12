@@ -11,8 +11,16 @@ import pytest
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.modeld_v2.blendful import Blendful
-from openpilot.sunnypilot.modeld_v2.blendful_right import MODE_OFF, MODE_REGULAR, MODE_RIGHT, BlendfulCorrection, RightInputs, RightLineBlendful
+from openpilot.sunnypilot.modeld_v2 import blendful_right as br
+from openpilot.sunnypilot.modeld_v2.blendful_right import MODE_OFF, MODE_REGULAR, MODE_RIGHT, BlendfulCorrection, RightLineBlendful
 from openpilot.sunnypilot.modeld_v2.constants import ModelConstants, Plan
+from openpilot.sunnypilot.modeld_v2.radar_clearance import healthy_empty_radar
+
+
+def RightInputs(**kw):
+  """RightInputs with a healthy, empty radar unless a test gives one (Right line needs a healthy radar, B6a)."""
+  kw.setdefault('radar', healthy_empty_radar())
+  return br.RightInputs(**kw)
 from openpilot.sunnypilot.modeld_v2.tests.test_blendful_right import Scene
 
 X = np.array(ModelConstants.X_IDXS)

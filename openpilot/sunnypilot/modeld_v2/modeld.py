@@ -42,6 +42,7 @@ from openpilot.sunnypilot.modeld_v2.fill_model_msg import fill_model_msg, fill_p
 from openpilot.sunnypilot.modeld_v2.parse_model_outputs import Parser
 from openpilot.sunnypilot.modeld_v2.blendful import Blendful
 from openpilot.sunnypilot.modeld_v2.blendful_right import (MODE_OFF, BlendfulCorrection, RightInputs, fill_log, mode_from_params)
+from openpilot.sunnypilot.modeld_v2.radar_clearance import RadarFrame
 from openpilot.sunnypilot.modeld_v2.plan_correction import shift_plan
 from openpilot.sunnypilot.modeld_v2.constants import ModelConstants, Plan
 from openpilot.sunnypilot.modeld_v2.meta_helper import load_meta_constants
@@ -360,7 +361,7 @@ def main(demo=False):
   pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"] + (["chestnutGpuState"] if CHESTNUT else [])
   pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState",
-                  "carControl", "controlsState", "lateralDelay"])
+                  "carControl", "controlsState", "lateralDelay", "radarTracks"])  # radarTracks: A8 right-side clearance check (B6a)
 
   publish_state = PublishState()
   chestnut_state = ChestnutGpuState(pm, model.chestnut) if CHESTNUT else None
@@ -526,14 +527,23 @@ def main(demo=False):
       if blendful_mode != MODE_OFF or blendful_ctl.releasing:  # a mode switch to Off releases the correction first (2.0 m/s^3)
         sm_car = sm['carState']
         frame_dt = (meta_main.timestamp_eof - blendful_last_eof) * 1e-9 if blendful_last_eof else DT_MDL
+        rt = sm['radarTracks']
+        radar = RadarFrame(tracks=[(pt.trackId, pt.dRel, pt.yRel, pt.vRel) for pt in rt.points],
+                           age=(time.monotonic() - sm.recv_time['radarTracks']) if sm.seen['radarTracks'] else float('inf'),
+                           fault=(not sm.seen['radarTracks']) or (not sm.valid['radarTracks']) or any(rt.errors.to_dict().values()),
+                           new=bool(sm.updated['radarTracks']), right_blindspot=bool(sm_car.rightBlindspot))
         rl_inputs = RightInputs(frame_dt=frame_dt, gap_low=blendful_gaps[0], gap_high=blendful_gaps[1], c_set=camera_offset_helper.camera_offset,
                                 c_applied=camera_offset_helper.actual_camera_offset, left_blinker=bool(sm_car.leftBlinker),
-                                right_blinker=bool(sm_car.rightBlinker))
+                                right_blinker=bool(sm_car.rightBlinker), radar=radar)
 
         def _correction(kappa_m, mo=model_output, mode=blendful_mode, inputs=rl_inputs, v=v_ego, act=blendful_active, t_a=lat_action_t):
           k0 = blendful_ctl.update(mo, v, act, kappa_m, t_a, mode, inputs)
           return k0, blendful_ctl.gain
+        t_blendful = time.perf_counter()
         action = model.get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego, correction=_correction)
+        # the whole Blendful part of this frame (design D): both instances, filters, radar check, targets, fit, the plan shift and the
+        # desired-curvature recomputation from the shifted plan; logged as blendfulUpdateTime
+        blendful_ctl.update_ms = (time.perf_counter() - t_blendful) * 1e3
       else:  # Off: today's car, bit for bit
         action = model.get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego,
                                              partial(blendful.update, model_output, v_ego, blendful_active, enabled=False))

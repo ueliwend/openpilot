@@ -25,6 +25,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.modeld_v2.blendful import Blendful, LANE_WIDTH_DEFAULT, LINE_STD, LOOKAHEAD_TIME, MIN_LOOKAHEAD, MIN_SPEED
 from openpilot.sunnypilot.modeld_v2.constants import ModelConstants, Plan
 from openpilot.sunnypilot.modeld_v2.plan_correction import approach_length, fit_amplitude, instant_gain, profile_length, shift_plan, smoothstep
+from openpilot.sunnypilot.modeld_v2.radar_clearance import RadarClearance, RadarFrame, clearance_q
 
 X_IDXS = np.array(ModelConstants.X_IDXS)
 NX = len(X_IDXS)
@@ -55,10 +56,16 @@ D_MAX = 1.0  # m, the fitted profile amplitude is clipped here (C9)
 BUILD, RELEASE, FADING_RELEASE, SWERVE_RELEASE = 0.5, 2.0, 0.5, 5.0  # m/s^3, final limiter (blendful.py:57-60; 5 = controlsd's limit)
 # authority (B5)
 A_DEAD, A_DWELL, A_OUT, A_IN, A_HOLD = 0.05, 0.5, 1.0, 0.5, 1.0
-# ground-fixed target (B5, C1; owner 21:44 question 9)
-TARGET_RATE_LEFT = 0.25  # m/s, the target moving left (toward the lane centre, away from the right line)
-MOVE_RATE_RIGHT = 0.05  # m/s, the move to the right-hand position (owner 21:44, question 9 option b)
+# ground-fixed target T_lim (B5 step 3, C1): glide rate in both directions, lag-bound rate, far points re-seeded from T_raw
+TARGET_RATE = 0.25  # m/s, both directions (rev 6.3: the speed of moves to the right is set by the final move-speed limit)
 LAG_BOUND, LAG_RATE = 1.0, 0.5  # m, m/s: where the target lags its raw value by more, that point moves at LAG_RATE (still glide-limited)
+RESEED_LOOKAHEADS = 2.0  # points beyond 2 L take T_raw every frame (rev 6.4)
+# final move-speed limit (B5 step 4b, rev 6.5; owner 21:44 question 9): the approach to the right reference grows at <= 0.05 m/s
+MOVE_SPEED = 0.05  # m/s
+RELEASE_NEAR = 0.05  # m: after a reset the approach is held until the car is this close to p0 (and its own approach is <= MOVE_SPEED)
+# measurement-filter rotation lever (B2, rev 6.3): "design" = lever x (scale 1, default); "model_axis" = lever x vEgo / v_x(0)
+ROTATION_SCALES = ("design", "model_axis")
+FILTER_ROTATION_SCALE = "design"
 # yields (B6, C7, C8)
 Q_NO_GROWTH, Q_CAP_START, Q_CAP_FULL, Q_RELEASE = 0.1, 0.15, 0.2, 0.1
 GAP_SMOOTH_TAU, GAP_MEDIAN_S = 0.25, 0.5  # s, endpoint gap smoothing and the median window before the running minimum
@@ -81,7 +88,7 @@ SIDE_RIGHT, SIDE_LEFT = 1, -1
 BOTH_SIDES = (SIDE_RIGHT, SIDE_LEFT)
 LOG_SIDE_BOTH = 2  # log value of the yield side while both directions are capped
 # left-limit formula hysteresis (review S4): two references from q > 0.5 on both sides, back to one when either falls below 0.4
-CENTRE_BOTH_ON, CENTRE_BOTH_OFF, CENTRE_SIDE_SWITCH = 0.5, 0.4, 0.1
+CENTRE_BOTH_ON, CENTRE_BOTH_OFF, CENTRE_SIDE_SWITCH, CENTRE_DWELL = 0.5, 0.4, 0.1, 0.5  # quality, quality, quality, s (rev 6.3)
 # episode end reasons and road classes (log)
 END_NONE, END_QUIET, END_WIDENING, END_MAX = 0, 1, 2, 3
 ROAD_EDGES, ROAD_SHARED, ROAD_LANES, ROAD_MOTORWAY = 0, 1, 2, 3
@@ -138,6 +145,7 @@ class InputFilter:
     self.gap = 0.0
     self.coast = False
     self.reinit = False
+    self.step = np.zeros(NX)  # on a re-initialisation (or coast expiry) frame: the jump of the estimate against its own prediction
 
   def predict(self, vx0: float, yaw_rate: float, dt: float = DT_MDL, scale: float = 1.0) -> np.ndarray:
     return motion_predict(self.y, vx0, yaw_rate, dt, scale)
@@ -146,9 +154,12 @@ class InputFilter:
              scale: float = 1.0) -> tuple[np.ndarray, float]:
     q_meas = float(np.clip(q_meas, 0.0, 1.0))
     self.reinit = False
+    self.step = np.zeros(NX)
     alpha = dt / (dt + self.tau)
+    was_initialized = self.initialized
+    pred_prev = self.predict(vx0, yaw_rate, dt, scale)
     if self.initialized:
-      pred = self.predict(vx0, yaw_rate, dt, scale)
+      pred = pred_prev
       self.y_pred = pred
       self.innovation = y_meas - pred
       if q_meas >= COAST_Q:
@@ -174,15 +185,17 @@ class InputFilter:
         self.q = q_meas
       else:
         self.q = 0.0
+    if was_initialized != self.initialized:  # re-initialised from the measurement, or the coast expired: a step that is not road
+      self.step = self.y - pred_prev
     return self.y, self.q
 
 
 class GroundTarget:
-  """Ground-fixed, rate-limited target (B5, C1, R5-3).  Last frame's limited target is predicted into the new car frame with the filters'
-  motion model and then moves toward the raw target by at most rate x dt per point: to the right (the move to the right-hand position)
-  MOVE_RATE_RIGHT, to the left TARGET_RATE_LEFT.  Where it lags the raw target by more than LAG_BOUND the rate rises to LAG_RATE (still
-  glide-limited), so a systematic prediction error cannot make it drift away.  Points beyond the last frame's horizon take the raw
-  target.  Its own state cannot jump: a flickering or re-indexed reference moves it by at most rate x dt per point and frame."""
+  """Ground-fixed, rate-limited target T_lim (B5 step 3, C1, R5-3, rev 6.3 / 6.4).  Last frame's T_lim is predicted into the new car frame
+  with the filters' motion model and then moves toward the raw target by at most TARGET_RATE x dt per point in either direction (the speed
+  of moves to the right is set by the final move-speed limit, step 4b).  Where it lags the raw target by more than LAG_BOUND the rate
+  rises to LAG_RATE (still glide-limited).  Points beyond the last frame's horizon, and every point beyond reseed_x (2 L), take the raw
+  target every frame, so far-field prediction errors are not carried into the fit window.  Inside reseed_x its own state cannot jump."""
   def __init__(self):
     self.t: np.ndarray | None = None
     self.lag = np.zeros(NX)
@@ -191,7 +204,7 @@ class GroundTarget:
     self.t = None
     self.lag = np.zeros(NX)
 
-  def update(self, t_raw: np.ndarray, vx0: float, yaw_rate: float, dt: float, scale: float = 1.0) -> np.ndarray:
+  def update(self, t_raw: np.ndarray, vx0: float, yaw_rate: float, dt: float, scale: float = 1.0, reseed_x: float | None = None) -> np.ndarray:
     if self.t is None:
       self.t = np.array(t_raw, dtype=float)
       self.lag = np.zeros(NX)
@@ -199,12 +212,58 @@ class GroundTarget:
     pred = motion_predict(self.t, vx0, yaw_rate, dt, scale)
     pred = np.where(X_IDXS + vx0 * dt > X_IDXS[-1], t_raw, pred)
     diff = t_raw - pred  # > 0: the raw target is further right
-    big = np.abs(diff) > LAG_BOUND
-    up = np.where(big, LAG_RATE, MOVE_RATE_RIGHT) * dt
-    down = np.where(big, LAG_RATE, TARGET_RATE_LEFT) * dt
-    self.t = pred + np.clip(diff, -down, up)
+    rate = np.where(np.abs(diff) > LAG_BOUND, LAG_RATE, TARGET_RATE) * dt
+    self.t = pred + np.clip(diff, -rate, rate)
+    if reseed_x is not None:
+      self.t = np.where(X_IDXS > reseed_x, t_raw, self.t)
     self.lag = t_raw - self.t
     return self.t.copy()
+
+
+class MoveSpeedLimit:
+  """Final move-speed limit (B5 step 4b, rev 6.5; question 9; reviews K62-1, C63-1; impl review B3).  Same frame, lane coordinates, no
+  lateral prediction.  Per window point the gap of the step-4 target to the right reference is G4 = Y_R - T4; G0 is the gap at the last
+  reset, carried along the lane by the model's own travel and rebased by the switch part of the change of Y_R (amendment 1).  The weighted
+  approach A = w (G0 - G), w = a s_R f_yieldR, grows by at most MOVE_SPEED dt per frame, any decrease passes at once:
+  A_lim = min(w (G0 - G4), A_prev + MOVE_SPEED dt), G = max(G4, G0 - A_lim / w) (G = max(G4, G0) at w = 0), and the target is
+  max(T_C', Y_R - G) (the centre limit as a floor, amendment 2); the caller applies the right safety bounds after it.
+  Reset (A = 0): p0 = max(car position, T_C'(0)), G0 := Y_R(0) - p0 along the lane, A held at 0 until the car's gap is within 0.05 m of
+  p0's and its own approach to the right reference (from Y_R(0), switch part removed) is <= MOVE_SPEED."""
+  def __init__(self):
+    self.g0: np.ndarray | None = None
+    self.a_lim = np.zeros(NX)
+    self.released = False
+    self.limiting = False
+    self.yr0_prev: float | None = None
+    self.approach_speed = 0.0
+
+  def update(self, y_r: np.ndarray, t4: np.ndarray, c_ctr: np.ndarray, w: float, switch_part: np.ndarray, vx0: float, dt: float,
+             reset: bool) -> np.ndarray:
+    yr0 = float(y_r[0])
+    if self.yr0_prev is not None:
+      self.approach_speed = (self.yr0_prev + float(switch_part[0]) - yr0) / dt
+    self.yr0_prev = yr0
+    if self.g0 is not None:
+      xs = X_IDXS + vx0 * dt
+      self.g0 = np.interp(xs, X_IDXS, self.g0) + switch_part
+      self.a_lim = np.interp(xs, X_IDXS, self.a_lim)
+    if reset or self.g0 is None:
+      p0 = max(0.0, float(c_ctr[0]))
+      self.g0 = np.full(NX, yr0 - p0)
+      self.a_lim = np.zeros(NX)
+      self.released = False
+    if not self.released and yr0 <= float(self.g0[0]) + RELEASE_NEAR and self.approach_speed <= MOVE_SPEED:
+      self.released = True
+    g4 = y_r - t4
+    if w > 1e-9:
+      want = w * (self.g0 - g4)
+      self.a_lim = np.minimum(want, self.a_lim + (MOVE_SPEED * dt if self.released else 0.0))
+      self.limiting = bool(np.any(self.a_lim < want - 1e-9))
+      g = np.maximum(g4, self.g0 - self.a_lim / w)
+    else:
+      self.limiting = False
+      g = np.maximum(g4, self.g0)
+    return np.maximum(c_ctr, y_r - g)
 
 
 class Authority:
@@ -564,26 +623,38 @@ def log_side(caps: dict[int, float]) -> int:
 
 
 class CentreLimitSource:
-  """Which formula the left limit T_C' uses (B5 step 4; review S4).  Two references: their midpoint (the unclipped width); one reference:
-  that reference minus / plus upstream's filtered half width.  Confidence hysteresis: two references once q_R and q_L both exceed 0.5, back to
-  one when either falls below 0.4; between the one-reference formulas the side changes only when the other side's quality is higher by more
-  than 0.1.  Quality flicker around a threshold therefore cannot switch the formula, and step the final target, from frame to frame."""
+  """Which form the left limit T_C' uses (B3, rev 6.3; review S4).  Two references: their midpoint (the unclipped width); one reference:
+  that reference minus / plus upstream's filtered half width.  The two-reference form is entered when the weaker side's quality has been
+  above 0.5 for longer than 0.5 s and left when it has been below 0.4 for longer than 0.5 s; between the one-reference forms the side
+  changes only when the other side's quality is higher by more than 0.1 (implementation choice; the design does not say).  Quality
+  flicker around a threshold therefore cannot switch the form from frame to frame."""
   BOTH, RIGHT, LEFT = 0, 1, 2
 
   def __init__(self):
     self.src: int | None = None
+    self.t = 0.0  # how long the switching condition has held, from its first frame
+    self.pending = False
 
-  def update(self, q_r: float, q_l: float) -> int:
-    if self.src == self.BOTH and min(q_r, q_l) >= CENTRE_BOTH_OFF:
+  def _single(self, q_r: float, q_l: float) -> int:
+    if self.src == self.RIGHT:
+      return self.LEFT if q_l > q_r + CENTRE_SIDE_SWITCH else self.RIGHT
+    if self.src == self.LEFT:
+      return self.RIGHT if q_r > q_l + CENTRE_SIDE_SWITCH else self.LEFT
+    return self.RIGHT if q_r >= q_l else self.LEFT
+
+  def update(self, q_r: float, q_l: float, dt: float = DT_MDL) -> int:
+    weak = min(q_r, q_l)
+    if self.src is None:
+      self.src = self.BOTH if weak > CENTRE_BOTH_ON else self._single(q_r, q_l)
       return self.src
-    if q_r > CENTRE_BOTH_ON and q_l > CENTRE_BOTH_ON:
-      self.src = self.BOTH
-    elif self.src == self.RIGHT:
-      self.src = self.LEFT if q_l > q_r + CENTRE_SIDE_SWITCH else self.RIGHT
-    elif self.src == self.LEFT:
-      self.src = self.RIGHT if q_r > q_l + CENTRE_SIDE_SWITCH else self.LEFT
-    else:  # first frame, or two references just ended
-      self.src = self.RIGHT if q_r >= q_l else self.LEFT
+    cond = weak < CENTRE_BOTH_OFF if self.src == self.BOTH else weak > CENTRE_BOTH_ON
+    self.t = (self.t + dt if self.pending else 0.0) if cond else 0.0
+    self.pending = cond
+    if cond and self.t > CENTRE_DWELL + 1e-9:  # held for longer than 0.5 s (a quality 0.5 +- 0.2 at 1 Hz is above 0.5 for exactly 0.5 s)
+      self.src = self._single(q_r, q_l) if self.src == self.BOTH else self.BOTH
+      self.t, self.pending = 0.0, False
+    elif self.src != self.BOTH:
+      self.src = self._single(q_r, q_l)
     return self.src
 
 
@@ -638,6 +709,7 @@ class RightInputs:
   ref_departure: float = 0.0  # the reference instance's offset - usual, m (> 0: its plan end moved right, i.e. an obstacle on the left)
   ref_lane_width: float = LANE_WIDTH_DEFAULT  # the reference instance's filtered lane width (left limit with one reference)
   building: bool = False  # last frame's final limiter was still building the correction toward the right
+  radar: RadarFrame | None = None  # the newest radarTracks message (B6a); None = no radar data: f_radar = 0, Right line = Regular
 
 
 @dataclass
@@ -654,8 +726,10 @@ class RightResult:
 
 
 class RightLineBlendful:
-  def __init__(self, strength_rising: bool | None = None):
+  def __init__(self, strength_rising: bool | None = None, rotation_scale: str | None = None):
     self.strength_rising = RISING_STRENGTH if strength_rising is None else strength_rising
+    self.rotation_scale = FILTER_ROTATION_SCALE if rotation_scale is None else rotation_scale
+    assert self.rotation_scale in ROTATION_SCALES, self.rotation_scale
     self.filters = [InputFilter() for _ in range(4)]  # left line, left edge, right line, right edge
     self.gates = [ConfGate() for _ in range(4)]
     self.reset()
@@ -669,8 +743,11 @@ class RightLineBlendful:
     self.blink_on = Timed(off_time=1.0, on_time=0.3)
     self.f_blink = 1.0
     self.width_mem = WidthMemory()
+    self.radar = RadarClearance()
     self.restart_lane_tracking()
     self.inactive_prev = False
+    self.force_regular_prev = True
+    self.mode_on = True  # the first frame after a (re)start is a re-entry of the move-speed limit
 
   def restart_lane_tracking(self):
     """Everything that describes the lane the car is in: the input filters and their confidence gates, the probability filters, the
@@ -685,15 +762,19 @@ class RightLineBlendful:
     self.line_probs = FirstOrderFilter(np.zeros(2), 0.5, DT_MDL)
     self.edge_q = FirstOrderFilter(np.zeros(2), 0.5, DT_MDL)
     self.ground = GroundTarget()
+    self.move = MoveSpeedLimit()
+    self.ref_present_prev = False
     self.jumps = JumpDetector()
     self.centre_src = CentreLimitSource()
     self.w_prev = None
+    self.w_r_prev = None
     self.width_mem.remeasure()
     self.reset_yields()
 
   def reset_yields(self):
     """Yield state: endpoint-gap trigger, both latches, the aggregator and the move flag (also while the instance fades, review S2)."""
     self.gap = EndpointGap()
+    self.gap_rebase = 0.0  # cumulative switch part of the right reference at L, left out of the endpoint gap
     self.yield_latch = Timed(off_time=1.0)
     self.ref_yield_latch = Timed(off_time=1.0)
     self.yields = YieldAggregator()
@@ -748,7 +829,11 @@ class RightLineBlendful:
     vx0 = float(plan[0, Plan.VELOCITY.start])  # the model's own speed: the x axis of the lines carries its distance scale (K1, C11)
     if not np.isfinite(vx0) or vx0 < 1.0:
       vx0 = max(v, 0.0)
-    scale = float(np.clip(v / vx0, 0.8, 1.25)) if (v >= 1.0 and vx0 >= 1.0) else 1.0  # vEgo / v_x(0): the true distance per model-axis metre
+    # rotation lever (B2, FILTER_ROTATION_SCALE): "model_axis" scales it by vEgo / v_x(0), "design" (default) uses x as it is
+    scale = float(np.clip(v / vx0, 0.8, 1.25)) if (self.rotation_scale == "model_axis" and v >= 1.0 and vx0 >= 1.0) else 1.0
+    if self.force_regular_prev and not force_regular:  # mode switched on (Regular -> Right line): a re-entry of the move-speed limit
+      self.mode_on = True
+    self.force_regular_prev = force_regular
     probs_raw = mo['lane_lines_prob'][0, 1::2]
     probs = self.line_probs.update(probs_raw[1:3])
     l_q = float(probs[0] * np.interp(np.interp(0.5 * look, X_IDXS, lstds[1]), LINE_STD, [1.0, 0.0]))
@@ -798,7 +883,7 @@ class RightLineBlendful:
     self.w_prev = w_at
     # --- left limit T_C': the centre between the references (unclipped width with two references, upstream's filtered width with one);
     # the formula changes with confidence hysteresis (S4)
-    centre_src = self.centre_src.update(q_R, q_L)
+    centre_src = self.centre_src.update(q_R, q_L, dt)
     if centre_src == CentreLimitSource.BOTH:
       c_ctr = (y_l + y_r) / 2
     elif centre_src == CentreLimitSource.RIGHT:
@@ -836,16 +921,15 @@ class RightLineBlendful:
     widening = max(widening_vals) if widening_vals else None
     was_episode = self.episodes.episode
     in_episode = self.episodes.update(cue_any, widening, v, dt)
-    if was_episode and not in_episode:  # the episode ended: re-measure the width, restart the target from the raw target
+    if was_episode and not in_episode:  # the episode ended: re-measure the width (T_lim keeps its state; the move limit resets, B5)
       self.width_mem.end_of_episode()
-      self.ground.reset()
     jn_active = in_episode and not force_regular
     # --- blinker fade (left blinker hands back to upstream; B9)
     lb = self.blink_on.update(p.left_blinker)
     self.f_blink = max(0.0, self.f_blink - dt) if lb else min(1.0, self.f_blink + dt)
     # --- road class (log / reports only; resets no estimator)
     road = self.road.update(v, q_L, q_R, width_now, dt)
-    # --- targets (B1, B8): references -> raw target -> rate limit -> bounds
+    # --- step 2 / 3: references -> raw target -> ground-fixed rate limit (B1, B5, B8)
     g = gap_for_speed(v, p.gap_low, p.gap_high)
     win_ref = (X_IDXS >= 0.5 * look) & (X_IDXS <= 1.5 * look)
     k_ref = 2.0 * float(np.polyfit(X_IDXS[win_ref], y_r[win_ref], 2)[0])
@@ -853,33 +937,33 @@ class RightLineBlendful:
     dc = p.c_set - p.c_applied
     t_r_line = y_r - W_R - g - off_track - dc
     t_raw = np.maximum(t_r_line, c_ctr)
-    t_lim = self.ground.update(t_raw, vx0, yaw_rate, dt, scale)
-    t_left = np.maximum(t_lim, c_ctr)  # the left limit acts after the rate limit
-    t_bound_line = y_r - W_R - LINE_BOUND - off_track - dc
-    w_e = float(ss((qf[3] - 0.4) / 0.2))
-    t_bound_edge = filt[3] - W_R - EDGE_BOUND - off_track - dc
-    t_bounded = np.minimum(t_left, t_bound_line)
-    target = t_bounded - w_e * np.maximum(0.0, t_bounded - t_bound_edge)
-    bound_active = bool(np.any(target < t_left - 1e-9))
+    t_lim = self.ground.update(t_raw, vx0, yaw_rate, dt, scale, reseed_x=RESEED_LOOKAHEADS * look)
     lag_L = float(np.interp(iL, X_IDXS, self.ground.lag))
-    # --- correction (B4)
-    w_c = float(np.interp(abs(model_curvature) * v ** 2, [0.18, 0.53], [STRENGTH_RIGHT_ONLY, 1.0])) if self.strength_rising else STRENGTH_RIGHT_ONLY
-    s_r = 1.0 - (1.0 - l_q) * (1.0 - w_c * q_R)
-    d_rl, k0_rl, k_fit, d_clipped = self._correction(target, plan_x, plan_y, v, s_r)
-    # --- yields (B6, C7, C8): the endpoint-gap trigger on the right reference, else the left one, else the plan alone
+    # --- radar right-side clearance check (B6a): reads the radar, the references and the centre limit, never the plan
+    rc = self.radar.update(p.radar, v, vx0, yaw_rate, g, dc, W_R, X_IDXS, c_ctr, filt[3] - EDGE_EXTRA, w_r[1], dt)
+    f_radar = 1.0 if rc.healthy else 0.0
+    # --- yields (B6, C7, C8): the endpoint-gap trigger on the right reference, else the left one, else the plan alone, the reference
+    # instance, and the radar clearance trigger, each with its own side
     if q_R >= 0.3:
       src, ref_L = 1, float(np.interp(look, X_IDXS, y_r))
     elif q_L >= 0.3:
       src, ref_L = 2, float(np.interp(look, X_IDXS, y_l))
     else:
       src, ref_L = 0, 0.0
-    x_gap = ref_L - float(np.interp(look, plan_x, plan_y))
+    # the switch part of the change of Y_R (B5 amendment 1: candidate weights, filter re-initialisation steps): not road
+    sw = (w_r - self.w_r_prev) * cands_r if self.w_r_prev is not None else np.zeros_like(cands_r)
+    switch_part = sw.sum(axis=0) + w_r[0] * self.filters[2].step + w_r[1] * self.filters[3].step
+    self.w_r_prev = w_r.copy()
+    if src == 1:  # the endpoint gap on the right reference leaves the switch part out as well, so a line -> edge switch is no departure
+      self.gap_rebase += float(np.interp(look, X_IDXS, switch_part))
+    x_gap = ref_L - float(np.interp(look, plan_x, plan_y)) - (self.gap_rebase if src == 1 else 0.0)
     allow = 0.25 * abs(model_curvature) * look ** 2 / 2
     if fading:  # lane change or v < 5 m/s: the gap state and the latches would compare the old lane with the new one (S2)
       self.reset_yields()
       q_y, no_growth, yield_active, caps = 0.0, False, False, {}
     else:
-      move_now = (not self.no_growth_prev) and (lag_L > MOVE_LAG_EPS or self.authority.a < self.authority.a_cmd - 1e-6 or p.building)
+      move_now = (not self.no_growth_prev) and (lag_L > MOVE_LAG_EPS or self.authority.a < self.authority.a_cmd - 1e-6 or p.building
+                                                or self.move.limiting)
       self.moving_t = MOVE_SETTLE if move_now else max(0.0, self.moving_t - dt)
       skip = (not f_jump_t) or cand_changed
       q_y = self.gap.update(x_gap, src, self.moving_t > 0.0, bool(skip), allow, self.ref_around(p), dt)
@@ -887,28 +971,51 @@ class RightLineBlendful:
       car_trig = self.yield_latch.update(q_y > Q_CAP_FULL if not self.yield_latch.state else q_y >= Q_RELEASE)
       ref_trig = self.ref_yield_latch.update(self.ref_around(p))
       # each trigger supplies its own side (B1): the endpoint gap from its departure (> 0: the plan moved left, obstacle on the right), the
-      # reference instance from its own offset - usual (> 0: its plan end moved right, obstacle on the left)
+      # reference instance from its own offset - usual (> 0: its plan end moved right, obstacle on the left), the radar check the right
       side_gap = (SIDE_RIGHT if dep > 0 else SIDE_LEFT) if abs(dep) > SIDE_KNOWN else 0
       side_ref = (SIDE_LEFT if p.ref_departure > 0 else SIDE_RIGHT) if abs(p.ref_departure) > SIDE_KNOWN else 0
+      q_rc = clearance_q(rc.deficit, Q_NO_GROWTH, Q_CAP_START, Q_CAP_FULL)
       no_growth, yield_active, caps = self.yields.update([
         TriggerReport('endpoint_gap', bool(q_y >= Q_NO_GROWTH or car_trig), bool(car_trig), q_y, side_gap),
         TriggerReport('reference', bool(ref_trig), bool(ref_trig), Q_CAP_FULL, side_ref),
+        TriggerReport('radar_clearance', bool(rc.yield_active), bool(rc.yield_active), q_rc, SIDE_RIGHT),
       ])
+    yield_ended = self.no_growth_prev and not no_growth
     self.no_growth_prev = no_growth
     q_eff = max(caps.values()) if caps else 0.0
     f_yl = 0.0 if (yield_active and SIDE_RIGHT in caps) else 1.0
     f_yr = float(np.interp(caps[SIDE_LEFT], (0.2, 0.45), (1.0, 0.0))) if (yield_active and SIDE_LEFT in caps) else 1.0
-    k0_rl *= f_yr
     # --- authority (B5)
     qa = self.quality_gate.update(q_R)
     a_star = float(qa)
     f_ep = 0.0 if jn_active else 1.0
-    a_star *= f_bend_t * f_jump_t * f_plaus_t * self.f_blink * f_yl * f_ep
+    a_star *= f_bend_t * f_jump_t * f_plaus_t * self.f_blink * f_yl * f_ep * f_radar
     if force_regular or fading:
       a_star = 0.0
     if q_y >= Q_NO_GROWTH:
       a_star = min(a_star, self.authority.a_cmd)
     a = self.authority.update(a_star)
+    # --- step 4: limits from the current references, not rate-limited: the left limit, the object bound (B6a), the right safety bounds
+    t_left = np.maximum(t_lim, c_ctr)
+    t_obj = c_ctr if rc.right_blindspot else np.full(NX, rc.t_obj)  # rightBlindspot: no right-line shift
+    t_objb = np.minimum(t_left, np.maximum(t_obj, c_ctr))
+    rc.bound_active = bool(np.any(t_objb < t_left - 1e-9))
+    t_bound_line = y_r - W_R - LINE_BOUND - off_track - dc
+    w_e = float(ss((qf[3] - 0.4) / 0.2))
+    t_bound_edge = filt[3] - W_R - EDGE_BOUND - off_track - dc
+    t4 = self.safety_bounds(t_objb, t_bound_line, t_bound_edge, w_e)
+    bound_active = bool(np.any(t4 < t_objb - 1e-9))
+    # --- step 4b: final move-speed limit on the approach to the right reference (rev 6.5), the centre limit as a floor, then the bounds
+    w_c = float(np.interp(abs(model_curvature) * v ** 2, [0.18, 0.53], [STRENGTH_RIGHT_ONLY, 1.0])) if self.strength_rising else STRENGTH_RIGHT_ONLY
+    s_r = 1.0 - (1.0 - l_q) * (1.0 - w_c * q_R)
+    present = qa > 0.0
+    reasons = (a <= 0.0, was_episode and not in_episode, yield_ended, present and not self.ref_present_prev, self.mode_on)
+    self.ref_present_prev, self.mode_on = present, False
+    t_move = self.move.update(y_r, t4, c_ctr, a * s_r * f_yr, switch_part, vx0, dt, any(reasons))
+    target = self.safety_bounds(t_move, t_bound_line, t_bound_edge, w_e)
+    # --- correction (B4)
+    d_rl, k0_rl, k_fit, d_clipped = self._correction(target, plan_x, plan_y, v, s_r)
+    k0_rl *= f_yr
     wts = junction_policy(in_episode, a, right_line_mode=not force_regular)
     k0 = wts.w_rl * k0_rl + wts.w_up * k0_up
     if fading:
@@ -918,9 +1025,10 @@ class RightLineBlendful:
     em = self.episodes
     cue_bits = sum(int(f) << i for i, f in enumerate(cue_flags))
     wm = self.width_mem
+    mv = self.move
     log = {
       'applied': a > 0.0, 'gap': g, 'gap_now': gap_now, 'q_R': q_R, 'q_L': q_L, 'a': a, 'a_star': a_star,
-      'f_bend': f_bend_t, 'f_yl': f_yl, 'f_yr': f_yr, 'f_jump': f_jump_t, 'f_plaus': f_plaus_t, 'f_blink': self.f_blink,
+      'f_bend': f_bend_t, 'f_yl': f_yl, 'f_yr': f_yr, 'f_jump': f_jump_t, 'f_plaus': f_plaus_t, 'f_blink': self.f_blink, 'f_radar': f_radar,
       'away_car': q_y, 's_r': s_r, 'w_c': w_c, 'right_only': right_only,
       'curve_accel': abs(model_curvature) * v ** 2, 'yield_active': yield_active, 'bound_active': bound_active,
       'k_rl': k0_rl, 'weights': (wts.w_rl, wts.w_up), 'l_c': profile_length(max(v, 1.0)), 'd': d_rl, 'd_clipped': d_clipped, 'filter_ms': t_filter,
@@ -938,10 +1046,19 @@ class RightLineBlendful:
       'width_mem': wm.w if wm.armed else 0.0, 'width_age': wm.age, 'width_state': int(wm.armed) | (int(wm.stale) << 1) | (int(not wm.armed) << 2),
       'road_class': road, 'frame_dt': dt, 'plan_speed': vx0, 'target_lag': lag_L,
       'yield_side': log_side(caps), 'yield_source': src, 'centre_source': centre_src, 'yield_moving': self.moving_t > 0.0,
-      't_raw': t_raw, 't_lim': t_lim, 'y_edge_r': filt[3], 'c_ctr': c_ctr, 'y_r': y_r, 'y_l': y_l, 'beta': beta, 'jump_inno': np.array(inno),
+      't_raw': t_raw, 't_lim': t_lim, 't4': t4, 'y_edge_r': filt[3], 'c_ctr': c_ctr, 'y_r': y_r, 'y_l': y_l, 'beta': beta, 'jump_inno': np.array(inno),
+      'approach': float(np.interp(iL, X_IDXS, mv.a_lim)), 'gap_reset': float(np.interp(iL, X_IDXS, mv.g0)), 'approach_held': not mv.released,
+      'move_reset': sum(int(r_) << i for i, r_ in enumerate(reasons)), 'switch_part': float(np.interp(iL, X_IDXS, switch_part)),
+      'move_limiting': mv.limiting, 'rotation_scale': ROTATION_SCALES.index(self.rotation_scale), 'radar': rc,
     }
     return RightResult(k0=float(k0), fading=fading, yield_active=yield_active, no_growth=no_growth, caps=caps, yield_q=float(q_eff),
                        yield_side=log_side(caps), episode=in_episode, log=log)
+
+  @staticmethod
+  def safety_bounds(t: np.ndarray, t_bound_line: np.ndarray, t_bound_edge: np.ndarray, w_e: float) -> np.ndarray:
+    """The right safety bounds (B8): the line bound (0.2 m), then the edge bound (0.3 m) by the edge's clarity; they override the left limit."""
+    tb = np.minimum(t, t_bound_line)
+    return tb - w_e * np.maximum(0.0, tb - t_bound_edge)
 
   @staticmethod
   def ref_around(p: RightInputs) -> bool:
@@ -1167,6 +1284,29 @@ def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
   builder.blendfulYieldSide = int(lg['yield_side'])
   builder.blendfulYieldSource = int(lg['yield_source'])
   builder.blendfulCentreSource = int(lg['centre_source'])
+  # rev 6.5 final move-speed limit (B5 step 4b)
+  builder.blendfulApproach = float(lg['approach'])
+  builder.blendfulGapReset = float(lg['gap_reset'])
+  builder.blendfulApproachHeld = bool(lg['approach_held'])
+  builder.blendfulMoveLimiting = bool(lg['move_limiting'])
+  builder.blendfulMoveReset = int(lg['move_reset'])
+  builder.blendfulSwitchPart = float(lg['switch_part'])
+  builder.blendfulRotationScale = int(lg['rotation_scale'])
+  # radar right-side clearance check (B6a item 8)
+  rc = lg['radar']
+  builder.blendfulRadarHealthy = bool(rc.healthy)
+  builder.blendfulRadarObjects = int(min(rc.objects, 255))
+  builder.blendfulRadarMemory = int(min(rc.memory, 255))
+  builder.blendfulRadarMoving = int(min(rc.moving, 255))
+  builder.blendfulRadarPopups = int(min(rc.popups, 255))
+  builder.blendfulRadarNearest = [float(x) for x in rc.nearest]
+  builder.blendfulObjectBound = float(rc.t_obj)
+  builder.blendfulObjectBoundHold = float(rc.hold)
+  builder.blendfulObjectBoundActive = bool(rc.bound_active)
+  builder.blendfulClearanceDeficit = float(rc.deficit)
+  builder.blendfulClearanceYield = bool(rc.yield_active)
+  builder.blendfulClearanceMargin = float(rc.margin)
+  builder.blendfulRightBlindspot = bool(rc.right_blindspot)
   builder.blendfulJunctionCueValues = [float(x) for x in lg['cue_values']]
   builder.blendfulInputFiltered = [float(x) for x in lg['filtered']]
   builder.blendfulInputRaw = [float(x) for x in lg['raw']]

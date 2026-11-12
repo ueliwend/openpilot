@@ -13,10 +13,17 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.modeld_v2 import blendful_right as br
 from openpilot.sunnypilot.modeld_v2.blendful import Blendful
 from openpilot.sunnypilot.modeld_v2.blendful_right import (MODE_OFF, MODE_REGULAR, MODE_RIGHT, BlendfulCorrection, ConfGate, EndpointGap, GroundTarget,
-                                                           InputFilter, JumpDetector, JunctionEpisodes, RightInputs, RightLineBlendful, RoadClass,
+                                                           InputFilter, JumpDetector, JunctionEpisodes, RightLineBlendful, RoadClass,
                                                            WidthMemory, bend_score, junction_policy, mode_from_params, selection_to_params)
 from openpilot.sunnypilot.modeld_v2.constants import ModelConstants, Plan
 from openpilot.sunnypilot.modeld_v2.plan_correction import shift_plan
+from openpilot.sunnypilot.modeld_v2.radar_clearance import healthy_empty_radar
+
+
+def RightInputs(**kw):
+  """RightInputs with a healthy, empty radar unless a test gives one (Right line needs a healthy radar, B6a)."""
+  kw.setdefault('radar', healthy_empty_radar())
+  return br.RightInputs(**kw)
 
 X = np.array(ModelConstants.X_IDXS)
 LAT_T = 0.275
@@ -103,8 +110,9 @@ def drive(ctl, scenes, mode=MODE_RIGHT, inputs=None):
 
 
 def target_at(log, v):
+  """The step-4 target at x = L (references, raw target, glide, limits): where the car is placed once the move-speed limit has caught up."""
   look = max(1.5 * v, 10.0)
-  return float(np.interp(look, X, log['target']))
+  return float(np.interp(look, X, log['t4']))
 
 
 def steady(rl_kwargs=None, frames=200, **scene_kw):
@@ -187,7 +195,7 @@ class TestMeasurementFilter:
     for _ in range(150):
       sc = Scene(center=0.4 + 0.05 * rng.standard_normal(), v=15.0)
       mo = sc.model_output()
-      ctl.update(mo, 15.0, True, 0.0, LAT_T, MODE_RIGHT)
+      ctl.update(mo, 15.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
       assert abs(ctl.k_up - ref.update(sc.model_output(), 15.0, True, 0.0, enabled=True)) == 0.0
 
   def test_filter_rerun_reproduces_logged_values(self):
@@ -200,7 +208,7 @@ class TestMeasurementFilter:
     for sc in scenes:
       mo = sc.model_output()
       raw_plan = mo['plan'].copy()
-      ctl.update(mo, sc.v, True, sc.k, LAT_T, MODE_RIGHT)
+      ctl.update(mo, sc.v, True, sc.k, LAT_T, MODE_RIGHT, RightInputs())
       logs.append(ctl.result.log)
       published.append(shift_plan(raw_plan[0], ctl.k0, sc.v)[None])
       k0s.append(ctl.k0)
@@ -249,8 +257,9 @@ class TestReferences:
 
   @staticmethod
   def _moves(tg, v=20.0):
-    """Per frame, per point: the target's change relative to its own-motion prediction (the ground-fixed part removed)."""
-    inside = X + v * DT_MDL <= X[-1]
+    """Per frame, per point inside 2 L (beyond it T_lim is re-seeded from T_raw, rev 6.4): the target's change relative to its own-motion
+    prediction (the ground-fixed part removed)."""
+    inside = (X + v * DT_MDL <= X[-1]) & (X <= br.RESEED_LOOKAHEADS * max(1.5 * v, 10.0))
     return np.concatenate([(b - br.motion_predict(a, v, 0.0, DT_MDL))[inside] for a, b in zip(tg[:-1], tg[1:], strict=True)])
 
   def _edge_line_run(self, prob_fn, frames=80):
@@ -273,14 +282,14 @@ class TestReferences:
     refs, tg = self._edge_line_run(lambda t: 0.05 if t < 1.0 else float(np.clip(0.05 + (t - 1.0), 0, 0.9)), 120)
     assert abs(refs[0] - 1.8) < 0.05 and abs(refs[-1] - 1.6) < 0.05
     d = self._moves(tg)
-    assert d.min() >= -br.TARGET_RATE_LEFT * DT_MDL - 1e-9 and d.max() <= br.MOVE_RATE_RIGHT * DT_MDL + 1e-9  # the rate limit turns it into a glide
+    assert d.min() >= -br.TARGET_RATE * DT_MDL - 1e-9 and d.max() <= br.TARGET_RATE * DT_MDL + 1e-9  # the rate limit turns it into a glide
 
   def test_inner_line_fading_out_and_vanishing_glide(self):
     for prob in (lambda t: 0.9 if t < 1.0 else float(np.clip(0.9 - (t - 1.0) / 0.3, 0.0, 0.9)), lambda t: 0.9 if t < 1.0 else 0.0):
       refs, tg = self._edge_line_run(prob, 120)
       assert abs(refs[10] - 1.6) < 0.05 and abs(refs[-1] - 1.8) < 0.05
       d = self._moves(tg)
-      assert d.min() >= -br.TARGET_RATE_LEFT * DT_MDL - 1e-9 and d.max() <= br.MOVE_RATE_RIGHT * DT_MDL + 1e-9
+      assert d.min() >= -br.TARGET_RATE * DT_MDL - 1e-9 and d.max() <= br.TARGET_RATE * DT_MDL + 1e-9
 
   def test_inner_line_flicker_at_threshold_changes_nothing(self):
     refs, tg = self._edge_line_run(lambda t: 0.35 + 0.1 * np.sin(2 * np.pi * 3 * t), 120)
@@ -383,7 +392,7 @@ class TestCorrectionLaw:
     worst = 0.0
     for _ in range(200):
       sc = Scene(v=15.0, center=0.5, k=1 / 150, pr=0.0, lever=True)  # a steady circle: consistent with the car's own motion
-      ctl.update(sc.model_output(), 15.0, True, sc.k, LAT_T, MODE_RIGHT)
+      ctl.update(sc.model_output(), 15.0, True, sc.k, LAT_T, MODE_RIGHT, RightInputs())
       up = ref.update(sc.model_output(), 15.0, True, sc.k, enabled=True)
       worst = max(worst, abs(ctl.c - up))
     assert worst <= 1e-9 and ctl.right.a == 0.0
@@ -547,8 +556,8 @@ class TestYieldCap:
 # ---------------------------------------------------------------------------------------------------------------------------------
 # rev 5: ground-fixed target, bounds order, width memory, junction episodes (model alone), road class, jumps, endpoint-gap trigger, D clip
 def moves_of(tgs, v=20.0, dt=DT_MDL, vx_scale=1.0):
-  """Per frame and point: the change of the rate-limited target relative to its own-motion prediction."""
-  inside = X + v * vx_scale * dt <= X[-1]
+  """Per frame and point inside 2 L (re-seeded beyond, rev 6.4): the change of the rate-limited target relative to its own-motion prediction."""
+  inside = (X + v * vx_scale * dt <= X[-1]) & (X <= br.RESEED_LOOKAHEADS * max(1.5 * v, 10.0))
   return np.concatenate([(b - br.motion_predict(a, v * vx_scale, 0.0, dt))[inside] for a, b in zip(tgs[:-1], tgs[1:], strict=True)])
 
 
@@ -578,14 +587,15 @@ class TestGroundFixedTarget:
     assert np.max(np.abs(np.diff(raw, axis=0))) < 0.01
     tgs = [lg['t_lim'] for lg in logs[100:]]
     d = moves_of(tgs)
-    assert d.min() >= -br.TARGET_RATE_LEFT * DT_MDL - 1e-9 and d.max() <= br.MOVE_RATE_RIGHT * DT_MDL + 1e-9
+    assert d.min() >= -br.TARGET_RATE * DT_MDL - 1e-9 and d.max() <= br.TARGET_RATE * DT_MDL + 1e-9
     qs = np.array([lg['q_L'] for lg in logs[100:]])
     assert qs.min() < centre < qs.max()
 
   def test_own_motion_prediction_exact_on_a_steady_circle(self):
-    for vx_scale in (1.0, 1.08, 0.967):
+    # each rotation-lever variant on a circle built under its own hypothesis (review S6: not only the variant the fixture assumes)
+    for vx_scale, variant in ((1.0, 'design'), (1.0, 'model_axis'), (1.08, 'model_axis'), (0.967, 'model_axis')):
       sc = Scene(v=14.0, k=1 / 50, width=3.5, lever=True, vx_scale=vx_scale)
-      rl, logs = frames_of([sc] * 300)
+      rl, logs = frames_of([sc] * 300, rl=RightLineBlendful(rotation_scale=variant))
       lg = logs[-1]
       assert np.max(np.abs(lg['t_lim'] - lg['t_raw'])[X < 60]) < 2e-3  # the target stays on the ground-fixed circle: no drift
 
@@ -600,18 +610,18 @@ class TestGroundFixedTarget:
     scenes = [Scene(v=20.0, width=3.5)] * 200 + [Scene(v=20.0, width=3.5, widen=-0.4)] * 60
     rl, logs = frames_of(scenes)
     d = moves_of([lg['t_lim'] for lg in logs[190:]])
-    assert d.min() >= -br.TARGET_RATE_LEFT * DT_MDL - 1e-9
+    assert d.min() >= -br.TARGET_RATE * DT_MDL - 1e-9
 
   def test_rate_limits_by_direction_and_lag_bound(self):
     gt = GroundTarget()
     raw0 = np.zeros(br.NX)
     gt.update(raw0, 20.0, 0.0, DT_MDL)
     t = gt.update(raw0 + 0.5, 20.0, 0.0, DT_MDL)  # the raw target 0.5 m to the right: moves right at 0.05 m/s
-    assert abs(t[5] - br.MOVE_RATE_RIGHT * DT_MDL) < 1e-12
+    assert abs(t[5] - br.TARGET_RATE * DT_MDL) < 1e-12
     gt = GroundTarget()
     gt.update(raw0, 20.0, 0.0, DT_MDL)
     t = gt.update(raw0 - 0.5, 20.0, 0.0, DT_MDL)  # to the left at 0.25 m/s
-    assert abs(t[5] + br.TARGET_RATE_LEFT * DT_MDL) < 1e-12
+    assert abs(t[5] + br.TARGET_RATE * DT_MDL) < 1e-12
     gt = GroundTarget()
     gt.update(raw0, 20.0, 0.0, DT_MDL)
     t = gt.update(raw0 + 1.5, 20.0, 0.0, DT_MDL)  # a lag above 1.0 m: the rate rises to 0.5 m/s, still glide limited
@@ -619,7 +629,7 @@ class TestGroundFixedTarget:
 
   def test_lag_bound_holds_under_a_systematic_prediction_error(self):
     # a yaw rate bias makes the own-motion prediction wrong by up to 0.015 m per frame in the far field (and the near field inherits it
-    # through the shift): more than the 0.0125 m the rate allows, less than the 0.025 m of the lag-bound rate
+    # through the shift): more than the 0.0125 m the rate allows, less than the 0.025 m of the lag-bound rate; without re-seeding
     for bias in (0.0015, -0.0015):
       gt = GroundTarget()
       raw = np.full(br.NX, 0.3)
@@ -627,16 +637,14 @@ class TestGroundFixedTarget:
       for _ in range(600):
         gt.update(raw, 20.0, bias, DT_MDL)
         worst = max(worst, float(np.max(np.abs(gt.lag))))
-      assert worst <= br.LAG_BOUND + br.LAG_RATE * DT_MDL + 1e-6  # bounded
-      if bias > 0:  # the drift is to the right, where the nominal rate is only 0.05 m/s: it runs into the bound and stays there
-        assert worst > 0.9
+      assert worst <= br.LAG_BOUND + br.LAG_RATE * DT_MDL + 1e-6  # bounded (with 0.25 m/s in both directions it stays small: 0.03 m)
 
   def test_far_points_beyond_the_last_horizon_take_the_raw_target(self):
     gt = GroundTarget()
     gt.update(np.zeros(br.NX), 30.0, 0.0, DT_MDL)
     raw = np.full(br.NX, 0.4)
     t = gt.update(raw, 30.0, 0.0, DT_MDL)
-    assert t[-1] == 0.4 and abs(t[0] - br.MOVE_RATE_RIGHT * DT_MDL) < 1e-12
+    assert t[-1] == 0.4 and abs(t[0] - br.TARGET_RATE * DT_MDL) < 1e-12
 
 
 class TestBoundOrder:
@@ -925,7 +933,7 @@ class TestInsideAnEpisode:
     ctl, ref = BlendfulCorrection(), Blendful()
     for i in range(400):
       sc = Scene(v=20.0, width=3.5, pl=0.9, pr=0.9) if i < 200 else Scene(v=20.0, width=3.5, pl=0.9, pr=0.9, bend_x0=15.0, bend_R=30.0)
-      ctl.update(sc.model_output(), 20.0, True, 0.0, LAT_T, MODE_REGULAR)
+      ctl.update(sc.model_output(), 20.0, True, 0.0, LAT_T, MODE_REGULAR, RightInputs())
       up = ref.update(sc.model_output(), 20.0, True, 0.0, enabled=True)
       assert abs(ctl.c - up) <= 1e-12 and not ctl.result.episode
 
@@ -1053,7 +1061,7 @@ def upstream_from_centre_trigger(sw_start, sw_T, T=60.0, noise=0.03, seed=1):
   return tt
 
 
-def sim_endpoint_gap(rho, sw_start, sw_T, rate=br.MOVE_RATE_RIGHT, hmax=1.0, T=60.0, noise=0.03, seed=1, settle=br.MOVE_SETTLE):
+def sim_endpoint_gap(rho, sw_start, sw_T, rate=br.MOVE_SPEED, hmax=1.0, T=60.0, noise=0.03, seed=1, settle=br.MOVE_SETTLE):
   """Closed loop of DESIGN check 18: the car moves to the held offset hmax (target glide `rate`, 1.5 s lag), the model plans back with the
   return fraction rho; x = Y_R(L) - plan_y(L) = 2 - (car + p)."""
   gap = EndpointGap()
@@ -1221,7 +1229,7 @@ class TestHandBackWindow:
     cs, ups, a = [], [], []
     for i in range(500):
       sc = Scene(v=13.0, center=0.5, pl=1.0, pr=1.0) if i < 250 else Scene(v=13.0, center=0.5, pl=1.0, pr=0.0)
-      ctl.update(sc.model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT)
+      ctl.update(sc.model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
       ups.append(ref.update(Scene(v=13.0, center=0.5, pl=1.0, pr=1.0 if i < 250 else 0.0).model_output(), 13.0, True, 0.0, enabled=True))
       cs.append(ctl.c)
       a.append(ctl.right.a)
@@ -1347,7 +1355,7 @@ class TestModes:
     ref = Blendful()
     for _ in range(100):
       sc = Scene(v=13.0, center=0.5, pl=1.0, pr=1.0)
-      ctl.update(sc.model_output(), 13.0, True, 0.0, LAT_T, MODE_REGULAR)
+      ctl.update(sc.model_output(), 13.0, True, 0.0, LAT_T, MODE_REGULAR, RightInputs())
       k_ref = ref.update(sc.model_output(), 13.0, True, 0.0, enabled=True)
       assert abs(ctl.k_up - k_ref) < 1e-9  # the reference instance is upstream, frame by frame
 
@@ -1529,13 +1537,26 @@ class TestYieldAggregator:
 
 
 class TestCentreLimitSource:
-  def test_two_references_from_0_5_and_back_to_one_below_0_4(self):
+  @staticmethod
+  def hold(cs, q_r, q_l, seconds):
+    return [cs.update(q_r, q_l, DT_MDL) for _ in range(int(round(seconds / DT_MDL)))]
+
+  def test_two_references_after_0_5_s_above_0_5_and_back_after_0_5_s_below_0_4(self):
     cs = br.CentreLimitSource()
     assert cs.update(0.9, 0.45) == cs.RIGHT
-    assert cs.update(0.9, 0.51) == cs.BOTH
-    assert cs.update(0.9, 0.41) == cs.BOTH  # inside the band: no switch
-    assert cs.update(0.9, 0.39) == cs.RIGHT
-    assert cs.update(0.9, 0.49) == cs.RIGHT
+    srcs = self.hold(cs, 0.9, 0.51, 0.6)
+    assert srcs[-2] == cs.RIGHT and srcs[-1] == cs.BOTH  # entered once the condition has held longer than 0.5 s, not before
+    assert self.hold(cs, 0.9, 0.41, 2.0)[-1] == cs.BOTH  # inside the band: no switch
+    srcs = self.hold(cs, 0.9, 0.39, 0.6)
+    assert srcs[-2] == cs.BOTH and srcs[-1] == cs.RIGHT
+    assert self.hold(cs, 0.9, 0.49, 2.0)[-1] == cs.RIGHT
+
+  def test_a_short_excursion_does_not_switch(self):
+    cs = br.CentreLimitSource()
+    cs.update(0.9, 0.9)
+    assert cs.src == cs.BOTH  # a fresh instance starts in the form that fits
+    assert set(self.hold(cs, 0.9, 0.3, 0.45)) == {cs.BOTH}
+    assert set(self.hold(cs, 0.9, 0.9, 1.0)) == {cs.BOTH}
 
   def test_one_reference_side_changes_only_with_a_clear_quality_lead(self):
     cs = br.CentreLimitSource()
@@ -1544,7 +1565,14 @@ class TestCentreLimitSource:
     assert cs.update(0.30, 0.45) == cs.LEFT  # by more than 0.1: switch
     assert cs.update(0.42, 0.40) == cs.LEFT
 
-  def test_per_frame_flicker_across_0_5_switches_once(self):
+  def test_quality_0_5_plus_minus_0_2_at_1_hz_gives_no_step(self):
+    # design E3 (rev 6.3): the weaker side's quality 0.5 +- 0.2 at 1 Hz: below 0.4 for less than 0.5 s, above 0.5 for less than 0.5 s
+    cs = br.CentreLimitSource()
+    cs.update(0.9, 0.3)
+    srcs = [cs.update(0.9, 0.5 + 0.2 * np.sin(2 * np.pi * i * DT_MDL)) for i in range(400)]
+    assert len(set(srcs)) == 1
+
+  def test_per_frame_flicker_across_0_5_switches_at_most_once(self):
     rng = np.random.default_rng(3)
     cs = br.CentreLimitSource()
     srcs = [cs.update(0.9, 0.5 + 0.08 * (2 * rng.random() - 1)) for _ in range(400)]
@@ -1619,49 +1647,70 @@ def k1_world(world: str, s: float, v: float = 14.0, k: float = 1 / 100):
 
 
 class TestScaleHypotheses:
-  """Review S6: the 2 x 2 case.  The filter's rotation lever uses scale = vEgo / v_x(0) (round 2, unchanged in round 3 Part 1; the choice is
-  rev 6.3's, review S1).  Each variant is exact under its own hypothesis and biased under the other, so neither the steady-circle tests nor
-  the replay's sign argument decide K1; the E1 re-run has to."""
+  """Review S6 / design E3 (rev 6.3): the 2 x 2 case.  FILTER_ROTATION_SCALE "design" (default, lever x) and "model_axis" (lever x vEgo /
+  v_x(0)); each is exact on a circle built under its own hypothesis and biased under the other, so neither the circle tests nor the replay's
+  sign argument decide K1; the E1 re-run evaluates both offline (both selectable per instance)."""
   @pytest.mark.parametrize("world,s,variant,lo,hi", [
-    ('H_axis', 1.05, 'scaled', -0.01, 0.01), ('H_axis', 0.95, 'scaled', -0.01, 0.01),
-    ('H_vego', 1.05, 'scaled', 0.08, 0.16), ('H_vego', 0.95, 'scaled', -0.16, -0.08),
-    ('H_axis', 1.05, 'unscaled', -0.16, -0.08), ('H_axis', 0.95, 'unscaled', 0.08, 0.16),
-    ('H_vego', 1.05, 'unscaled', -0.01, 0.01), ('H_vego', 0.95, 'unscaled', -0.01, 0.01),
+    ('H_axis', 1.05, 'model_axis', -0.01, 0.01), ('H_axis', 0.95, 'model_axis', -0.01, 0.01),
+    ('H_vego', 1.05, 'model_axis', 0.08, 0.16), ('H_vego', 0.95, 'model_axis', -0.16, -0.08),
+    ('H_axis', 1.05, 'design', -0.16, -0.08), ('H_axis', 0.95, 'design', 0.08, 0.16),
+    ('H_vego', 1.05, 'design', -0.01, 0.01), ('H_vego', 0.95, 'design', -0.01, 0.01),
   ])
-  def test_right_line_filter_bias_at_L(self, world, s, variant, lo, hi, monkeypatch):
-    if variant == 'unscaled':  # design B2 verbatim: the rotation acts at x
-      orig = br.motion_predict
-      monkeypatch.setattr(br, 'motion_predict', lambda y, vx0, yr, dt, scale=1.0: orig(y, vx0, yr, dt, 1.0))
-    rl = RightLineBlendful()
+  def test_right_line_filter_bias_at_L(self, world, s, variant, lo, hi):
+    rl = RightLineBlendful(rotation_scale=variant)
     for _ in range(400):
       res = rl.update(k1_world(world, s), 14.0, True, 1 / 100, 0.0, RightInputs())
     assert lo <= float(res.log['filter_offset'][2]) <= hi
 
+  def test_default_is_the_design_form(self):
+    assert br.FILTER_ROTATION_SCALE == 'design' and RightLineBlendful().rotation_scale == 'design'
+    with pytest.raises(AssertionError):
+      RightLineBlendful(rotation_scale='other')
+
 
 class TestLagBoundUnderFarFieldErrors:
-  """Review S1 / S6: a harder lag-bound fixture than test_lag_bound_holds_under_a_systematic_prediction_error (0.015 m per frame).  The
-  design's claim |T_lim - T_raw| <= 1.0 m (R5-3) does not hold once far-field prediction errors exceed the 0.025 m per frame of the lag-bound
-  rate, because the ground-fixed shift carries them inward.  Strict xfail: the test turns into a failure as soon as the bound holds."""
-  XFAIL = pytest.mark.xfail(strict=True, reason="review S1: lag bound vs far-field errors; deferred to design rev 6.3 (Part 2)")
+  """Review S1 / design check 21 as a test: far-field prediction errors above the glide rate are no longer carried into the fit window,
+  because every T_lim point beyond 2 L takes T_raw each frame (rev 6.4)."""
+  @pytest.mark.parametrize("world,variant", [('H_vego', 'model_axis'), ('H_axis', 'design')])
+  @pytest.mark.parametrize("s", [1.05, 0.95])
+  def test_no_lag_in_the_fit_window_under_the_other_scale_hypothesis(self, world, variant, s):
+    # round 2 / Part 1 (horizon seeding): lag at L +3.9 / -4.2 m (H_vego) and -3.6 / +4.6 m (H_axis, design form)
+    rl = RightLineBlendful(rotation_scale=variant)
+    for _ in range(400):
+      res = rl.update(k1_world(world, s), 14.0, True, 1 / 100, 0.0, RightInputs())
+    look = 1.5 * 14.0
+    lag = res.log['t_lim'] - res.log['t_raw']
+    assert abs(float(np.interp(look, X, lag))) <= 0.05 and abs(float(np.interp(1.5 * look, X, lag))) <= 0.05
 
-  @XFAIL
-  @pytest.mark.parametrize("yaw_bias", [0.01, -0.01])
-  def test_target_lag_under_a_yaw_rate_bias(self, yaw_bias):
-    # 0.01 rad/s mispredicts the far field by up to 0.01 x 0.05 s x 190 m = 0.095 m per frame (lag at 30 m: 5.3 m in round 2 / 3)
+  def test_points_beyond_2_L_equal_the_raw_target_every_frame(self):
+    gt = GroundTarget()
+    rng = np.random.default_rng(1)
+    for _ in range(50):
+      raw = 0.3 + 0.5 * rng.standard_normal(br.NX)
+      t = gt.update(raw, 20.0, 0.004, DT_MDL, reseed_x=60.0)
+      np.testing.assert_array_equal(t[X > 60.0], raw[X > 60.0])
+      assert np.all(np.abs(t - raw)[X <= 60.0] >= 0.0)
+
+  def test_check_21(self):
+    # design check 21 (EST there): R 100 m, 50 km/h, per-frame error (s - 1) x dpsi from the rotation scale; lag at L with re-seeding at 2 L
+    v, R = 50 / 3.6, 100.0
+    look = max(1.5 * v, 10.0)
+    k = 1 / R
+    raw = k * X ** 2 / 2 + br.L_D * k * X  # the steady circle seen from the device (T_raw is ground-fixed on it)
+    for s in (1.05, 0.95):
+      gt = GroundTarget()
+      gt.update(raw, v, v * k, DT_MDL)
+      for _ in range(600):
+        gt.update(raw, v, v * k * s, DT_MDL, scale=1.0, reseed_x=2 * look)  # the prediction rotates by s x the true yaw step
+      assert abs(float(np.interp(look, X, gt.lag))) < 0.05
+
+  def test_target_lag_under_a_large_yaw_rate_bias(self):
+    # 0.01 rad/s mispredicts by up to 0.095 m per frame at the horizon (Part 1 without re-seeding: 5.3 m of lag at 30 m); with re-seeding at
+    # 2 L the lag at L stays within the lag bound
     gt = GroundTarget()
     raw = np.full(br.NX, 0.3)
     worst = 0.0
     for _ in range(600):
-      gt.update(raw, 20.0, yaw_bias, DT_MDL)
+      gt.update(raw, 20.0, 0.01, DT_MDL, reseed_x=60.0)
       worst = max(worst, float(np.abs(np.interp(30.0, X, gt.lag))))
     assert worst <= br.LAG_BOUND + br.LAG_RATE * DT_MDL + 1e-6
-
-  @XFAIL
-  @pytest.mark.parametrize("s", [1.05, 0.95])
-  def test_target_lag_under_the_other_scale_hypothesis(self, s):
-    # the reviewer's S6 case: H_vego world, the implemented scale: lag at L +3.9 / -4.2 m in round 2 / 3
-    rl = RightLineBlendful()
-    for _ in range(400):
-      res = rl.update(k1_world('H_vego', s), 14.0, True, 1 / 100, 0.0, RightInputs())
-    lag = float(np.interp(1.5 * 14.0, X, res.log['t_lim'] - res.log['t_raw']))
-    assert abs(lag) <= br.LAG_BOUND + br.LAG_RATE * DT_MDL + 1e-6

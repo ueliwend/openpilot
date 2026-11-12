@@ -538,7 +538,29 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   blendfulCapMemory @66 :Float32;  # toward-obstacle correction held at the no-growth point (1/m)
   blendfulUpdateTime @67 :Float32;  # ms, the whole Blendful update of this frame (reference, right-line instance, cap, limiter); 0 when it did not run
   blendfulNonFinite @68 :Bool;  # a non-finite input or result this frame: released toward 0, instances reset
-  blendfulCentreSource @69 :UInt8;  # left-limit formula: 0 midpoint of both references, 1 right reference, 2 left reference (hysteresis 0.5 / 0.4)
+  blendfulCentreSource @69 :UInt8;  # left-limit form: 0 midpoint of both references, 1 right reference, 2 left reference (0.5 / 0.4, 0.5 s dwell)
+  # rev 6.5 final move-speed limit (B5 step 4b): values at x = L
+  blendfulApproach @70 :Float32;  # weighted approach A to the right reference since the last reset, m
+  blendfulGapReset @71 :Float32;  # G0, the gap to the right reference at the last reset (rebased by reference switches), m
+  blendfulApproachHeld @72 :Bool;  # A held at 0 after a reset until the car is at p0 and slow
+  blendfulMoveLimiting @73 :Bool;  # the 0.05 m/s limit binds somewhere in the window
+  blendfulMoveReset @74 :UInt8;  # reset reasons this frame: bit 0 a = 0, 1 junction end, 2 yield end, 3 right reference regained, 4 mode on
+  blendfulSwitchPart @75 :Float32;  # switch part of the change of Y_R added to G0 this frame, m
+  blendfulRotationScale @76 :UInt8;  # FILTER_ROTATION_SCALE: 0 design, 1 model_axis
+  # radar right-side clearance check (B6a item 8)
+  blendfulRadarHealthy @77 :Bool;  # f_radar = 1 (tracks fresh, no error flags, 1 s since they returned)
+  blendfulRadarObjects @78 :UInt8;  # confirmed objects in the right corridor
+  blendfulRadarMemory @79 :UInt8;  # of them remembered beside the car
+  blendfulRadarMoving @80 :UInt8;  # of them classified moving (log only)
+  blendfulRadarPopups @81 :UInt8;  # confirmed this frame less than 2 s ahead (log only)
+  blendfulRadarNearest @82 :List(Float32);  # [x, y, clearance of the car's right side] of the corridor object with the largest deficit, m
+  blendfulObjectBound @83 :Float32;  # held object bound T_obj (1000 = none)
+  blendfulObjectBoundHold @84 :Float32;  # s since the object bound last fell
+  blendfulObjectBoundActive @85 :Bool;
+  blendfulClearanceDeficit @86 :Float32;  # d = m(v) - clearance at the centre limit, m (> 0 starts the clearance yield)
+  blendfulClearanceYield @87 :Bool;
+  blendfulClearanceMargin @88 :Float32;  # m(v) = g(v) + e(v), m
+  blendfulRightBlindspot @89 :Bool;
 
   enum TurnDirection {
     none @0;
