@@ -196,7 +196,10 @@ class TestInsterTable(OpenpilotTestCase):
     """the table's exact value (Fraction) at |a| (m/s^2) and speed v (m/s), bilinear on the float weights, and its exact top"""
     j, w = inster_lateral._table_speed_cell(v)
     fw = Fraction(w)
-    cell = lambda i: (1 - fw) * Fraction(tbl[j][i]) + fw * Fraction(tbl[j + 1][i])
+
+    def cell(i):
+      return (1 - fw) * Fraction(tbl[j][i]) + fw * Fraction(tbl[j + 1][i])
+
     top = cell(len(A_NODES) - 1)
     if a >= A_NODES[-1]:
       return top, top
@@ -234,7 +237,7 @@ class TestInsterTable(OpenpilotTestCase):
     # every speed 0-160 km/h (0.01 km/h steps and the node speeds) for the car's table (d30x95) and the tables that reach 409 at the top
     # (d31 = rtk100's, d26, c19a1b0). Before the fix 2.4-2.5 % of the plateau evaluations of the 409 tables tested False.
     assert self.PLATEAU_TABLES['d30x95'] == CMD_RAW
-    speeds = [k / 100.0 / 3.6 for k in range(0, 16001)] + list(inster_lateral.V_NODES)
+    speeds = [k / 100.0 / 3.6 for k in range(16001)] + list(inster_lateral.V_NODES)
     for name, tbl in self.PLATEAU_TABLES.items():
       n = self._check_plateau(tbl, speeds, [3.5, 3.5000001, 4.0, 6.0, 100.0], [])
       assert n == 5 * len(speeds), name
@@ -244,7 +247,7 @@ class TestInsterTable(OpenpilotTestCase):
   def test_plateau_test_old_blend_missed_409(self):
     # the cause, kept as a regression: the plain blend of two 409 cells exceeds 409.0 at some speeds, the clipped command then missed it
     n = 0
-    for k in range(0, 16001):
+    for k in range(16001):
       j, w = inster_lateral._table_speed_cell(k / 100.0 / 3.6)
       if j + 1 < len(CMD_RAW) and (1.0 - w) * 409.0 + w * 409.0 > 409.0:
         n += 1
@@ -258,7 +261,7 @@ class TestInsterTable(OpenpilotTestCase):
     base = self.PLATEAU_TABLES['d26']
     for tops in ((380.0,) * 5, (409.0,) * 5, (420.0,) * 5, (409.0, 409.0, 396.8, 396.8, 409.0), (409.0, 430.0, 409.0, 409.0, 400.0),
                  (388.55, 409.0, 409.0, 409.0, 409.0), (409.0, 409.0, 409.0, 409.0, 409.0 - 1e-12)):
-      tbl = tuple(tuple(r[:-1]) + (t,) for r, t in zip(base, tops))
+      tbl = tuple(tuple(r[:-1]) + (t,) for r, t in zip(base, tops, strict=True))
       speeds = [rng.uniform(0.0, 160.0) / 3.6 for _ in range(3000)]
       cap = inster_lateral.MPC_RAMP_CAP
       with mock.patch.object(inster_lateral, 'CMD_RAW', tbl):
