@@ -13,8 +13,10 @@ the centre limit and the speed, never the model's plan.
 - Clearance deficit d = m - min (y - w_R - dc - T_C'(x)); d > 0 starts the clearance yield (obstacle side right), released when d < -0.1 m
   for 1 s (or the object is gone); the cap ramps over d 0 .. 0.05 m.
 - Stationary / moving (radial test over 8 of 10 messages) and pop-ups are logged only.
-- Health: no message, a message older than 0.3 s, an invalid message or any RadarData.errors flag -> unhealthy; healthy again 1 s after
-  healthy messages return.  The caller turns unhealthy into f_radar = 0 (Right line fades to Regular).
+- Health: no message, a message older than 0.3 s, an invalid message, any RadarData.errors flag, a non-finite dRel / yRel in the message,
+  or a car radar configuration that publishes no side tracks (review R3-B1: radarUnavailable, or a Hyundai without RADAR_FULL_RADAR, whose
+  messages are valid but empty or lead-only) -> unhealthy; healthy again 1 s after healthy messages return.  The caller turns unhealthy into
+  f_radar = 0 (Right line fades to Regular).
 Signs: model frame y > 0 = right.  Offline only; not validated on the car.
 """
 from collections import deque
@@ -32,7 +34,7 @@ CORRIDOR_TIME, CORRIDOR_MIN = 3.0, 15.0  # s, m
 ROADSIDE_BEYOND_EDGE, EDGE_CLEAR_WEIGHT = 1.0, 0.5  # m, candidate weight of the right edge
 MARGIN_EXTRA = (0.2, 0.5)  # m at <= 50 km/h and >= 100 km/h
 MARGIN_SPEEDS = (50 / 3.6, 100 / 3.6)
-BOUND_HOLD, BOUND_RISE = 1.0, 0.05  # s, m/s
+BOUND_HOLD = 1.0  # s; the bound then rises at r_ref (blendful_right.REFERENCE_RATE, passed in)
 DEFICIT_RAMP, DEFICIT_RELEASE, DEFICIT_RELEASE_TIME = 0.05, -0.1, 1.0  # m, m, s
 STALE_AGE, HEALTHY_RETURN = 0.3, 1.0  # s
 MOVING_SPEED, MOVING_WINDOW, MOVING_MIN = 1.0, 10, 8  # m/s, messages
@@ -48,11 +50,39 @@ class RadarFrame:
   fault: bool = True  # message invalid or any RadarData.errors flag (or never received)
   new: bool = False  # the message arrived since the last model frame
   right_blindspot: bool = False  # carState.rightBlindspot
+  config_ok: bool = False  # the car's radar configuration publishes side tracks (radar_tracks_ok); unknown counts as not
+
+
+def radar_tracks_ok(CP, CP_SP) -> bool:
+  """Does this car's radar configuration publish side tracks in radarTracks (review R3-B1)?  Not with CarParams.radarUnavailable (card.py then
+  publishes empty RadarData), and on a Hyundai only with HyundaiFlagsSP.RADAR_FULL_RADAR (opendbc sunnypilot/car/hyundai/values.py:41): the
+  default without a fingerprinted track range is RADAR_LEAD_ONLY (sunnypilot/car/interfaces.py:145-152), one SCC lead point with yRel NaN
+  (hyundai/radar_interface_ext.py), and radar_off_can gives empty messages (hyundai/radar_interface.py:181)."""
+  from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+  return (not CP.radarUnavailable) and (CP.brand != "hyundai" or bool(CP_SP.flags & HyundaiFlagsSP.RADAR_FULL_RADAR))
+
+
+def read_radar_tracks_ok(params) -> bool:
+  """radar_tracks_ok from the CarParams / CarParamsSP that card.py writes (selfdrive/car/card.py:184-194); missing or unreadable -> False."""
+  try:
+    from openpilot.cereal import custom, messaging
+    from opendbc.car.structs import car
+    cp_bytes, cp_sp_bytes = params.get("CarParams"), params.get("CarParamsSP")
+    if not cp_bytes or not cp_sp_bytes:
+      return False
+    return radar_tracks_ok(messaging.log_from_bytes(cp_bytes, car.CarParams), messaging.log_from_bytes(cp_sp_bytes, custom.CarParamsSP))
+  except Exception:
+    return False
 
 
 def healthy_empty_radar() -> RadarFrame:
-  """A healthy radar that sees nothing (offline tests and replays without objects)."""
-  return RadarFrame(tracks=[], age=0.0, fault=False, new=True)
+  """A healthy radar that sees nothing (offline tests and replays without objects), on a car whose configuration publishes side tracks."""
+  return RadarFrame(tracks=[], age=0.0, fault=False, new=True, config_ok=True)
+
+
+def frame_finite(radar: RadarFrame) -> bool:
+  """Every track's dRel and yRel is finite (a lead-only message carries yRel NaN, R3-B1 second guard)."""
+  return all(np.isfinite(d) and np.isfinite(y) for _, d, y, _ in radar.tracks)
 
 
 def margin_extra(v: float) -> float:
@@ -105,13 +135,14 @@ class RadarClearance:
     self.healthy = False
     self.yield_latch = False
     self.release_t = 0.0
+    self.yield_obj_x: float | None = None  # where the object that set the deficit is now (moved with the car's travel while unseen)
 
   def reset(self):
     self.__init__()
 
   # --- health
   def _health(self, radar: RadarFrame | None, dt: float) -> bool:
-    ok = radar is not None and not radar.fault and radar.age <= STALE_AGE
+    ok = radar is not None and radar.config_ok and not radar.fault and radar.age <= STALE_AGE and frame_finite(radar)
     self.healthy_t = self.healthy_t + dt if ok else 0.0
     if not ok:
       self.healthy = False
@@ -149,25 +180,27 @@ class RadarClearance:
       else:
         del self.tracks[tid]
 
-  def _move_memory(self, vx0: float, yaw_rate: float, dt: float):
+  def _move_memory(self, vx0: float, yaw_rate: float, dt: float, l_d: float):
     """Remembered objects are ground-fixed: moved with the B2 motion model into the new car frame (and forgotten behind the car)."""
     for tid, tr in list(self.tracks.items()):
       if tr.seen:
         continue
       tr.x -= vx0 * dt
-      tr.y -= yaw_rate * dt * (tr.x + 1.95 + vx0 * dt / 2)
+      tr.y -= yaw_rate * dt * (tr.x + l_d + vx0 * dt / 2)
       if tr.x < FORGET_X:
         del self.tracks[tid]
 
   def update(self, radar: RadarFrame | None, v: float, vx0: float, yaw_rate: float, gap: float, dc: float, w_r: float,
-             x_idxs: np.ndarray, c_ctr: np.ndarray, y_edge: np.ndarray, edge_weight: np.ndarray, dt: float = DT_MDL) -> ClearanceResult:
+             x_idxs: np.ndarray, c_ctr: np.ndarray, y_edge: np.ndarray, edge_weight: np.ndarray, dt: float = DT_MDL, l_d: float = 1.95,
+             rise: float = 0.042) -> ClearanceResult:
     """gap: g(v), the GUI gap in use; w_r: the car's half width to its right side; c_ctr: the centre limit T_C'(x); y_edge, edge_weight: the
-    filtered right edge and its weight in the right reference (B3)."""
+    filtered right edge and its weight in the right reference (B3); l_d: the device ahead of the no-slip point (B2 motion model); rise: the
+    object bound's rise rate after its hold, r_ref."""
     res = ClearanceResult()
     fresh = self._health(radar, dt)
     if fresh and radar.new:
       self._ingest(radar, v, max(dt, 1e-3), dc)
-    self._move_memory(vx0, yaw_rate, dt)
+    self._move_memory(vx0, yaw_rate, dt, l_d)
     if not fresh:  # a stale or faulty radar gives no objects; the caller fades Right line to Regular
       self.tracks = {k: t for k, t in self.tracks.items() if not t.seen}
     res.healthy = self.healthy
@@ -201,16 +234,22 @@ class RadarClearance:
     else:
       self.hold += dt
       if self.hold >= BOUND_HOLD - 1e-9:
-        self.t_obj = min(t_raw, self.t_obj + BOUND_RISE * dt) if t_raw < NO_BOUND else min(NO_BOUND, self.t_obj + BOUND_RISE * dt)
+        self.t_obj = min(t_raw, self.t_obj + rise * dt) if t_raw < NO_BOUND else min(NO_BOUND, self.t_obj + rise * dt)
     res.t_obj_raw, res.t_obj, res.hold = t_raw, self.t_obj, self.hold
-    # clearance yield (obstacle side right): starts at d > 0, released at d < -0.1 m for 1 s or when no object is left
+    # clearance yield (obstacle side right): starts at d > 0; released when d < -0.1 m (or no confirmed object is left, e.g. a track that
+    # lost its confirmation for a message, R3-S3) for 1 s, or at once when the object that set it is 1 m behind the rear bumper
     res.deficit = d
+    if self.yield_obj_x is not None:
+      self.yield_obj_x -= vx0 * dt
     if d > 0.0:
-      self.yield_latch, self.release_t = True, 0.0
+      self.yield_latch, self.release_t, self.yield_obj_x = True, 0.0, nearest.x
     elif self.yield_latch:
+      if nearest is not None and nearest.x > (self.yield_obj_x if self.yield_obj_x is not None else -NO_BOUND):
+        self.yield_obj_x = nearest.x
       self.release_t = self.release_t + dt if (d < DEFICIT_RELEASE or nearest is None) else 0.0
-      if self.release_t >= DEFICIT_RELEASE_TIME - 1e-9 or nearest is None:
-        self.yield_latch, self.release_t = False, 0.0
+      passed = self.yield_obj_x is not None and self.yield_obj_x < FORGET_X
+      if self.release_t >= DEFICIT_RELEASE_TIME - 1e-9 or passed:
+        self.yield_latch, self.release_t, self.yield_obj_x = False, 0.0, None
     res.yield_active = self.yield_latch
     return res
 

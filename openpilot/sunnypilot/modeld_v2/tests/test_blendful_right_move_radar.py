@@ -19,7 +19,7 @@ from openpilot.sunnypilot.modeld_v2.tests.test_blendful_right import Scene
 
 X = np.array(ModelConstants.X_IDXS)
 LAT_T = 0.275
-RATE = br.MOVE_SPEED * DT_MDL
+RATE = br.REFERENCE_RATE * DT_MDL
 
 
 def inputs(radar=None, **kw):
@@ -46,7 +46,7 @@ class TestMoveSpeedLimitUnit:
     ts = self.run(ml, t4, 300)
     assert np.all(ts[0] <= RATE + 1e-12)  # starts where the car is (gap 1.75 at the reset), plus the first step
     steps = np.diff([t[10] for t in ts])
-    assert steps.max() <= RATE + 1e-12 and abs(ts[-1][10] - 0.44) < 1e-9  # 0.05 m/s, then on T4
+    assert steps.max() <= RATE + 1e-12 and abs(ts[-1][10] - 0.44) < 1e-9  # r_ref, then on T4
     t_left = ml.update(self.y_r, np.full(br.NX, 0.1), self.c_ctr, 1.0, np.zeros(br.NX), 0.0, DT_MDL, False)
     assert np.allclose(t_left, 0.1)  # leftward at once
 
@@ -54,7 +54,7 @@ class TestMoveSpeedLimitUnit:
     ml = MoveSpeedLimit()
     t4 = np.full(br.NX, 0.44)
     ts = self.run(ml, t4, 20, w=0.5)
-    assert abs(ts[-1][5] - min(0.44, 20 * RATE / 0.5)) < 1e-9  # A = w (G0 - G) grows 0.05 m/s: the target moves 1 / w as fast
+    assert abs(ts[-1][5] - min(0.44, 20 * RATE / 0.5)) < 1e-9  # A = w (G0 - G) grows at r_ref: the target moves 1 / w as fast
     ml2 = MoveSpeedLimit()
     assert np.allclose(self.run(ml2, t4, 5, w=0.0)[-1], 0.0)  # G = G0 at w = 0
 
@@ -76,7 +76,7 @@ class TestMoveSpeedLimitUnit:
     before = ts[-1][5]
     sw = np.full(br.NX, 0.3)  # the reference moves 0.3 m outward through the weights (line -> edge), not with the road
     t = ml.update(self.y_r + 0.3, t4 + 0.3, self.c_ctr, 1.0, sw, 0.0, DT_MDL, False)
-    assert abs(t[5] - (before + RATE)) < 1e-9  # the switch itself moves nothing; the approach continues at 0.05 m/s
+    assert abs(t[5] - (before + RATE)) < 1e-9  # the switch itself moves nothing; the approach continues at r_ref
 
   def test_an_inward_switch_reaches_the_target_at_once(self):
     ml = MoveSpeedLimit()
@@ -118,9 +118,9 @@ class TestMoveSpeedLimitUnit:
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
-# re-entries (full instance, open loop: the car does not move, so A grows from the car's gap at 0.05 m/s)
+# re-entries (full instance, open loop: the car does not move, so A grows from the car's gap at r_ref)
 def growth_ok(rows, start, v):
-  """From frame `start` on: A carried along the lane grows by at most 0.05 m/s x dt per frame at every window point."""
+  """From frame `start` on: A carried along the lane grows by at most r_ref x dt per frame at every window point."""
   for (a0, _), (a1, _) in zip(rows[start:-1], rows[start + 1:], strict=True):
     carried = np.interp(X + v * DT_MDL, X, a0)
     if np.max(a1 - carried) > RATE + 1e-12:
@@ -147,7 +147,7 @@ class TestReEntries:
   V = 13.0
 
   def check_reset_then_growth(self, rows, frame):
-    assert np.all(rows[frame][0] <= RATE + 1e-12)  # A reset to 0 (and the first 0.05 m/s step of the same frame, as in check 20b)
+    assert np.all(rows[frame][0] <= RATE + 1e-12)  # A reset to 0 (and the first r_ref step of the same frame, as in check 20b)
     assert growth_ok(rows, frame, self.V)
 
   def test_mode_switched_on_from_regular(self):
@@ -173,7 +173,7 @@ class TestReEntries:
       if cause == 'left_blinker':
         return inputs(left_blinker=150 <= i < 250)
       if cause == 'radar_health' and 150 <= i < 250:
-        return inputs(radar=RadarFrame(tracks=[], age=1.0, fault=False, new=False))  # stale
+        return inputs(radar=RadarFrame(tracks=[], age=1.0, fault=False, new=False, config_ok=True))  # stale
       return inputs()
     rl, rows, logs = run_instance(scenes, self.V, inp)
     zero = [i for i in reset_frames(rows, 0) if i > 150]
@@ -222,7 +222,7 @@ class TestReEntries:
 
     def inp(i):
       tracks = [(7, 6.0, -1.0, -v)] if 100 <= i < 160 else []  # an object 1.0 m right of the car centre: deficit > 0
-      return inputs(radar=RadarFrame(tracks=tracks, age=0.0, fault=False, new=True))
+      return inputs(radar=RadarFrame(tracks=tracks, age=0.0, fault=False, new=True, config_ok=True))
     rl, rows, logs = run_instance([Scene(v=v)] * 400, v, inp)
     assert any(lg['radar'].yield_active for lg in logs[100:170])
     ends = [i for i in reset_frames(rows, 2) if i > 100]
@@ -247,7 +247,7 @@ class TestReEntries:
     v = self.V
 
     def inp(i):
-      return inputs(radar=RadarFrame(tracks=[(3, 12.0, -1.75, -v)] if 300 <= i < 360 else [], age=0.0, fault=False, new=True))
+      return inputs(radar=RadarFrame(tracks=[(3, 12.0, -1.75, -v)] if 300 <= i < 360 else [], age=0.0, fault=False, new=True, config_ok=True))
     rl, rows, logs = run_instance([Scene(v=v)] * 800, v, inp)
     gap = np.array([float(np.interp(1.5 * v, X, lg['y_r'] - lg['target'])) for lg in logs])
     assert gap[330] > gap[290] + 0.1  # the bound took shift away
@@ -329,7 +329,7 @@ class TestClosedLoop:
     final = 1.75 - br.W_R - 0.44  # 0.5 m right of the centre
     after = t >= 0
     assert abs(y[-1] - final) < 0.01
-    assert vs[after].max() <= 0.052  # 0.05 m/s plus the loop's lag (design E3)
+    assert vs[after].max() <= 0.052  # design rev 6.7 E3 (check 20's loop follows r_ref 0.042 at about 0.042 m/s)
     arr = int(np.argmax(y >= 0.9 * final))
     err = np.diff((final - y)[after][: arr - int(np.sum(~after)) + 1])
     err = err[np.abs(err) > 1e-7]
@@ -339,10 +339,8 @@ class TestClosedLoop:
 
   @pytest.mark.parametrize("kmh", SPEEDS)
   def test_right_reference_switch_line_to_edge_through_the_weights(self, kmh):
-    # 5 s into the move the inner right line (1.75) fades over 1 s and the edge (2.15, counted 2.05) takes over.  Design E3: <= 0.052 m/s
-    # (check 20b, EST, idealised loop: 0.050).  Here, with the whole instance: 0.0522-0.0525 m/s, of which 0.0519-0.0521 with equal line and
-    # edge qualities; the rest comes from the weight w = a s_R f_yR changing with q_R during the switch (s_R is a gain, design B5).  Asserted
-    # at 0.053 and listed as an open point (IMPL.md).  Without the switch part in G0 it would be 0.19 m/s (design check 20b).
+    # 5 s into the move the inner right line (1.75) fades over 1 s and the edge (2.15, counted 2.05) takes over.  Design rev 6.7 E3:
+    # <= 0.053 m/s where w changes during the move (s_R follows q_R).  Without the switch part in G0 it would be 0.18 m/s (check 20b).
     def scene(t):
       return {'right_edge': 2.15, 'right_line_prob': float(np.clip(0.9 - 0.9 * (t - 5.0), 0.0, 0.9)) if t > 5.0 else 0.9}
     t, y, vs, _, _ = closed_loop(kmh / 3.6, scene, seconds=60.0)
@@ -394,7 +392,8 @@ class TestClosedLoop:
 # ---------------------------------------------------------------------------------------------------------------------------------
 # radar right-side clearance check (B6a)
 def frame(tracks, **kw):
-  return RadarFrame(tracks=tracks, age=kw.pop('age', 0.0), fault=kw.pop('fault', False), new=kw.pop('new', True), **kw)
+  return RadarFrame(tracks=tracks, age=kw.pop('age', 0.0), fault=kw.pop('fault', False), new=kw.pop('new', True),
+                    config_ok=kw.pop('config_ok', True), **kw)
 
 
 class TestRadarClearanceUnit:
@@ -464,7 +463,7 @@ class TestRadarClearanceUnit:
     res = self.step(rcl, [(1, 10.0, -2.5, 0.0)])  # the object is 0.5 m further right
     ts = [res.t_obj] + [self.step(rcl, [(1, 10.0, -2.5, 0.0)]).t_obj for _ in range(60)]
     assert ts[0] == low and np.all(np.diff(ts[:19]) == 0.0)  # held for 1 s
-    assert np.diff(ts[20:]).max() <= 0.05 * DT_MDL + 1e-12 and ts[-1] > low
+    assert np.diff(ts[20:]).max() <= br.REFERENCE_RATE * DT_MDL + 1e-12 and ts[-1] > low
 
   def test_popup_confirmed_one_second_ahead_binds_in_its_confirmation_frame(self):
     rcl = RadarClearance()
@@ -578,3 +577,161 @@ class TestThreeTriggerSides:
       if i >= 160:
         assert set(ctl.result.caps) == {br.SIDE_RIGHT, br.SIDE_LEFT}
     assert abs(cs[-1]) < 1e-9  # both caps: kappa0 -> 0 through the limiter, the model alone
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# the car's own speed with a heading-keeping model (design rev 6.7 B5 / E3: r_ref so that the car moves at <= 0.05 m/s; bound 0.052 m/s)
+def model_loop(seconds, v_fn, scene_fn, mode_fn=lambda t: MODE_RIGHT, y0=0.0, regular_s=5.0, gap=(0.5, 1.0)):
+  """The review's loop (results/2026-11-12_a8_impl_r3/review/rv3_move_model.py, model=True): check 20's car (0.2 s dead time, 0.3 s lag) with a
+  model that keeps the road's direction (plan along the road from the car; its curvature turns the heading back in about 1 s), healthy
+  empty radar.  Returns the car's peak sideways speed toward the right while it is right of the lane centre (+0.02 m), from t = 0."""
+  ctl = BlendfulCorrection()
+  y, psi, kc = y0, 0.0, 0.0
+  buf = [0.0] * 4
+  peak = 0.0
+  for i in range(int(seconds / DT_MDL)):
+    t = i * DT_MDL - regular_s
+    v = v_fn(t)
+    mo = model_output(v, y, psi, kc, **scene_fn(t))
+    mo['plan'][0, :, 1] = -psi * X
+    k_model = -psi / max(v, 1.0)
+    ctl.update(mo, v, True, k_model, LAT_T, MODE_REGULAR if t < 0 else mode_fn(t), inputs(gap_low=gap[0], gap_high=gap[1]))
+    buf.append(ctl.c + k_model)
+    cmd = buf.pop(0)
+    for _ in range(5):
+      kc += (cmd - kc) * 0.01 / 0.3
+      psi += v * kc * 0.01
+      y += v * psi * 0.01
+    if t >= 0 and y > 0.02:
+      peak = max(peak, v * psi)
+  return peak
+
+
+def const(val):
+  return lambda t: val
+
+
+V50 = 50 / 3.6
+FLICKER = 'right-line probability 0.45 +- 0.3 at 1 Hz'
+
+
+class TestCarSpeedWithAHeadingKeepingModel:
+  """Review R3-S1 numbers at r_ref 0.042 m/s (review/rref.txt): 0.0497 / 0.0509 / 0.0500, switch 0.0511, 100 -> 50 km/h 0.0491."""
+  @pytest.mark.parametrize("kmh", SPEEDS)
+  def test_step(self, kmh):
+    assert model_loop(60, const(kmh / 3.6), lambda t: {}) <= 0.052
+
+  def test_line_to_edge_switch_mid_move(self):
+    peak = model_loop(60, const(V50), lambda t: {'right_edge': 2.15, 'right_line_prob': float(np.clip(0.9 - 0.9 * (t - 5), 0, 0.9)) if t > 5 else 0.9})
+    assert peak <= 0.053  # w changes during the move (design rev 6.7 E3)
+
+  def test_speed_drop_100_to_50_km_h(self):
+    assert model_loop(80, lambda t: float(np.interp(t, [40, 50], [100 / 3.6, 50 / 3.6])), lambda t: {}) <= 0.052
+
+  # Cases the review shows r_ref cannot bound (R3-S1); expected to fail until design rev 6.8's statement is implemented (round 4 Part B)
+  @pytest.mark.xfail(strict=True, reason="R3-S1: return from 0.4 m left of the centre crosses it at the loop's pace (review 0.0873 m/s at any r_ref)")
+  def test_return_from_left_of_the_centre(self):
+    assert model_loop(60, const(V50), lambda t: {}, y0=-0.4, regular_s=0.0) <= 0.055
+
+  @pytest.mark.xfail(strict=True, reason="R3-S1: Right line <-> Regular every 2 s (review 0.0659 m/s at r_ref 0.042)")
+  def test_mode_toggling_every_2_s(self):
+    assert model_loop(70, const(V50), lambda t: {}, mode_fn=lambda t: MODE_RIGHT if (t < 20 or t > 50 or int(t / 2) % 2 == 0) else MODE_REGULAR) <= 0.052
+
+  @pytest.mark.xfail(strict=True, reason="R3-S1: right-line quality flicker across the gate (review 0.0636 m/s at r_ref 0.042; needs <= 0.034)")
+  def test_quality_flicker_across_the_gate(self):
+    assert model_loop(70, const(V50), lambda t: {'right_line_prob': float(np.clip(0.45 + 0.3 * np.sin(2 * np.pi * t), 0, 1)) if 20 <= t < 50 else 0.9}) <= 0.052
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# review R3-B1: the radar configuration is part of the radar health
+class TestRadarConfiguration:
+  @staticmethod
+  def params_for(brand, radar_unavailable, flags):
+    """CarParams / CarParamsSP bytes as card.py writes them (selfdrive/car/card.py:184-194: CP.to_bytes(), convert_to_capnp(CP_SP))."""
+    from opendbc.car import structs
+    from opendbc.car.structs import car
+    from openpilot.selfdrive.car.helpers import convert_to_capnp
+    store = {"CarParams": car.CarParams.new_message(brand=brand, radarUnavailable=radar_unavailable).to_bytes(),
+             "CarParamsSP": convert_to_capnp(structs.CarParamsSP(flags=flags)).to_bytes()}
+
+    class P:
+      def get(self, key):
+        return store.get(key)
+    return P()
+
+  @pytest.mark.parametrize("brand,unavailable,flags,ok", [
+    ("hyundai", False, 'FULL', True),  # the Inster with fingerprinted RADAR_3A5_3C4 tracks
+    ("hyundai", False, 'LEAD', False),  # lead-only: one SCC lead point with yRel NaN
+    ("hyundai", False, 0, False),  # no radar flag
+    ("hyundai", True, 'FULL', False),
+    ("toyota", False, 0, True),
+    ("toyota", True, 0, False),  # RadarInterfaceBase / radarUnavailable: empty messages
+  ])
+  def test_radar_tracks_ok_from_the_params_card_py_writes(self, brand, unavailable, flags, ok):
+    from opendbc.sunnypilot.car.hyundai.values import HyundaiFlagsSP
+    f = {'FULL': int(HyundaiFlagsSP.RADAR_FULL_RADAR), 'LEAD': int(HyundaiFlagsSP.RADAR_LEAD_ONLY)}.get(flags, flags)
+    assert rc.read_radar_tracks_ok(self.params_for(brand, unavailable, f)) is ok
+
+  def test_missing_or_unreadable_params_are_not_ok(self):
+    class P:
+      def __init__(self, store):
+        self.store = store
+
+      def get(self, key):
+        return self.store.get(key)
+    assert not rc.read_radar_tracks_ok(P({}))
+    assert not rc.read_radar_tracks_ok(P({"CarParams": b"junk", "CarParamsSP": b"junk"}))
+
+  V = 13.0
+
+  def run(self, frames_fn, n=300):
+    rl = RightLineBlendful()
+    for i in range(n):
+      res = rl.update(Scene(v=self.V).model_output(), self.V, True, 0.0, 0.0, br.RightInputs(radar=frames_fn(i)))
+    return res.log
+
+  def test_lead_only_radar_hands_back_to_regular(self):
+    lg = self.run(lambda i: RadarFrame(tracks=[(0, 25.0, float('nan'), 0.0)], age=0.02, fault=False, new=True, config_ok=False))
+    assert lg['f_radar'] == 0.0 and lg['a'] == 0.0
+    lg = self.run(lambda i: RadarFrame(tracks=[(0, 25.0, float('nan'), 0.0)], age=0.02, fault=False, new=True, config_ok=True))
+    assert lg['f_radar'] == 0.0 and lg['a'] == 0.0  # the second guard: a non-finite yRel alone makes the frame a fault frame
+
+  def test_radar_unavailable_with_empty_messages_at_20_hz_hands_back_to_regular(self):
+    lg = self.run(lambda i: RadarFrame(tracks=[], age=0.02, fault=False, new=True, config_ok=False))
+    assert lg['f_radar'] == 0.0 and lg['a'] == 0.0
+
+  @pytest.mark.parametrize("bad", [(float('inf'), -1.5), (12.0, float('nan')), (float('nan'), 0.0)])
+  def test_non_finite_values_are_a_fault(self, bad):
+    lg = self.run(lambda i: frame([(4, bad[0], bad[1], 0.0)] if i % 7 == 0 else []), n=40)
+    assert lg['f_radar'] == 0.0  # every 7th frame a fault: never 1 s of healthy frames
+
+  def test_healthy_configuration(self):
+    lg = self.run(lambda i: frame([(7, 25.0 - 1.52, -(1.75 + 0.3), 0.0)]))
+    assert lg['f_radar'] == 1.0 and lg['a'] == pytest.approx(1.0) and lg['radar'].objects == 1
+
+
+class TestClearanceYieldHold:
+  def test_one_unconfirmed_message_does_not_release_the_clearance_yield(self):
+    # review R3-S3: a track that loses its confirmation for one inconsistent message needs 0.3 s to come back; the yield is held 1 s
+    rcl = RadarClearance()
+    C, E, W0 = np.zeros(br.NX), np.full(br.NX, 1e3), np.zeros(br.NX)
+
+    def step(tracks):
+      return rcl.update(frame(tracks), 13.0, 0.0, 0.0, 0.5, 0.0, br.W_R, X, C, E, W0)
+    for _ in range(6):
+      res = step([(1, 8.0, -1.4, 0.0)])
+    assert res.yield_active
+    res = step([(1, 10.5, -1.4, 0.0)])  # a 2.5 m jump: confirmation restarts
+    actives = [res.yield_active] + [step([(1, 10.5, -1.4, 0.0)]).yield_active for _ in range(10)]
+    assert all(actives)  # held through the 0.3 s re-confirmation (and d > 0 again afterwards)
+
+  def test_released_when_the_object_has_passed_the_rear_bumper(self):
+    rcl = RadarClearance()
+    C, E, W0 = np.zeros(br.NX), np.full(br.NX, 1e3), np.zeros(br.NX)
+    v = 13.0
+    for n in range(6):
+      res = rcl.update(frame([(1, 3.0 - v * DT_MDL * n, -1.4, -v)]), v, v, 0.0, 0.5, 0.0, br.W_R, X, C, E, W0)
+    assert res.yield_active
+    for _ in range(30):  # leaves the field of view, remembered, passes x < -3.3 m within about 0.4 s
+      res = rcl.update(frame([]), v, v, 0.0, 0.5, 0.0, br.W_R, X, C, E, W0)
+    assert not res.yield_active and not rcl.tracks

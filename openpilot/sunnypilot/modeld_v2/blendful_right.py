@@ -60,9 +60,11 @@ A_DEAD, A_DWELL, A_OUT, A_IN, A_HOLD = 0.05, 0.5, 1.0, 0.5, 1.0
 TARGET_RATE = 0.25  # m/s, both directions (rev 6.3: the speed of moves to the right is set by the final move-speed limit)
 LAG_BOUND, LAG_RATE = 1.0, 0.5  # m, m/s: where the target lags its raw value by more, that point moves at LAG_RATE (still glide-limited)
 RESEED_LOOKAHEADS = 2.0  # points beyond 2 L take T_raw every frame (rev 6.4)
-# final move-speed limit (B5 step 4b, rev 6.5; owner 21:44 question 9): the approach to the right reference grows at <= 0.05 m/s
-MOVE_SPEED = 0.05  # m/s
-RELEASE_NEAR = 0.05  # m: after a reset the approach is held until the car is this close to p0 (and its own approach is <= MOVE_SPEED)
+# final move-speed limit (B5 step 4b, rev 6.5 / 6.7; owner 21:44 question 9): the car moves at <= 0.05 m/s; the means is the reference
+# rate r_ref, the rate at which the approach to the right reference may grow (start value 0.042 m/s, rev 6.7; final value from the kit)
+REFERENCE_RATE = 0.042  # m/s, r_ref
+CAR_MOVE_SPEED = 0.05  # m/s, the decided move speed of the car (release condition after a reset)
+RELEASE_NEAR = 0.05  # m: after a reset the approach is held until the car is this close to p0 (and its own approach is <= CAR_MOVE_SPEED)
 # measurement-filter rotation lever (B2, rev 6.3): "design" = lever x (scale 1, default); "model_axis" = lever x vEgo / v_x(0)
 ROTATION_SCALES = ("design", "model_axis")
 FILTER_ROTATION_SCALE = "design"
@@ -224,11 +226,11 @@ class MoveSpeedLimit:
   """Final move-speed limit (B5 step 4b, rev 6.5; question 9; reviews K62-1, C63-1; impl review B3).  Same frame, lane coordinates, no
   lateral prediction.  Per window point the gap of the step-4 target to the right reference is G4 = Y_R - T4; G0 is the gap at the last
   reset, carried along the lane by the model's own travel and rebased by the switch part of the change of Y_R (amendment 1).  The weighted
-  approach A = w (G0 - G), w = a s_R f_yieldR, grows by at most MOVE_SPEED dt per frame, any decrease passes at once:
-  A_lim = min(w (G0 - G4), A_prev + MOVE_SPEED dt), G = max(G4, G0 - A_lim / w) (G = max(G4, G0) at w = 0), and the target is
+  approach A = w (G0 - G), w = a s_R f_yieldR, grows by at most REFERENCE_RATE dt per frame, any decrease passes at once:
+  A_lim = min(w (G0 - G4), A_prev + REFERENCE_RATE dt), G = max(G4, G0 - A_lim / w) (G = max(G4, G0) at w = 0), and the target is
   max(T_C', Y_R - G) (the centre limit as a floor, amendment 2); the caller applies the right safety bounds after it.
   Reset (A = 0): p0 = max(car position, T_C'(0)), G0 := Y_R(0) - p0 along the lane, A held at 0 until the car's gap is within 0.05 m of
-  p0's and its own approach to the right reference (from Y_R(0), switch part removed) is <= MOVE_SPEED."""
+  p0's and its own approach to the right reference (from Y_R(0), switch part removed) is <= CAR_MOVE_SPEED."""
   def __init__(self):
     self.g0: np.ndarray | None = None
     self.a_lim = np.zeros(NX)
@@ -252,12 +254,12 @@ class MoveSpeedLimit:
       self.g0 = np.full(NX, yr0 - p0)
       self.a_lim = np.zeros(NX)
       self.released = False
-    if not self.released and yr0 <= float(self.g0[0]) + RELEASE_NEAR and self.approach_speed <= MOVE_SPEED:
+    if not self.released and yr0 <= float(self.g0[0]) + RELEASE_NEAR and self.approach_speed <= CAR_MOVE_SPEED:
       self.released = True
     g4 = y_r - t4
     if w > 1e-9:
       want = w * (self.g0 - g4)
-      self.a_lim = np.minimum(want, self.a_lim + (MOVE_SPEED * dt if self.released else 0.0))
+      self.a_lim = np.minimum(want, self.a_lim + (REFERENCE_RATE * dt if self.released else 0.0))
       self.limiting = bool(np.any(self.a_lim < want - 1e-9))
       g = np.maximum(g4, self.g0 - self.a_lim / w)
     else:
@@ -940,7 +942,8 @@ class RightLineBlendful:
     t_lim = self.ground.update(t_raw, vx0, yaw_rate, dt, scale, reseed_x=RESEED_LOOKAHEADS * look)
     lag_L = float(np.interp(iL, X_IDXS, self.ground.lag))
     # --- radar right-side clearance check (B6a): reads the radar, the references and the centre limit, never the plan
-    rc = self.radar.update(p.radar, v, vx0, yaw_rate, g, dc, W_R, X_IDXS, c_ctr, filt[3] - EDGE_EXTRA, w_r[1], dt)
+    rc = self.radar.update(p.radar, v, vx0, yaw_rate, g, dc, W_R, X_IDXS, c_ctr, filt[3] - EDGE_EXTRA, w_r[1], dt, l_d=L_D,
+                           rise=REFERENCE_RATE)
     f_radar = 1.0 if rc.healthy else 0.0
     # --- yields (B6, C7, C8): the endpoint-gap trigger on the right reference, else the left one, else the plan alone, the reference
     # instance, and the radar clearance trigger, each with its own side

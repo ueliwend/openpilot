@@ -42,7 +42,7 @@ from openpilot.sunnypilot.modeld_v2.fill_model_msg import fill_model_msg, fill_p
 from openpilot.sunnypilot.modeld_v2.parse_model_outputs import Parser
 from openpilot.sunnypilot.modeld_v2.blendful import Blendful
 from openpilot.sunnypilot.modeld_v2.blendful_right import (MODE_OFF, BlendfulCorrection, RightInputs, fill_log, mode_from_params)
-from openpilot.sunnypilot.modeld_v2.radar_clearance import RadarFrame
+from openpilot.sunnypilot.modeld_v2.radar_clearance import RadarFrame, read_radar_tracks_ok
 from openpilot.sunnypilot.modeld_v2.plan_correction import shift_plan
 from openpilot.sunnypilot.modeld_v2.constants import ModelConstants, Plan
 from openpilot.sunnypilot.modeld_v2.meta_helper import load_meta_constants
@@ -403,6 +403,7 @@ def main(demo=False):
   blendful_kind = 0
   blendful_gaps = (0.5, 1.0)
   blendful_last_eof = 0  # timestamp_eof of the previous model frame: the true frame interval for the A8 filters and target
+  radar_tracks_ok = read_radar_tracks_ok(params)  # the car's radar configuration publishes side tracks (A8 B6a health, review R3-B1)
 
   while True:
     # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
@@ -449,6 +450,7 @@ def main(demo=False):
       blendful_enabled = params.get_bool("Blendful")
       blendful_kind = int(params.get("BlendfulMode", return_default=True))
       blendful_gaps = (float(params.get("BlendfulRightGapLow", return_default=True)), float(params.get("BlendfulRightGapHigh", return_default=True)))
+      radar_tracks_ok = read_radar_tracks_ok(params)
     lat_delay = fixed_or_learned(inster_mpc_fixed, 'lat_delay', model.lat_delay) + model.LAT_SMOOTH_SECONDS
     if sm.updated["extrinsicsCalibration"] and sm.seen['narrowRoadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["extrinsicsCalibration"].rpyCalib, dtype=np.float32)
@@ -530,8 +532,9 @@ def main(demo=False):
         rt = sm['radarTracks']
         radar = RadarFrame(tracks=[(pt.trackId, pt.dRel, pt.yRel, pt.vRel) for pt in rt.points],
                            age=(time.monotonic() - sm.recv_time['radarTracks']) if sm.seen['radarTracks'] else float('inf'),
-                           fault=(not sm.seen['radarTracks']) or (not sm.valid['radarTracks']) or any(rt.errors.to_dict().values()),
-                           new=bool(sm.updated['radarTracks']), right_blindspot=bool(sm_car.rightBlindspot))
+                           fault=(not sm.seen['radarTracks']) or (not sm.valid['radarTracks']) or any(rt.errors.to_dict().values())
+                           or not radar_tracks_ok,
+                           new=bool(sm.updated['radarTracks']), right_blindspot=bool(sm_car.rightBlindspot), config_ok=radar_tracks_ok)
         rl_inputs = RightInputs(frame_dt=frame_dt, gap_low=blendful_gaps[0], gap_high=blendful_gaps[1], c_set=camera_offset_helper.camera_offset,
                                 c_applied=camera_offset_helper.actual_camera_offset, left_blinker=bool(sm_car.leftBlinker),
                                 right_blinker=bool(sm_car.rightBlinker), radar=radar)

@@ -1061,7 +1061,7 @@ def upstream_from_centre_trigger(sw_start, sw_T, T=60.0, noise=0.03, seed=1):
   return tt
 
 
-def sim_endpoint_gap(rho, sw_start, sw_T, rate=br.MOVE_SPEED, hmax=1.0, T=60.0, noise=0.03, seed=1, settle=br.MOVE_SETTLE):
+def sim_endpoint_gap(rho, sw_start, sw_T, rate=br.CAR_MOVE_SPEED, hmax=1.0, T=60.0, noise=0.03, seed=1, settle=br.MOVE_SETTLE):
   """Closed loop of DESIGN check 18: the car moves to the held offset hmax (target glide `rate`, 1.5 s lag), the model plans back with the
   return fraction rho; x = Y_R(L) - plan_y(L) = 2 - (car + p)."""
   gap = EndpointGap()
