@@ -111,7 +111,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"PandaHeartbeatLost", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
     {"PrimeType", {PERSISTENT, INT}},
     {"RecordAudio", {PERSISTENT | BACKUP, BOOL}},
-    {"RecordFront", {PERSISTENT | BACKUP, BOOL, "1"}},
+    {"RecordFront", {PERSISTENT | BACKUP, BOOL, "0"}},  // off by default since 12 Nov 2026 (owner); filled only when unset: a device with it on stays on; the training guide writes the answer
     {"RecordFrontLock", {PERSISTENT, BOOL}},  // for the internal fleet
     {"SecOCKey", {PERSISTENT | DONT_LOG | BACKUP, STRING}},
     {"ShowDebugInfo", {PERSISTENT, BOOL}},

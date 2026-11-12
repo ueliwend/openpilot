@@ -21,7 +21,8 @@ DEVICE_DEFAULTS = {
   "LaneTurnDesire": True, "LaneTurnValue": 19.62, "RoadEdgeLaneChangeEnabled": True,
   "ShowTurnSignals": True, "TorqueBar": True, "TrueVEgoUI": True, "RoadNameToggle": True, "RocketFuel": True, "ShowAdvancedControls": True,
   "ChevronInfo": 0, "OnroadScreenOffBrightness": 1,
-  "IsMetric": True, "IsLdwEnabled": True, "RecordFront": True,
+  "IsMetric": True, "IsLdwEnabled": True,
+  "RecordFront": False,  # owner, 12 Nov 2026: driver camera not recorded by default (was 1 since 10 Nov); the training guide still asks
   "Mads": True, "MadsUnifiedEngagementMode": True, "MadsMainCruiseAllowed": True, "MadsSteeringMode": 0,
   "LagdToggle": True, "LagdToggleDelay": 0.2, "NeuralNetworkLateralControl": False, "DisengageOnAccelerator": False, "OnroadUploads": True,
   # owner, 11 Nov 2026 (the three settings changed on the device after the reinstall; initData of the 11 Nov 09:27 drive): once the blind-spot
@@ -71,8 +72,8 @@ class TestInsterDeviceDefaults(OpenpilotTestCase):
       assert params.get(k) == v, (k, params.get(k), v)
 
   def test_store_without_the_new_default_keys(self):
-    # the keys that had no default before (5 on 10 Nov 2026, GsmRoaming on 11 Nov 2026) become 1 on a store that never set them;
-    # every value the store holds stays
+    # the keys that had no default before (5 on 10 Nov 2026, GsmRoaming on 11 Nov 2026) get their default on a store that never set
+    # them (1; RecordFront 0 since 12 Nov 2026); every value the store holds stays
     params = Params()
     params.put("OnroadScreenOffBrightnessMigrated", "1.0", block=True)
     new_keys = ("EnforceTorqueControl", "LiveTorqueParamsToggle", "IsMetric", "IsLdwEnabled", "RecordFront", "GsmRoaming")
@@ -81,7 +82,7 @@ class TestInsterDeviceDefaults(OpenpilotTestCase):
         params.put(k, v, block=True)
     manager_start(params)
     for k in new_keys:
-      assert params.get(k) is True, k
+      assert params.get(k) is DEVICE_DEFAULTS[k], (k, params.get(k))
     for k, v in OTHER.items():
       if k not in new_keys:
         assert params.get(k) == v, (k, params.get(k), v)
