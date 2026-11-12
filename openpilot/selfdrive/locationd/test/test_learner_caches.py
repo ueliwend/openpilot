@@ -73,6 +73,46 @@ def restored_state(params, CP):
   return (retrieve_initial_lag(params, CP), retrieve_initial_vehicle_params(params, CP, False, False)[:3], torque)
 
 
+# A7 (full scale 1.0 = 409): torque_data values per 409 and the pre-A7 values per 384
+A7_FACTOR, A7_FRICTION = 3.9408854, 0.0798044
+PRE_A7_FACTOR, PRE_A7_FRICTION = 3.7, 0.085
+USER_FLOATS = {"TorqueParamsOverrideLatAccelFactor": 2.5, "TorqueParamsOverrideFriction": 0.1, "TorqueControlTune": 0.0,
+               "LagdToggleDelay": 0.2}
+USER_BOOLS = {"TorqueParamsOverrideEnabled": False, "CustomTorqueParams": False, "LiveTorqueParamsToggle": True,
+              "LiveTorqueParamsRelaxedToggle": False, "EnforceTorqueControl": True, "LagdToggle": True}   # the owner's settings
+ALL_KEYS = (*CACHE_KEYS, *USER_FLOATS, *USER_BOOLS)
+
+
+def get_pre_a7_CP():
+  # synthetic pre-A7 CarParams: the A7 Inster CarParams with the per-384 torque_data values
+  CP = get_CP(INSTER)
+  CP.lateralTuning.torque.latAccelFactor = PRE_A7_FACTOR
+  CP.lateralTuning.torque.friction = PRE_A7_FRICTION
+  return CP
+
+
+def put_user_keys(params):
+  for k, v in USER_FLOATS.items():
+    params.put(k, v, block=True)
+  for k, v in USER_BOOLS.items():
+    params.put_bool(k, v, block=True)
+
+
+def snapshot(params):
+  return {k: params.get(k) for k in ALL_KEYS}
+
+
+def assert_torque_reset(torque, factor, friction):
+  np.testing.assert_allclose([torque['latAccelFactor'], torque['latAccelOffset'], torque['frictionCoefficient'], torque['decay']],
+                             [factor, 0.0, friction, 50.0], rtol=1e-6)
+  assert torque['points'] == 0
+
+
+def assert_lag_and_vehicle_restored(lag, vehicle):
+  assert lag == (np.float32(0.31), 7)
+  np.testing.assert_allclose(vehicle, (15.6, 1.0, 0.4), rtol=1e-6)
+
+
 class _Stop(Exception):
   pass
 
@@ -216,3 +256,71 @@ class TestLearnerCaches(OpenpilotTestCase):
     params.put("CarParamsPersistent", b"not carparams", block=True)
     write_prev_route_car_params(params)
     assert params.get("CarParamsPrevRoute") == b"not carparams"
+
+  # A7 (Device & Platform, results/2026-11-12_a7_learned_torque section 6.2): the full-scale change resets torqued's cache through its
+  # restore key and nothing else
+  def test_a7_torque_data_is_per_409(self):
+    tune = get_CP(INSTER).lateralTuning.torque
+    np.testing.assert_allclose([tune.latAccelFactor, tune.friction], [A7_FACTOR, A7_FRICTION], rtol=1e-6)
+
+  def test_full_scale_change_resets_only_torqued(self):
+    params = Params()
+    put_user_keys(params)
+    start_route(params, get_pre_a7_CP())
+    save_learned_caches(params)
+    before = snapshot(params)
+
+    start_route(params, get_CP(INSTER))               # a fresh CarParams builder per call (pycapnp writes a builder only once)
+    lag, vehicle, torque = restored_state(params, get_CP(INSTER))
+    assert_lag_and_vehicle_restored(lag, vehicle)
+    assert_torque_reset(torque, A7_FACTOR, A7_FRICTION)
+    assert snapshot(params) == before                 # starting the learners removes or changes nothing
+
+    run_main(torqued)
+    assert {k for k in ALL_KEYS if params.get(k) != before[k]} == {"LiveTorqueParameters"}
+
+    # the next A7 route restores a cache written under A7 (no repeated reset)
+    save_learned_caches(params)
+    start_route(params, get_CP(INSTER))
+    torque = restored_state(params, get_CP(INSTER))[2]
+    np.testing.assert_allclose([torque['latAccelFactor'], torque['latAccelOffset'], torque['frictionCoefficient'], torque['decay']],
+                               [2.1, 0.05, 0.12, 25.0], rtol=1e-6)
+    assert torque['points'] == 21
+
+  def test_full_scale_rollback_resets_torqued(self):
+    params = Params()
+    start_route(params, get_CP(INSTER))
+    save_learned_caches(params)
+    pre_CP = get_pre_a7_CP()
+    start_route(params, pre_CP)
+    lag, vehicle, torque = restored_state(params, pre_CP)
+    assert_lag_and_vehicle_restored(lag, vehicle)
+    assert_torque_reset(torque, PRE_A7_FACTOR, PRE_A7_FRICTION)
+
+  def test_mock_route_after_full_scale_change(self):
+    params = Params()
+    start_route(params, get_pre_a7_CP())
+    save_learned_caches(params)
+    saved = get_caches(params)
+    pre_cp = params.get("CarParamsPersistent")
+
+    start_route(params, get_CP(MOCK))                 # first route on A7 software, car not recognised
+    assert params.get("CarParamsPrevRoute") == pre_cp
+    for module in (lagd, paramsd, torqued):
+      run_main(module)
+    assert get_caches(params) == saved                 # nothing restored, saved or removed
+
+    start_route(params, get_CP(INSTER))
+    assert params.get("CarParamsPrevRoute") == pre_cp
+    lag, vehicle, torque = restored_state(params, get_CP(INSTER))
+    assert_lag_and_vehicle_restored(lag, vehicle)
+    assert_torque_reset(torque, A7_FACTOR, A7_FRICTION)
+
+  def test_restore_key_holds_torque_units(self):
+    # no-reset case 3: an upstream change that drops friction or latAccelFactor from torqued's restore key fails here
+    key = TorqueEstimator.get_restore_key(get_CP(INSTER), torqued.VERSION)
+    assert TorqueEstimator.get_restore_key(get_CP(INSTER), torqued.VERSION) == key
+    for field, scale in (("latAccelFactor", 409 / 384), ("friction", 384 / 409)):
+      CP = get_CP(INSTER)
+      setattr(CP.lateralTuning.torque, field, getattr(CP.lateralTuning.torque, field) * scale)
+      assert TorqueEstimator.get_restore_key(CP, torqued.VERSION) != key, field

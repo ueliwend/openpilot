@@ -14,10 +14,10 @@ class LatControlTorqueExt(NeuralNetworkLateralControl, LatControlTorqueExtOverri
   def __init__(self, lac_torque, CP, CP_SP, CI):
     NeuralNetworkLateralControl.__init__(self, lac_torque, CP, CP_SP, CI)
     LatControlTorqueExtOverride.__init__(self, CP)
-    # Hyundai Inster: its steering cap (409 raw, lac_torque.steer_max = 409 / 384) is a property of the car. The jerk-aware / NNLC
-    # extensions run the controller's PID in torque space; controlsd sets its limits to +-steer_max (extension.update_limits()) only
-    # when it applies torque parameters, so for the Inster the extension does it itself on every step (also when useParams is off),
-    # and holds its output to the cap.
+    # Hyundai Inster: its steering cap (409 raw, which is also its full scale since A7, so lac_torque.steer_max = 1.0) is a property of
+    # the car. The jerk-aware / NNLC extensions run the controller's PID in torque space; controlsd sets its limits to +-steer_max
+    # (extension.update_limits()) only when it applies torque parameters, so for the Inster the extension does it itself on every step
+    # (also when useParams is off), and holds its output to the cap.
     self._inster = is_inster(CP)
     if self._inster:
       self._pid = lac_torque.pid

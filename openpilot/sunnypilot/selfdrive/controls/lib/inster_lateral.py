@@ -26,11 +26,12 @@ and a small stateful filter class.
     InsterAngleErrorPI on, either type; fitted for the PID): P scaled by sigma, softer for small errors on straights, stronger in curves (soft_p_sigma).
 
   * Torque cap (no switch): the Inster's steering command is capped at 409 raw (opendbc values.INSTER_STEER_MAX, the highest the
-    owner's steering unit took without a fault, 23 Oct 2026) with 1.0 = 384 raw (INSTER_STEER_FULL_SCALE): every lateral
-    controller's output limit is 409 / 384 for the Inster (lateral_steer_max, used by LatControl), the car side caps at 409.
+    owner's steering unit took without a fault, 23 Oct 2026), which is also its full scale: actuators.torque 1.0 = 409 raw since A7
+    (12 Nov 2026; before: 1.0 = 384 raw with the controllers' output limit at 409 / 384). Every lateral controller keeps openpilot's
+    output limit 1.0 (LatControl.steer_max), the car side caps at 409.
   * Request ceiling (no switch): max_lateral_accel_no_roll, 3.3 m/s^2 for the Inster instead of openpilot's 3.0.
 
-Units and signs: commands in raw LKAS11 units (full scale STEER_MAX_RAW = 384 = actuators.torque 1.0) or as a fraction of full torque;
+Units and signs: commands in raw LKAS11 units (full scale STEER_MAX_RAW = 409 = actuators.torque 1.0) or as a fraction of full torque;
 v0's internal sign convention (+ = right turn), the convention of v0's setpoint, measurement and output before its final negation.
 Derived offline from the owner's logs (step 1, 21 Oct 2026; open-loop replays and the closed-loop steering simulator).
 Nothing here is validated on the car.
@@ -38,14 +39,14 @@ Nothing here is validated on the car.
 import math
 from types import MappingProxyType
 
-from opendbc.car.hyundai.values import CAR, INSTER_STEER_DELTA_DOWN, INSTER_STEER_DELTA_UP, INSTER_STEER_FULL_SCALE, INSTER_STEER_MAX, \
-                                        CarControllerParams
+from opendbc.car.hyundai.values import CAR, INSTER_STEER_DELTA_DOWN, INSTER_STEER_DELTA_UP, INSTER_STEER_MAX, CarControllerParams
 from opendbc.car.lateral import apply_driver_steer_torque_limits
 from openpilot.common.pid import PIDController
 
-# Full-scale command the table and the friction term are expressed in (actuators.torque 1.0; opendbc INSTER_STEER_FULL_SCALE).
-# If it changes, F0 and the raw amplitudes below need a review: test_inster_lateral.py checks that both agree.
-STEER_MAX_RAW = 384.0
+# Full-scale command (raw per actuators.torque 1.0): the car's own conversion, opendbc's STEER_MAX for the Inster (= its cap 409 since
+# A7, 12 Nov 2026; 384 before). The table and the friction amplitudes are raw values and do not depend on it; F0 does (per full scale).
+# test_inster_lateral.py measures the car's raw per 1.0 through CarInterface.apply and checks that it equals this.
+STEER_MAX_RAW = float(INSTER_STEER_MAX)
 
 # The Inster's switches (params; on by default since 10 Nov 2026 (params_keys.h, filled at manager start), unset = off; changeable
 # only offroad, ignored while NNLC is enabled). With any of them on, the Lateral Jerk Torque Controller is switched off.
@@ -64,8 +65,6 @@ ANGLE_PI_G6_SWITCH = "InsterAngleErrorPIG6"        # legacy bool, read only by t
 # Option 5 of InsterAngleErrorPI (same rules; alone it changes nothing, so it is not one of INSTER_SWITCHES): soft small-error P
 SOFT_P_PARAM = "InsterSoftSmallErrorP"
 
-# Steering torque cap as a fraction of full scale: 409 / 384 = 1.065 (opendbc values.py: INSTER_STEER_MAX / INSTER_STEER_FULL_SCALE)
-INSTER_STEER_MAX_FRACTION = INSTER_STEER_MAX / INSTER_STEER_FULL_SCALE
 # Highest planned lateral acceleration without roll (m/s^2) for the Inster, instead of openpilot's 3.0 (drive_helpers
 # MAX_LATERAL_ACCEL_NO_ROLL); used by controlsd's clip_curvature. Owner's choice for the higher torque; route 0000007f at 409: held
 # 3.1-3.45 at 40-60 km/h without the command limiting (LOG), estimated 3.13-3.26 above 60 km/h (EST, unverified).
@@ -79,11 +78,6 @@ def is_inster(CP) -> bool:
 
 def any_inster_switch(params) -> bool:
   return any(params.get_bool(k) for k in INSTER_SWITCHES)
-
-
-def lateral_steer_max(CP) -> float:
-  """Output limit of every lateral controller (fraction of full torque; LatControl.steer_max): 409 / 384 for the Inster, 1.0 else."""
-  return INSTER_STEER_MAX_FRACTION if is_inster(CP) else 1.0
 
 
 def max_lateral_accel_no_roll(CP, default: float) -> float:
@@ -143,8 +137,8 @@ CMD_RAW = (                                                                # row
 # the 48 km/h move comes from that route alone (the refit without it equals the table). F0 and the clip unchanged: the filtered learned
 # factor that controlsd passes ranged 2.68-3.06 since 22 Oct (scale F0 / factor 0.914-1.045), inside the clip.
 # 23 Oct 2026: the 13 cells that were pinned at the old cap of 384 now run up to the new cap of 409 (torque-map extension of the owner's
-# route 0000007f at the 409 cap; agents/r7f_tmap/ff_table_409.json); every cell <= INSTER_STEER_MAX (tested). In raw units of the
-# full scale 384, so the 409 cells are 409 / 384 = 1.065 of full torque.
+# route 0000007f at the 409 cap; agents/r7f_tmap/ff_table_409.json); every cell <= INSTER_STEER_MAX (tested). Raw units (LKAS11), so
+# the cells do not depend on the full scale (1.0 = 384 raw until A7, 1.0 = 409 since).
 # 30 Oct 2026 (owner's go for the over-turn fix, step 2): the table is no longer scaled by the learned factor. It was read at |a| x F0 /
 # factor (clipped +-15 %), but the table is fitted on a physical axis (EPS torque against v x yaw minus the gravity term; no factor), the
 # hands-off torque of the drives does not fall with a higher learned factor (LOG: correlation +0.22 / +0.66 at 32 km/h @ 0.5 / 48 km/h
@@ -152,26 +146,38 @@ CMD_RAW = (                                                                # row
 # At the factor 2.60 the learner gave after its reset with the 29 Oct update, the table was read 7.7 % high (over-turning at 15-30
 # km/h, drive 000000af), and P / I / D torque was 7.7 % above the simulator's (the factor swing seen, 2.60-3.70, spans +8 % to -24 %).
 # F0 is now the single conversion constant of the whole Inster path (INSTER_FIXED_FACTOR).
-F0 = 2.8                          # m/s^2 per unit torque: the Inster path's fixed lateral-acceleration factor (the simulator's value)
-_TAB = tuple(tuple(c / STEER_MAX_RAW for c in row) for row in CMD_RAW)
+# 12 Nov 2026 (A7, full scale 1.0 = 409 raw): F0 = 2.8 per 384 raw re-expressed per 409 raw (2.8 x 409 / 384 = 2.98229), the same
+# m/s^2 per raw command unit (2.8 / 384) as the simulator's value.
+F0 = 2.8 * STEER_MAX_RAW / 384.0  # m/s^2 per unit torque (1.0 = STEER_MAX_RAW raw): the Inster path's fixed lateral-acceleration factor
 
 
-def table_torque(a_abs: float, v_ego: float) -> float:
-  """|a| (m/s^2, >= 0) and speed (m/s) -> torque fraction 0..1. Bilinear: linear in v between the rows, then linear in a."""
+def _table_speed_cell(v_ego: float) -> tuple[int, float]:
+  """the table's speed row j and weight w at v_ego (m/s): linear between V_NODES[j] and V_NODES[j + 1], clamped at the outer rows"""
   vn = V_NODES
   if v_ego <= vn[0]:
-    j, w = 0, 0.0
-  elif v_ego >= vn[-1]:
-    j, w = len(vn) - 2, 1.0
-  else:
-    j = 0
-    while v_ego >= vn[j + 1]:
-      j += 1
-    w = (v_ego - vn[j]) / (vn[j + 1] - vn[j])
-  t0, t1 = _TAB[j], _TAB[j + 1]
+    return 0, 0.0
+  if v_ego >= vn[-1]:
+    return len(vn) - 2, 1.0
+  j = 0
+  while v_ego >= vn[j + 1]:
+    j += 1
+  return j, (v_ego - vn[j]) / (vn[j + 1] - vn[j])
+
+
+def _table_top_raw(j: int, w: float) -> float:
+  """the table's top (raw) at the speed cell (j, w): its value on the plateau. ff_table_top and table_raw use this one expression,
+  so a command read off the plateau is recognised as the plateau exactly (12 Nov 2026, A7: the table is read in raw units; before, it
+  was read as a fraction of 384 and multiplied back, and the plateau test missed 15 % of plateau commands at 32-111 km/h)."""
+  return (1.0 - w) * CMD_RAW[j][-1] + w * CMD_RAW[j + 1][-1]
+
+
+def table_raw(a_abs: float, v_ego: float) -> float:
+  """|a| (m/s^2, >= 0) and speed (m/s) -> steering command (raw, >= 0). Bilinear: linear in v between the rows, then linear in a."""
+  j, w = _table_speed_cell(v_ego)
+  t0, t1 = CMD_RAW[j], CMD_RAW[j + 1]
   an = A_NODES
   if a_abs >= an[-1]:
-    return (1.0 - w) * t0[-1] + w * t1[-1]
+    return _table_top_raw(j, w)
   if a_abs <= 0.0:
     return 0.0
   i = 0
@@ -182,14 +188,24 @@ def table_torque(a_abs: float, v_ego: float) -> float:
   return c0 + (c1 - c0) * (a_abs - an[i]) / (an[i + 1] - an[i])
 
 
-def ff_torque(lateral_accel: float, v_ego: float) -> float:
-  """Feed-forward torque (fraction of full torque, signed like lateral_accel) for a gravity-adjusted lateral acceleration (m/s^2):
-  the table, odd in the acceleration, no factor scaling."""
+def table_torque(a_abs: float, v_ego: float) -> float:
+  """|a| (m/s^2, >= 0) and speed (m/s) -> torque fraction of full scale (table_raw / STEER_MAX_RAW)."""
+  return table_raw(a_abs, v_ego) / STEER_MAX_RAW
+
+
+def ff_raw(lateral_accel: float, v_ego: float) -> float:
+  """Feed-forward command (raw, signed like lateral_accel) for a gravity-adjusted lateral acceleration (m/s^2): the table, odd in the
+  acceleration, no factor scaling."""
   if lateral_accel > 0.0:
-    return table_torque(lateral_accel, v_ego)
+    return table_raw(lateral_accel, v_ego)
   if lateral_accel < 0.0:
-    return -table_torque(-lateral_accel, v_ego)
+    return -table_raw(-lateral_accel, v_ego)
   return 0.0
+
+
+def ff_torque(lateral_accel: float, v_ego: float) -> float:
+  """Feed-forward torque (fraction of full torque, signed like lateral_accel): ff_raw / STEER_MAX_RAW."""
+  return ff_raw(lateral_accel, v_ego) / STEER_MAX_RAW
 
 
 def ff_lat_accel_equivalent(lateral_accel: float, v_ego: float, lat_accel_factor: float) -> float:
@@ -394,7 +410,8 @@ def angle_pi_log_version(controller: int, soft_p: bool, mpc: bool = False, mpc_r
   976106 (builds up to 36584a3, learned values in force); since 9 Nov 2026 with the held values 1488106 / 2000106 (1360106: MPC selected
   but its set-up failed, plain PID with the held values); since 11 Nov 2026 every value + 1000 x 2048 (parameter set 11 Nov:
   PI 2368105, PID 2384106, option 5 2376105 / 2392106, PID + MPC + ramp-aware + held 4048106, PID + MPC + held 3536106, MPC set-up failed
-  3408106)."""
+  3408106); since 12 Nov 2026 (A7, full scale 1.0 = 409 raw) every value + 1000 x 4096: PI 6464105, PID 6480106, option 5 6472105 /
+  6488106, PID + MPC + ramp-aware + held 8144106, PID + MPC + held 7632106, MPC set-up failed 7504106)."""
   if controller == LATERAL_PID:
     base, mask = ANGLE_PI_PID_BASE_VERSION, ANGLE_PI_VERSION_D_BIT
   else:
@@ -407,7 +424,8 @@ def angle_pi_log_version(controller: int, soft_p: bool, mpc: bool = False, mpc_r
       mask |= ANGLE_PI_VERSION_MPC_RAMP_BIT
   if mpc_fixed:
     mask |= ANGLE_PI_VERSION_MPC_FIXED_BIT
-  return base + 1000 * (mask | ANGLE_PI_VERSION_FREEZE_DIR_BIT | ANGLE_PI_VERSION_FIXED_FACTOR_BIT | ANGLE_PI_VERSION_SET_11NOV_BIT)
+  return base + 1000 * (mask | ANGLE_PI_VERSION_FREEZE_DIR_BIT | ANGLE_PI_VERSION_FIXED_FACTOR_BIT | ANGLE_PI_VERSION_SET_11NOV_BIT |
+                        ANGLE_PI_VERSION_FULL_SCALE_409_BIT)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -430,12 +448,16 @@ ANGLE_PI_VERSION_FIXED_FACTOR_BIT = 256   # 30 Oct 2026: fixed factor F0 on the 
 # the 7 Nov set (earlier table and parameter-set changes did not change the version; this one does, owner 11 Nov). No behaviour hangs
 # on the bit.
 ANGLE_PI_VERSION_SET_11NOV_BIT = 2048
+# 12 Nov 2026 (A7, owner): full scale actuators.torque 1.0 = 409 raw (was 384), always set with F on, so drives on the new unit are told
+# apart in controlsState too (the unit also shows in every rlog as CarParams latAccelFactor 3.94 vs 3.70, and as torqueOutputCan /
+# actuatorsOutput.torque). No behaviour hangs on the bit.
+ANGLE_PI_VERSION_FULL_SCALE_409_BIT = 4096
 LIMIT_TOL_RAW = 1.5          # rounding (+-0.5 raw) and the limiter's driver-torque frame (one carState later on the car side)
 
 
 class InsterSteerLimitObserver:
   """the car-side command for this controller's requests (CODE: hyundai carcontroller, apply_torque = apply_driver_steer_torque_limits(
-  round(actuators.torque x STEER_FULL_SCALE), apply_torque_last, steeringTorque, params); 0 while lateral control is inactive) and the
+  round(actuators.torque x STEER_MAX), apply_torque_last, steeringTorque, params); 0 while lateral control is inactive) and the
   direction in which the last request was held back: +1 / -1 in actuators.torque sign, 0 if it passed within LIMIT_TOL_RAW."""
 
   def __init__(self, ccp):
@@ -455,7 +477,7 @@ class InsterSteerLimitObserver:
       torque = 0.0              # controlsd replaces a non-finite actuators.torque by 0 after this update (its NaN guard)
     if not math.isfinite(driver_torque):
       driver_torque = 0.0
-    new_torque = int(round(torque * self.ccp.STEER_FULL_SCALE))
+    new_torque = int(round(torque * self.ccp.STEER_MAX))
     apply_torque = apply_driver_steer_torque_limits(new_torque, self.apply_torque_last, driver_torque, self.ccp)
     self.apply_torque_last = apply_torque
     gap = new_torque - apply_torque
@@ -851,23 +873,15 @@ def mpc_gain_matrix(p: dict):
 
 
 def ff_table_inverse(raw: float, v_ego: float) -> float:
-  """exact inverse of ff_torque (raw units in, signed lateral acceleration out, m/s^2): the acceleration whose table torque is raw; on
-  the 409 plateau the first acceleration that reaches it; beyond the table's top the same as the top"""
+  """exact inverse of ff_raw (raw units in, signed lateral acceleration out, m/s^2): the acceleration whose table command is raw; on
+  the table's plateau (its top, 388.55 raw since 11 Nov 2026) the first acceleration that reaches it; beyond the top the same as the
+  top"""
   if raw == 0.0:
     return 0.0
-  r = abs(raw) / STEER_MAX_RAW
-  vn = V_NODES
-  if v_ego <= vn[0]:
-    j, w = 0, 0.0
-  elif v_ego >= vn[-1]:
-    j, w = len(vn) - 2, 1.0
-  else:
-    j = 0
-    while v_ego >= vn[j + 1]:
-      j += 1
-    w = (v_ego - vn[j]) / (vn[j + 1] - vn[j])
-  t0, t1 = _TAB[j], _TAB[j + 1]
-  top = (1.0 - w) * t0[-1] + w * t1[-1]
+  r = abs(raw)
+  j, w = _table_speed_cell(v_ego)
+  t0, t1 = CMD_RAW[j], CMD_RAW[j + 1]
+  top = _table_top_raw(j, w)
   if r > top:
     r = top
   an = A_NODES
@@ -882,18 +896,10 @@ def ff_table_inverse(raw: float, v_ego: float) -> float:
 
 
 def ff_table_top(raw: float, v_ego: float) -> bool:
-  """|raw| at or above the table's top at v_ego (the plateau, where ff_table_inverse answers the knee)"""
-  vn = V_NODES
-  if v_ego <= vn[0]:
-    j, w = 0, 0.0
-  elif v_ego >= vn[-1]:
-    j, w = len(vn) - 2, 1.0
-  else:
-    j = 0
-    while v_ego >= vn[j + 1]:
-      j += 1
-    w = (v_ego - vn[j]) / (vn[j + 1] - vn[j])
-  return abs(raw) / STEER_MAX_RAW >= (1.0 - w) * _TAB[j][-1] + w * _TAB[j + 1][-1]
+  """|raw| at or above the table's top at v_ego (the plateau, where ff_table_inverse answers the knee). Raw units on both sides and
+  the same expression as table_raw's plateau, so every command ff_raw returns on the plateau tests True."""
+  j, w = _table_speed_cell(v_ego)
+  return abs(raw) >= _table_top_raw(j, w)
 
 
 def mpc_ramp_envelope(T: list, up_block: float, down_block: float) -> list:
@@ -1193,7 +1199,7 @@ class InsterMPC:
       kdj = kd if j == 0 else float(np.interp(ld + tj, self.taus, P))
       aj = ap if j == 0 else float(U[j - 1])
       Fj = la0 + v2 * (kdj - kd) + w * (aj - v2 * kdj)
-      Tj = ff_torque(Fj, v_ego) * STEER_MAX_RAW
+      Tj = ff_raw(Fj, v_ego)
       if j < 2:
         F01.append(Fj)
       if j == 0:
@@ -1247,9 +1253,9 @@ class InsterMPC:
 
 
 def ff_table_slope_raw(lateral_accel: float, v_ego: float) -> float:
-  """|d ff_torque / d a| (raw per m/s^2) at lateral_accel, central difference over +-0.05 m/s^2 (the MPC's ramp conversion; the table
+  """|d ff_raw / d a| (raw per m/s^2) at lateral_accel, central difference over +-0.05 m/s^2 (the MPC's ramp conversion; the table
   at the fixed factor F0)"""
-  return abs(ff_torque(lateral_accel + 0.05, v_ego) - ff_torque(lateral_accel - 0.05, v_ego)) / 0.1 * STEER_MAX_RAW
+  return abs(ff_raw(lateral_accel + 0.05, v_ego) - ff_raw(lateral_accel - 0.05, v_ego)) / 0.1
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
