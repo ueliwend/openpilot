@@ -381,15 +381,183 @@ class TestServerCheckOffTheLoop(MapsCase):
     w.request("CH")
     w.maps.step()
     assert len(jobs) == 1 and w.status()["run"]["waiting"] == om.WAIT_CHECKING
-    w.clock.t += om.CHECK_MAX_AGE_SECONDS + 1
+    w.offroad = False  # a drive starts right after the answer arrives
     jobs.pop()()
-    w.maps.step()  # the stale answer is dropped
+    w.clock.t += om.CHECK_MAX_AGE_SECONDS + 1
+    w.offroad = True
+    w.maps.step()  # the answer, now older than five minutes, is dropped
     assert w.sent == [] and len(jobs) == 0
     w.maps.step()  # and a new check starts
     assert len(jobs) == 1
     jobs.pop()()
     assert w.run()
     assert w.sent_codes() == ["CH"]
+
+
+  def test_a_slow_check_is_not_dropped_as_stale(self, monkeypatch):
+    """The age counts from the answer: a check that took longer than five minutes (many tiles, slow server) is used."""
+    jobs = []
+    w = self.world(monkeypatch, runner=jobs.append)
+    w.serve_locations("CH")
+    assert w.run()
+    w.request("CH")
+    w.maps.step()
+    w.clock.t += om.CHECK_MAX_AGE_SECONDS + 60
+    jobs.pop()()
+    assert w.run()
+    assert w.sent_codes() == ["CH"] and jobs == []
+
+  def test_a_check_that_never_answers_ends_after_the_timeout(self, monkeypatch):
+    jobs = []
+    w = self.world(monkeypatch, runner=jobs.append)  # the worker never runs: a hung server
+    w.serve_locations("CH")
+    assert w.run()
+    w.request("CH")
+    w.maps.step()
+    assert w.status()["run"]["waiting"] == om.WAIT_CHECKING
+    w.clock.t += om.CHECK_TIMEOUT_SECONDS + 1
+    w.maps.step()
+    run = w.status()["run"]
+    assert run["waiting"] == om.WAIT_SERVER_SLOW and run["retry_at"] > 0 and w.status()["message"] == om.WAIT_SERVER_SLOW
+    w.request("all")  # a retry by hand starts a new check at once
+    w.maps.step()
+    assert len(jobs) == 2
+    jobs.pop()()
+    assert w.run()
+    assert w.sent_codes() == ["CH"]
+
+  def test_check_progress_is_in_the_status(self, monkeypatch):
+    jobs = []
+    w = self.world(monkeypatch, runner=jobs.append)
+    w.serve_locations("AT")
+    assert w.run()
+    w.request("AT")
+    w.maps.step()
+    check = w.status()["run"]["check"]
+    assert check == {"location": "AT", "done": 0, "total": 10}
+    jobs.pop()()
+    assert w.run()
+    assert w.status()["run"]["check"] is None
+
+
+class TestSlowServer(MapsCase):
+  """Review S1: a slow server that keeps answering is waited for; sizes of a check that stops are kept for the retry."""
+  def _blocking_head(self, monkeypatch, w):
+    gate, answered = threading.Semaphore(0), []
+    head = w.tile_server.head
+
+    def slow_head(t):
+      gate.acquire()
+      answered.append(t)
+      return head(t)
+    monkeypatch.setattr(w.tile_server, "head", slow_head)
+    return gate, answered
+
+  def _answer(self, w, gate, answered, seconds):
+    """The server answers one more HEAD after `seconds`; returns once the worker has it."""
+    n = len(answered)
+    w.clock.t += seconds
+    gate.release()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+      job = w.maps._check
+      if job is None or job.get("cancelled") or len(job["sizes"]) > n or job["result"] is not None:
+        break  # answered, or the check has ended (then the test's assertions decide)
+      time.sleep(0.002)
+    w.maps.step()
+
+  def test_a_slow_server_answering_every_30_s_completes_a_five_country_batch(self, monkeypatch):
+    w = self.world(monkeypatch, runner="default")
+    five = ["CH", "AT", "DE", "IT", "FR"]
+    w.serve_locations(*five)
+    gate, answered = self._blocking_head(monkeypatch, w)
+    assert w.run()
+    w.request(",".join(five))
+    w.maps.step()
+    total = w.maps._check["total"]
+    assert total == len(union_tiles(five))  # nothing on disk: every tile is asked once
+    for _ in range(total):
+      self._answer(w, gate, answered, 30)
+      assert w.status()["run"]["waiting"] in (om.WAIT_CHECKING, ""), len(answered)  # never "too slow" while answers come ("": sent)
+    assert 30 * total > om.CHECK_TIMEOUT_SECONDS  # far longer than the limit in all, never 10 min without an answer
+    assert w.status()["run"]["waiting"] != om.WAIT_SERVER_SLOW
+    gate.release(1000)
+    assert w.run()
+    assert w.sent_codes() == ["AT", "DE", "IT", "FR"] and len(answered) == total  # CH covered by Italy
+
+  def test_a_check_that_stops_keeps_its_sizes_and_the_retry_continues(self, monkeypatch):
+    w = self.world(monkeypatch, runner="default")
+    w.serve_locations("AT")
+    gate, answered = self._blocking_head(monkeypatch, w)
+    assert w.run()
+    w.request("AT")
+    w.maps.step()
+    for _ in range(6):
+      self._answer(w, gate, answered, 30)
+    w.clock.t += om.CHECK_TIMEOUT_SECONDS + 1  # then 10 min without an answer
+    w.maps.step()
+    assert w.status()["run"]["waiting"] == om.WAIT_SERVER_SLOW
+    assert all(w.maps.cache.download(t) for t in answered)  # the 6 sizes are kept
+    w.request("all")  # retry by hand
+    w.maps.step()
+    assert w.maps._check["total"] == len(AT) - 6  # only the rest is asked
+    gate.release(1000)
+    assert w.run()
+    assert w.sent_codes() == ["AT"] and len(answered) == len(AT) + 1  # the hanging 7th answer arrives late, unused
+
+
+class TestBatches(MapsCase):
+  """Several countries picked at once, added during a download, and checked together."""
+  def test_countries_added_during_a_download_extend_the_queue(self, monkeypatch):
+    w = self.world(monkeypatch)
+    w.serve_locations("CH", "AT", "DE")
+    w.request("CH")
+    w.run(until=lambda w: w.updater.current == ("nation", "CH"))
+    w.request("AT,DE")  # ADD with two ticks while Switzerland downloads
+    w.maps.step()
+    run = w.status()["run"]
+    assert run["count"] == 3 and run["current"] == "CH"
+    assert run["queue_tiles_total"] == len(CH) + len(AT) + len(DE)
+    assert w.run()
+    assert w.sent_codes() == ["CH", "AT", "DE"] and w.selected() == ["CH", "AT", "DE"]
+
+  def test_queue_progress_counts_every_country(self, monkeypatch):
+    w = self.world(monkeypatch)
+    w.serve_locations("CH", "AT")
+    w.request("CH,AT")
+    w.run(until=lambda w: w.updater.current == ("nation", "AT"))
+    w.maps.step()
+    run = w.status()["run"]
+    assert run["queue_tiles_total"] == 16 and len(CH) <= run["queue_tiles_done"] < 16
+
+  def test_the_guard_checks_the_whole_queue(self, monkeypatch):
+    # room for one country's tiles but not for three: refused before the first is sent, with all names
+    w = self.world(monkeypatch)
+    w.serve_locations("CH", "AT", "DE")
+    sizes = dict.fromkeys(union_tiles(["CH", "AT", "DE"]), GB // 2)  # what the server says: 2 GB per tile on disk (ratio 4)
+    monkeypatch.setattr(w.tile_server, "head", lambda t: sizes.get(t, 0))
+    w.disk_size.capacity, w.disk_size.slack = 100 * GB, 85 * GB  # maps may use about 42 GB: CH 12 GB fits, all three 86 GB not
+    w.drives = 0
+    w.request("CH,AT,DE")
+    assert w.run()
+    assert w.sent == [] and "Switzerland, Austria, Germany" in w.status()["message"]
+    w.request("CH")  # alone it fits
+    assert w.run()
+    assert w.sent_codes() == ["CH"]
+
+  def test_a_deleted_country_being_downloaded_is_shown_as_a_queued_delete(self, monkeypatch):
+    w = self.world(monkeypatch)
+    w.serve_locations("CH", "AT")
+    w.request("CH,AT")
+    w.run(until=lambda w: w.updater.current == ("nation", "CH") and w.mapd.gets)
+    w.delete("CH")
+    w.maps.step()
+    run = w.status()["run"]
+    assert run["deletes_pending"] == ["CH"] and run["current"] == "CH" and run["count"] == 2
+    assert "CH" not in w.status()["entries"]
+    assert w.run()
+    assert w.sent_codes() == ["CH", "AT"] and w.status()["run"]["deletes_pending"] == []
+    assert not any(on_disk(w, t) for t in CH if t not in AT)
 
 
 class TestServerErrors(MapsCase):

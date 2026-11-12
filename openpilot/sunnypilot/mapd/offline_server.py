@@ -21,7 +21,7 @@ from openpilot.sunnypilot.mapd.offline_storage import DEFAULT_UNPACK_RATIO
 
 SIZES_NAME = "offline_sizes.json"  # must not start with "v" or be "db" / "tmp" (mapd_manager.get_files_for_cleanup)
 GZIP_MAGIC = b"\x1f\x8b"
-TIMEOUT = 10
+TIMEOUT = (5, 10)  # connect, read: every request ends within seconds (offline_maps.py also caps the whole check)
 
 GZIP, NOT_GZIP, NO_DATA, NO_ANSWER, SERVER_ERROR = "gzip", "not_gzip", "no_data", "no_answer", "server_error"
 NO_ANSWER_SIZE = -1
@@ -59,15 +59,21 @@ class TileServer:
     return (GZIP if head == GZIP_MAGIC else NOT_GZIP), r.status_code
 
 
-def check(server, tiles: list[Tile], missing: list[Tile], no_data: set[Tile]) -> dict:
-  """HEAD sizes of the tiles not on disk (stops at the first one without an answer), then the probe of the first tile in
-  the binary's order not known as "no data" (a 404 moves on to the next tile). Touches no file: the caller applies it."""
+def check(server, tiles: list[Tile], missing: list[Tile], no_data: set[Tile], progress=None, on_size=None) -> dict:
+  """HEAD sizes of `missing` (tiles not on disk; stops at the first one without an answer), then the probe of the first
+  tile of `tiles` in the binary's order not known as "no data" (a 404 moves on to the next tile). Touches no file: the
+  caller applies the result. progress(done, total) is called before each HEAD request, on_size(tile, size) after each one
+  that got an answer (so a caller can keep the sizes of a check that does not finish)."""
   sizes: dict = {}
-  for t in missing:
+  for i, t in enumerate(missing):
+    if progress is not None:
+      progress(i, len(missing))
     size = server.head(t)
     if size == NO_ANSWER_SIZE:
       return {"sizes": sizes, "answer": NO_ANSWER, "code": None, "no_data": []}
     sizes[t] = size
+    if on_size is not None:
+      on_size(t, size)
   known = set(no_data) | {t for t, s in sizes.items() if s == 0}
   probe_no_data = []
   for t in tiles:

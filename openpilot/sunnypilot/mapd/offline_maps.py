@@ -17,7 +17,9 @@ Gates before each location is sent (offline_update.py runs the rest), in this or
 - server check, in a worker thread so the manager loop (and map speed data) never waits on the network: a HEAD request
   for each tile not on disk (download size, 404 = no data on the server), then the probe: the first tile with data must
   start with the gzip magic (offline_server.py). No answer, or a server error (e.g. HTTP 403, shown with its code), makes
-  the run wait 1, 2, 4 ... min (at most 1 h); a request by hand (DOWNLOAD, Update all, ADD) asks again at once;
+  the run wait 1, 2, 4 ... min (at most 1 h); a request by hand (DOWNLOAD, Update all, ADD) asks again at once. A check
+  ends when the server has not answered for 10 min (a slow server that keeps answering is waited for); the sizes it got
+  are kept, so a retry asks only for the rest;
 - storage (offline_storage.py): the budget against the capacity with the 3 h drive buffer; refused = the run stops;
 - a reply that is not gzip skips the location (failed); otherwise it is sent.
 """
@@ -45,7 +47,9 @@ STATUS_VERSION = 1
 UNMETERED_TYPES = ("wifi", "ethernet", "cell2G", "cell3G", "cell4G", "cell5G")  # owner: any unmetered network
 SERVER_RETRY_SECONDS = 60.0
 SERVER_RETRY_MAX_SECONDS = 3600.0
-CHECK_MAX_AGE_SECONDS = 300.0
+CHECK_MAX_AGE_SECONDS = 300.0  # an answer older than this (counted from when it arrived) is asked again
+CHECK_TIMEOUT_SECONDS = 600.0  # a check with no answer from the server for this long ends (backoff, retry by hand)
+FRESH_SIZE_SECONDS = 3600.0  # a tile size the server told within this time is not asked again (a retry continues)
 DISK_REFRESH_SECONDS = 10.0
 STORAGE_REFRESH_SECONDS = 60.0
 
@@ -53,6 +57,7 @@ WAIT_NETWORK = "waiting for an unmetered network"
 WAIT_SERVER = "map server not reachable"
 WAIT_SERVER_ERROR = "map server error"
 WAIT_CHECKING = "checking the map server"
+WAIT_SERVER_SLOW = "map server too slow"
 SKIP_NOT_GZIP = "map server error (reply not gzip)"
 STOP_STORAGE = "not enough storage"
 
@@ -60,6 +65,10 @@ STOP_STORAGE = "not enough storage"
 def network_allows(network: tuple[str, bool] | None) -> bool:
   """Owner's answer 2: any network the device reports unmetered (Wi-Fi, Ethernet, a non-comma SIM with GsmMetered off)."""
   return network is not None and network[0] in UNMETERED_TYPES and not network[1]
+
+
+class CheckCancelled(Exception):
+  pass
 
 
 def thread_runner(work) -> None:
@@ -97,6 +106,7 @@ class OfflineMaps:
     self.server_error: int | None = None  # HTTP status of the last server error (shown in the status)
     self._runner = runner
     self._check: dict | None = None  # the server check of the location at the head of the queue
+    self._fresh: dict[Tile, float] = {}  # tile -> when the server last told its size
     self._check_lock = threading.Lock()
     self._disk_info: dict[Tile, tuple[int, float]] = {}
     self._disk_at = -1e9
@@ -139,7 +149,10 @@ class OfflineMaps:
     self.records = {}
     self.cache = SizeCache(self.root)
     self.message = ""
+    if self._check is not None:
+      self._check["cancelled"] = True
     self._check = None
+    self._fresh = {}
     self._retry_at, self._failures, self._server_wait, self.server_error = 0.0, 0, "", None
     self._disk_at = self._storage_at = -1e9
     self.params.remove(STATUS_KEY)
@@ -194,8 +207,8 @@ class OfflineMaps:
       self.selection.remove(location_id)
       self.updater.dequeue(parsed)
       self.records.pop(location_id, None)
-      if location_id in self.run_ids and location_id not in self.run_done:
-        self.run_ids.remove(location_id)
+      if location_id in self.run_ids and location_id not in self.run_done and parsed != self.updater.current:
+        self.run_ids.remove(location_id)  # not sent yet: leaves the run; a country being downloaded stays until its end
       if location_id not in self.pending_deletes:
         self.pending_deletes.append(location_id)
     self._disk_at = -1e9
@@ -233,40 +246,87 @@ class OfflineMaps:
     if self._monotonic() < self._retry_at:
       return WAIT, self._server_wait or WAIT_SERVER
     location_id = entry_id(kind, code)
+    queued = self._queued_tiles(tiles)
     job = self._check
-    if job is None or job["id"] != location_id or job["tiles"] != tuple(tiles):
-      self._start_check(location_id, tiles)
+    if job is None or job["id"] != location_id or job["tiles"] != tuple(tiles) or job["queued"] != tuple(queued):
+      if job is not None:
+        job["cancelled"] = True  # the queue changed: that worker stops before its next request
+      self._start_check(location_id, tiles, queued)
       job = self._check
     with self._check_lock:
-      result = job["result"]
+      result, finished = job["result"], job["finished"]
+    now = self._monotonic()
     if result is None:
+      if now - max(job["started"], job["last_answer"]) > CHECK_TIMEOUT_SECONDS:  # no answer for 10 min: never holds the queue
+        self._check = None
+        job["cancelled"] = True  # its worker stops before its next request
+        self._keep_sizes(job["sizes"])  # a retry continues where this check stopped
+        self.message = WAIT_SERVER_SLOW
+        return self._backoff(WAIT_SERVER_SLOW)
       return WAIT, WAIT_CHECKING
     self._check = None
-    if self._monotonic() - job["started"] > CHECK_MAX_AGE_SECONDS:
+    if now - finished > CHECK_MAX_AGE_SECONDS:
       return WAIT, WAIT_CHECKING  # an old answer (e.g. the car was driven meanwhile): ask again at the next step
-    return self._decide(kind, code, tiles, result)
+    return self._decide(kind, code, tiles, queued, result)
 
-  def _start_check(self, location_id: str, tiles: list[Tile]) -> None:
+  def _queued_tiles(self, tiles: list[Tile]) -> list[Tile]:
+    """Tiles of the entries queued after the head (and not the head's): the storage guard covers the whole queue."""
+    head = set(tiles)
+    out: dict[Tile, None] = {}
+    for later in self.updater.queue[1:]:
+      for t in entry_tiles(entry_id(*later)):
+        if t not in head:
+          out[t] = None
+    return list(out)
+
+  def _keep_sizes(self, sizes: dict) -> None:
+    """Sizes the server told (also those of a check that did not finish): cached, and not asked again for an hour."""
+    with self._check_lock:
+      sizes = dict(sizes)
+    now = self._monotonic()
+    for t, size in sizes.items():
+      self.cache.set_download(t, size)
+      self._fresh[t] = now
+    if sizes:
+      self.cache.save()
+
+  def _start_check(self, location_id: str, tiles: list[Tile], queued: list[Tile]) -> None:
     missing = []
-    for t in tiles:
+    now = self._monotonic()
+    for t in tiles + queued:
       stats = tile_stats(self.root, t)
-      if stats is None:
-        missing.append(t)
-      else:
+      if stats is not None:
         self.cache.set_disk(t, stats[0])
+      elif self.cache.download(t) is not None and (t in queued or now - self._fresh.get(t, -1e18) < FRESH_SIZE_SECONDS):
+        continue  # size known: told within the hour (e.g. by a check that did not finish), or a later entry's tile
+      else:
+        missing.append(t)
     no_data = {t for t in tiles if self.cache.no_data(t)}
-    job = {"id": location_id, "tiles": tuple(tiles), "started": self._monotonic(), "result": None}
+    job = {"id": location_id, "tiles": tuple(tiles), "queued": tuple(queued), "started": now, "finished": 0.0, "last_answer": now,
+           "result": None, "done": 0, "total": len(missing), "sizes": {}}
     self._check = job
-    server = self.server
+    server, monotonic = self.server, self._monotonic
+
+    def progress(done, total):
+      if job.get("cancelled"):
+        raise CheckCancelled
+      job["done"], job["total"] = done, total
+
+    def on_size(tile, size):
+      with self._check_lock:
+        job["sizes"][tile] = size
+        job["last_answer"] = monotonic()
 
     def work():
       try:
-        result = check(server, list(tiles), missing, no_data)
+        result = check(server, list(tiles), missing, no_data, progress, on_size)
+      except CheckCancelled:
+        return
       except Exception:
         cloudlog.exception("mapd offline maps: server check failed")
         result = {"sizes": {}, "answer": NO_ANSWER, "code": None, "no_data": []}
       with self._check_lock:
-        job["result"] = result
+        job["result"], job["finished"], job["done"] = result, monotonic(), job["total"]
     self._runner(work)
 
   def _backoff(self, reason: str) -> tuple[str, str]:
@@ -277,9 +337,8 @@ class OfflineMaps:
     self._server_wait = reason
     return WAIT, reason
 
-  def _decide(self, kind: str, code: str, tiles: list[Tile], result: dict) -> tuple[str, str]:
-    for t, size in result["sizes"].items():
-      self.cache.set_download(t, size)
+  def _decide(self, kind: str, code: str, tiles: list[Tile], queued: list[Tile], result: dict) -> tuple[str, str]:
+    self._keep_sizes(result["sizes"])
     for t in result["no_data"]:
       self.cache.set_download(t, 0)
     self.cache.save()
@@ -292,7 +351,7 @@ class OfflineMaps:
       return self._backoff(reason)
     self.server_error = None
     on_disk, server = {}, {}
-    for t in tiles:
+    for t in tiles + queued:  # the head and every entry queued after it (a batch of countries is checked as a whole)
       stats = tile_stats(self.root, t)
       if stats is not None:
         on_disk[t] = stats[0]
@@ -307,7 +366,8 @@ class OfflineMaps:
                    deleter_first_written=replay.first_written, deleter_last_written=replay.last_written)
     if not b.ok:
       need, allowed = (b.maps_after + b.peak - b.maps_now) / 1e9, max(0, b.max_maps) / 1e9
-      self.message = f"{STOP_STORAGE}: {location_title(kind, code)} needs about {need:.1f} GB, " + \
+      names = ", ".join([location_title(kind, code)] + [location_title(*e) for e in self.updater.queue[1:]])
+      self.message = f"{STOP_STORAGE}: {names} need about {need:.1f} GB, " + \
                      f"maps may use {allowed:.1f} GB in all to keep {MIN_DRIVE_BUFFER_HOURS:.0f} h of drive recording"
       return STOP, STOP_STORAGE
     self._failures, self._server_wait = 0, ""
@@ -428,12 +488,22 @@ class OfflineMaps:
       "count": len(self.run_ids) if self.updater.busy else 0,
       "tiles_done": progress_done or 0, "tiles_total": len(entry_tiles(current_id)) if current_id else 0,
       "deletes_pending": list(self.pending_deletes),
+      "check": self._check_progress(),
+      "queue_tiles_total": sum(len(entry_tiles(i)) for i in self.run_ids) if self.updater.busy else 0,
+      "queue_tiles_done": (sum(len(entry_tiles(i)) for i in self.run_done if i in self.run_ids) + (progress_done or 0))
+                          if self.updater.busy else 0,
       "server_error": self.server_error if self.updater.busy else None,
       "retry_at": self._retry_wall if self.updater.busy and self._server_wait else 0,  # wall clock: constant while waiting
     }
     return {"version": STATUS_VERSION, "entries": entries, "order": ids, "run": run,
             "other": {"tiles": len(orphans), "bytes": sum(self._disk_info[t][0] for t in orphans)},
             "storage": self._storage, "message": self.message}
+
+  def _check_progress(self) -> dict | None:
+    job = self._check
+    if job is None or job["result"] is not None or not self.updater.busy:
+      return None
+    return {"location": job["id"], "done": job["done"], "total": job["total"]}
 
   def _write_status(self) -> None:
     status = self.status()

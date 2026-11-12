@@ -20,9 +20,9 @@ class OSMLayoutMulti(OSMLayout):
     self.items = [self._mapd_version, self._delete_maps_btn, *self._locations.items]
 
   def calculate_size(self):
-    """As upstream, but also counts the old copies moved aside and the download files of a running update."""
-    total_size = model.map_size(Paths.mapd_root())
-    self._delete_maps_btn.action_item.set_value(f"{total_size / 1024 ** 2:.2f} MB" if total_size < 1024 ** 3 else f"{total_size / 1024 ** 3:.2f} GB")
+    """As upstream, but also counts the old copies moved aside and the download files of a running update, and uses the
+    screen's units (MB / GB of 10^6 / 10^9 bytes; upstream divides by 1024^2), so it matches the per-country sizes."""
+    self._delete_maps_btn.action_item.set_value(model.size_text(model.map_size(Paths.mapd_root())))  # same units as every row
 
   def _delete_maps(self):
     self._show_confirm(tr("This will delete ALL downloaded maps and the list of countries\n\nAre you sure you want to delete all maps?"),
