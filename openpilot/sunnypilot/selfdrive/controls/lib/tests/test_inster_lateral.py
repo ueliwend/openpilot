@@ -6,6 +6,7 @@ See the LICENSE.md file in the root directory for more details.
 """
 import math
 import random
+from fractions import Fraction
 from unittest import mock
 
 import numpy as np
@@ -153,6 +154,123 @@ class TestInsterTable(OpenpilotTestCase):
       else:
         assert not ff_table_top(raw, v) and raw < top, (v, a)
     assert n > 10000 and n_old_missed > 0
+
+  # Plateau-test tables (A7 plateau fix, 12 Nov 2026). Sources (inster-dev, sha256 of the file):
+  #   d30x95  tools/fit/ff_joint/d30/table_summer.json (80a4150a0c8d...) x 0.95, rounded to 0.001 = the car's CMD_RAW (asserted below)
+  #   d31     tools/fit/ff_joint/d31/table_joint.json  (4c1ed393bd98...) x 1.00 (rtk100's table, top 409)
+  #   d26     tools/fit/ff_joint/d26/table_new.json    (28894b55b6cc...) (the table of fb352a1, top 409)
+  #   c19a1b0 tools/simkit/sim/candidates.py CMD_RAW_CAR (759de6e32c86...) (the table of b7704b3 / c19a1b0, top 409)
+  PLATEAU_TABLES = {
+    'd30x95': (
+      (0.0, 21.47, 45.315, 92.34, 165.68, 257.45, 299.915, 356.82, 388.55, 388.55, 388.55),
+      (0.0, 21.47, 45.315, 92.34, 135.66, 164.065, 198.075, 291.27, 348.65, 388.55, 388.55),
+      (0.0, 18.335, 45.315, 92.34, 127.3, 158.08, 186.485, 245.67, 300.2, 344.375, 370.405),
+      (0.0, 18.335, 37.81, 60.99, 93.385, 120.46, 149.34, 235.22, 287.28, 322.05, 351.215),
+      (0.0, 18.335, 36.1, 54.815, 81.035, 107.635, 137.085, 217.55, 279.775, 315.59, 343.52),
+    ),
+    'd31': (
+      (0.0, 22.6, 47.9, 98.6, 174.8, 270.9, 316.0, 375.7, 409.0, 409.0, 409.0),
+      (0.0, 22.6, 47.9, 97.5, 142.8, 172.7, 208.3, 306.7, 366.4, 409.0, 409.0),
+      (0.0, 19.2, 47.9, 97.5, 133.9, 166.5, 196.4, 258.5, 316.2, 362.0, 389.6),
+      (0.0, 19.2, 40.1, 64.1, 97.9, 126.5, 157.2, 246.9, 302.0, 338.2, 368.1),
+      (0.0, 19.2, 38.0, 57.6, 85.0, 112.7, 143.3, 226.6, 293.5, 331.3, 360.3),
+    ),
+    'd26': (
+      (0.0, 22.6, 48.9, 102.1, 183.3, 275.8, 321.2, 387.9, 409.0, 409.0, 409.0),
+      (0.0, 22.6, 48.9, 96.9, 139.9, 167.6, 201.0, 303.3, 370.6, 409.0, 409.0),
+      (0.0, 19.1, 48.9, 96.9, 130.6, 166.0, 201.0, 253.9, 315.0, 360.4, 389.7),
+      (0.0, 19.1, 39.8, 63.8, 96.0, 123.1, 155.9, 239.7, 299.1, 337.2, 367.7),
+      (0.0, 19.1, 38.3, 56.3, 80.6, 110.2, 145.5, 228.6, 291.7, 328.3, 357.9),
+    ),
+    'c19a1b0': (
+      (0.0, 23.0, 51.0, 115.0, 210.6, 303.8, 352.2, 409.0, 409.0, 409.0, 409.0),
+      (0.0, 23.0, 48.0, 97.8, 136.8, 175.2, 233.4, 314.7, 387.2, 409.0, 409.0),
+      (0.0, 21.1, 48.0, 95.4, 121.8, 150.6, 183.0, 267.9, 328.0, 396.8, 409.0),
+      (0.0, 19.8, 39.0, 67.9, 97.9, 130.3, 168.6, 267.9, 328.0, 396.8, 409.0),
+      (0.0, 19.8, 38.8, 57.7, 85.2, 115.8, 154.0, 251.0, 318.6, 389.9, 409.0),
+    ),
+  }
+
+  @staticmethod
+  def _exact_table(tbl, a, v):
+    """the table's exact value (Fraction) at |a| (m/s^2) and speed v (m/s), bilinear on the float weights, and its exact top"""
+    j, w = inster_lateral._table_speed_cell(v)
+    fw = Fraction(w)
+    cell = lambda i: (1 - fw) * Fraction(tbl[j][i]) + fw * Fraction(tbl[j + 1][i])
+    top = cell(len(A_NODES) - 1)
+    if a >= A_NODES[-1]:
+      return top, top
+    i = max(k for k in range(len(A_NODES) - 1) if A_NODES[k] <= a)
+    fa = Fraction(a)
+    c0, c1 = cell(i), cell(i + 1)
+    return c0 + (c1 - c0) * (fa - Fraction(A_NODES[i])) / (Fraction(A_NODES[i + 1]) - Fraction(A_NODES[i])), top
+
+  def _check_plateau(self, tbl, speeds, a_plateau, a_below):
+    """ff_table_top of the command the controller tests (ff_raw clipped to the cap, as _ramp_shift does) equals the exact answer
+    (|command| >= the table's exact top) at every speed; returns the number of evaluations"""
+    cap = inster_lateral.MPC_RAMP_CAP
+    n = 0
+    with mock.patch.object(inster_lateral, 'CMD_RAW', tbl):
+      for v in speeds:
+        j, w = inster_lateral._table_speed_cell(v)
+        top_f = inster_lateral._table_top_raw(j, w)
+        lo, hi = sorted((tbl[j][-1], tbl[j + 1][-1]))
+        assert lo <= top_f <= hi, (v, top_f)                           # the blend never leaves the cells (never above the cap)
+        if lo == hi:
+          assert top_f == lo, (v, top_f)                               # equal cells: exactly the cell
+        for a in a_plateau + a_below:
+          raw = inster_lateral.ff_raw(a, v)
+          clipped = cap if raw > cap else (-cap if raw < -cap else raw)
+          tex, top_ex = self._exact_table(tbl, abs(a), v)
+          expect = abs(Fraction(clipped)) >= top_ex if a in a_below else top_ex <= Fraction(cap)
+          if a in a_below and abs(tex - top_ex) < Fraction(1, 10 ** 9) and tex != top_ex:
+            continue                                                   # within rounding of the knee: float and exact may differ
+          assert ff_table_top(clipped, v) is expect and ff_table_top(-clipped, v) is expect, (v, a, clipped, top_f, expect)
+          n += 1
+    return n
+
+  def test_plateau_test_exact_on_tables_all_speeds(self):
+    # A7 plateau fix (12 Nov 2026): the plateau test on the command _ramp_shift tests (ff_raw clipped to 409) equals the exact answer at
+    # every speed 0-160 km/h (0.01 km/h steps and the node speeds) for the car's table (d30x95) and the tables that reach 409 at the top
+    # (d31 = rtk100's, d26, c19a1b0). Before the fix 2.4-2.5 % of the plateau evaluations of the 409 tables tested False.
+    assert self.PLATEAU_TABLES['d30x95'] == CMD_RAW
+    speeds = [k / 100.0 / 3.6 for k in range(0, 16001)] + list(inster_lateral.V_NODES)
+    for name, tbl in self.PLATEAU_TABLES.items():
+      n = self._check_plateau(tbl, speeds, [3.5, 3.5000001, 4.0, 6.0, 100.0], [])
+      assert n == 5 * len(speeds), name
+      n = self._check_plateau(tbl, speeds[::5], [], [0.0, 0.1, 1.0, 2.0, 3.0, 3.25, 3.4, 3.4999999])
+      assert n > 0, name
+
+  def test_plateau_test_old_blend_missed_409(self):
+    # the cause, kept as a regression: the plain blend of two 409 cells exceeds 409.0 at some speeds, the clipped command then missed it
+    n = 0
+    for k in range(0, 16001):
+      j, w = inster_lateral._table_speed_cell(k / 100.0 / 3.6)
+      if j + 1 < len(CMD_RAW) and (1.0 - w) * 409.0 + w * 409.0 > 409.0:
+        n += 1
+        assert inster_lateral._row_blend(409.0, 409.0, w) == 409.0
+    assert n > 100
+
+  def test_plateau_test_exact_on_any_table_top(self):
+    # tops below the cap, exactly 409, above it, and mixed: random speeds and random tops; the test equals the exact answer
+    # (a command on the plateau tests True unless the top is above the cap: a command clipped at 409 never reaches a top above 409)
+    rng = random.Random(409409)
+    base = self.PLATEAU_TABLES['d26']
+    for tops in ((380.0,) * 5, (409.0,) * 5, (420.0,) * 5, (409.0, 409.0, 396.8, 396.8, 409.0), (409.0, 430.0, 409.0, 409.0, 400.0),
+                 (388.55, 409.0, 409.0, 409.0, 409.0), (409.0, 409.0, 409.0, 409.0, 409.0 - 1e-12)):
+      tbl = tuple(tuple(r[:-1]) + (t,) for r, t in zip(base, tops))
+      speeds = [rng.uniform(0.0, 160.0) / 3.6 for _ in range(3000)]
+      cap = inster_lateral.MPC_RAMP_CAP
+      with mock.patch.object(inster_lateral, 'CMD_RAW', tbl):
+        for v in speeds:
+          j, w = inster_lateral._table_speed_cell(v)
+          lo, hi = sorted((tbl[j][-1], tbl[j + 1][-1]))
+          top_ex = (1 - Fraction(w)) * Fraction(tbl[j][-1]) + Fraction(w) * Fraction(tbl[j + 1][-1])
+          if abs(top_ex - Fraction(cap)) < Fraction(1, 10 ** 9) and lo != hi:
+            continue                                                   # a top within rounding of the cap, from two different cells
+          raw = inster_lateral.ff_raw(5.0, v)
+          clipped = cap if raw > cap else raw
+          assert ff_table_top(clipped, v) is (top_ex <= Fraction(cap)), (tops, v, clipped)   # a=5 is on the plateau: True unless the top is above the cap
 
   def test_zero_at_zero(self):
     for v in SPEEDS:

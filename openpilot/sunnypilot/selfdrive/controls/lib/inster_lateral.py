@@ -164,11 +164,24 @@ def _table_speed_cell(v_ego: float) -> tuple[int, float]:
   return j, (v_ego - vn[j]) / (vn[j + 1] - vn[j])
 
 
+def _row_blend(x0: float, x1: float, w: float) -> float:
+  """one table cell blended between two speed rows (weight w on x1): (1 - w) x0 + w x1, kept inside [min(x0, x1), max(x0, x1)] and
+  exactly the cell where the two rows hold the same value. The plain expression can round to 1 ulp above the larger cell (409.0 and
+  409.0 at w = 0.5 give 409.00000000000006 at some speeds), and a table value above its largest cell is above the steering cap."""
+  if x0 == x1:
+    return x0
+  y = (1.0 - w) * x0 + w * x1
+  lo, hi = (x0, x1) if x0 < x1 else (x1, x0)
+  return lo if y < lo else (hi if y > hi else y)
+
+
 def _table_top_raw(j: int, w: float) -> float:
-  """the table's top (raw) at the speed cell (j, w): its value on the plateau. ff_table_top and table_raw use this one expression,
-  so a command read off the plateau is recognised as the plateau exactly (12 Nov 2026, A7: the table is read in raw units; before, it
-  was read as a fraction of 384 and multiplied back, and the plateau test missed 15 % of plateau commands at 32-111 km/h)."""
-  return (1.0 - w) * CMD_RAW[j][-1] + w * CMD_RAW[j + 1][-1]
+  """the table's top (raw) at the speed cell (j, w): its value on the plateau. ff_table_top, ff_table_inverse and table_raw use this
+  one expression, so a command read off the plateau is recognised as the plateau exactly (12 Nov 2026, A7: the table is read in raw
+  units; before, it was read as a fraction of 384 and multiplied back, and the plateau test missed 15 % of plateau commands at 32-111
+  km/h). The blend never exceeds the table's largest cell, so a top of 409 stays 409.0 and the clip to the cap (MPC_RAMP_CAP) leaves
+  a plateau command unchanged: the test cannot miss it (A7 plateau fix, 12 Nov 2026; before: 409.00000000000006 > the clipped 409.0)."""
+  return _row_blend(CMD_RAW[j][-1], CMD_RAW[j + 1][-1], w)
 
 
 def table_raw(a_abs: float, v_ego: float) -> float:
@@ -183,8 +196,8 @@ def table_raw(a_abs: float, v_ego: float) -> float:
   i = 0
   while a_abs >= an[i + 1]:
     i += 1
-  c0 = (1.0 - w) * t0[i] + w * t1[i]
-  c1 = (1.0 - w) * t0[i + 1] + w * t1[i + 1]
+  c0 = _row_blend(t0[i], t1[i], w)
+  c1 = _row_blend(t0[i + 1], t1[i + 1], w)
   return c0 + (c1 - c0) * (a_abs - an[i]) / (an[i + 1] - an[i])
 
 
@@ -887,8 +900,8 @@ def ff_table_inverse(raw: float, v_ego: float) -> float:
   an = A_NODES
   a = an[-1]
   for i in range(len(an) - 1):
-    c0 = (1.0 - w) * t0[i] + w * t1[i]
-    c1 = (1.0 - w) * t0[i + 1] + w * t1[i + 1]
+    c0 = _row_blend(t0[i], t1[i], w)
+    c1 = _row_blend(t0[i + 1], t1[i + 1], w)
     if c1 >= r:
       a = an[i] + (r - c0) * (an[i + 1] - an[i]) / (c1 - c0)
       break
@@ -897,7 +910,8 @@ def ff_table_inverse(raw: float, v_ego: float) -> float:
 
 def ff_table_top(raw: float, v_ego: float) -> bool:
   """|raw| at or above the table's top at v_ego (the plateau, where ff_table_inverse answers the knee). Raw units on both sides and
-  the same expression as table_raw's plateau, so every command ff_raw returns on the plateau tests True."""
+  the same expression as table_raw's plateau, so every command ff_raw returns on the plateau tests True, also after the clip to the
+  cap (the top never exceeds the table's largest cell, <= 409, so the clip leaves it unchanged; tops above the cap are not clipped here)."""
   j, w = _table_speed_cell(v_ego)
   return abs(raw) >= _table_top_raw(j, w)
 
