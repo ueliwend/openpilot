@@ -483,17 +483,17 @@ class TestYieldCap:
     ctl, rows = swerve_run(+1)
     assert rows[90][0] > 0.0  # pulled right before the swerve
     v = 13.0
-    prev_s_c = None
+    prev_c = None
     windows = 0
     for c, q, s, active, _cap, rel, _i in rows[100:]:
-      s_c = s * c
-      if active and q >= br.Q_NO_GROWTH and prev_s_c is not None:
-        assert s_c <= max(prev_s_c, 0.0) + 1e-12  # no growth from q = 0.1 m
+      s_c = s * c  # s is this frame's capped side (+1 here; 0 outside a no-growth phase)
+      if active and q >= br.Q_NO_GROWTH and prev_c is not None:
+        assert s_c <= max(s * prev_c, 0.0) + 1e-12  # no growth from q = 0.1 m
       if active and not rel and q >= br.Q_CAP_FULL:
         assert s_c <= 1e-6  # the hard rule: zero correction toward the obstacle side, outside cap-release windows
       if rel:
         windows += 1
-      prev_s_c = s_c
+      prev_c = c
     last = rows[-1]
     assert last[3] and last[0] * last[2] <= 1e-6
     # the release never exceeds the 5 m/s^3 of controlsd's clip_curvature
@@ -522,17 +522,25 @@ class TestYieldCap:
     assert not ctl.result.yield_active
 
   def test_early_cap_ramp(self):
+    # a slow swerve to the left (obstacle on the right): between q 0.15 and 0.2 m the toward-obstacle correction is at most the cap
+    # memory times (0.2 - q) / 0.05, and from 0.2 m it is 0 (outside the cap-release window)
     ctl = BlendfulCorrection()
     for _ in range(100):
       ctl.update(Scene(v=13.0).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
-    start = ctl.c
-    assert start > 0.0
-    qs = []
-    for i in range(100):
-      sw = 0.001 * i  # slow swerve to the left
+    assert ctl.c > 0.0
+    in_ramp = 0
+    for i in range(200):
+      sw = 0.002 * i
       ctl.update(Scene(v=13.0, plan=-sw).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
-      qs.append(ctl.result.yield_q)
-    assert max(qs) > 0.0
+      q = ctl.result.caps.get(br.SIDE_RIGHT)
+      if q is None:
+        continue
+      mem = ctl.cap_mem[br.SIDE_RIGHT]
+      allowed = mem * float(np.clip((br.Q_CAP_FULL - q) / (br.Q_CAP_FULL - br.Q_CAP_START), 0.0, 1.0))
+      if not ctl.release_window:
+        assert ctl.c <= allowed + 1e-12
+      in_ramp += br.Q_CAP_START < q < br.Q_CAP_FULL
+    assert in_ramp > 0
 
 
 
@@ -566,8 +574,8 @@ class TestGroundFixedTarget:
     rl, logs = frames_of(scenes)
     logs = logs[100:]
     raw = np.array([lg['t_raw'] for lg in logs[100:]])
-    if centre == 0.5:
-      assert np.max(np.abs(np.diff(raw, axis=0))) > 0.2  # the flicker really moves the raw target (the old anchor jumped up to 5.5 m)
+    # round 2's left limit switched formula at q 0.5 and moved the raw target 0.23 m per switch; with the hysteresis (S4) it does not
+    assert np.max(np.abs(np.diff(raw, axis=0))) < 0.01
     tgs = [lg['t_lim'] for lg in logs[100:]]
     d = moves_of(tgs)
     assert d.min() >= -br.TARGET_RATE_LEFT * DT_MDL - 1e-9 and d.max() <= br.MOVE_RATE_RIGHT * DT_MDL + 1e-9
@@ -1163,13 +1171,13 @@ class TestYieldRules:
     for i in range(400):
       sw = 0.0 if i < 100 else min(0.8, 0.8 * (i - 100) * DT_MDL / 3.0)
       ctl2.update(Scene(v=13.0, plan=-sw).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
-      mems.append(ctl2.cap_mem)
+      mems.append(ctl2.cap_mem.get(br.SIDE_RIGHT))
     m = [x for x in mems if x is not None]
     assert m and all(b <= a + 1e-15 for a, b in zip(m[:-1], m[1:], strict=True))  # non-increasing for as long as it lives
-    # the swerve ends: the memory is released with the yield (None again once the latch released)
+    # the swerve ends: the memory is released with the yield (empty again once the latch released)
     for _ in range(1500):  # the usual follows the swerve with tau 10 s, so the yield ends within about a minute
       ctl2.update(Scene(v=13.0, plan=0.0).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
-    assert ctl2.cap_mem is None
+    assert ctl2.cap_mem == {}
 
   def test_no_growth_toward_the_obstacle_between_q_0_1_and_0_2(self):
     ctl = BlendfulCorrection()
@@ -1178,10 +1186,11 @@ class TestYieldRules:
     for i in range(500):
       sw = 0.0 if i < 100 else min(0.35, 0.35 * (i - 100) * DT_MDL / 6.0) if i < 300 else max(0.0, 0.35 - 0.35 * (i - 300) * DT_MDL / 6.0)
       ctl.update(Scene(v=13.0, plan=-sw).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
-      s_c = ctl.result.yield_side * ctl.c
+      s = ctl.result.yield_side
       if ctl.result.no_growth and prev is not None and ctl.result.yield_q < br.Q_CAP_FULL:
-        worst = max(worst, s_c - max(prev, 0.0))
-      prev = s_c
+        assert s in (1, -1)
+        worst = max(worst, s * ctl.c - max(s * prev, 0.0))
+      prev = ctl.c
     assert worst <= 1e-12
 
 
@@ -1432,7 +1441,11 @@ class TestLogging:
     assert abs(msg.blendfulWidthMemory - lg['width_mem']) < 1e-6 and msg.blendfulWidthMemoryState & 1
     assert abs(msg.blendfulFrameDt - DT_MDL) < 1e-6 and abs(msg.blendfulPlanSpeed - 20.0) < 1e-6
     assert msg.blendfulRoadClass == lg['road_class'] and abs(msg.blendfulTargetLag - lg['target_lag']) < 1e-6
-    assert msg.blendfulFadeSplit == 1.0 and not msg.blendfulJunctionHold and not msg.blendfulJunctionLatched  # superseded fields stay constant
+    assert msg.blendfulCentreSource == lg['centre_source'] and not msg.blendfulNonFinite
+    for gone in ('blendfulFadeSplit', 'blendfulRho', 'blendfulBias', 'blendfulJunctionLatched', 'blendfulJunctionRamp', 'blendfulJunctionHold',
+                 'blendfulSplitScore'):  # the first implementation's superseded fields are dropped from the schema (round 3)
+      with pytest.raises(AttributeError):
+        getattr(msg, gone)
 
   def test_fill_log_in_off_writes_only_the_mode_block(self):
     from openpilot.cereal import custom
@@ -1441,3 +1454,214 @@ class TestLogging:
     msg = custom.ModelDataV2SP.new_message()
     br.fill_log(msg, ctl, MODE_OFF, 13.0)
     assert msg.blendfulMode == MODE_OFF and msg.blendfulAuthority == 0.0
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# round 3 (review of round 2): trigger aggregator (B1), centre-limit hysteresis (S4), non-finite guard (S3), scale hypotheses and lag bound (S6)
+def report(name, no_growth=True, q=0.15, side=0, active=None):
+  return br.TriggerReport(name, no_growth, no_growth if active is None else active, q, side)
+
+
+class TestYieldAggregator:
+  def test_no_trigger_no_phase(self):
+    agg = br.YieldAggregator()
+    assert agg.update([report('a', no_growth=False), report('b', no_growth=False)]) == (False, False, {})
+    assert not agg.phase
+
+  def test_a_trigger_supplies_its_side_and_q(self):
+    agg = br.YieldAggregator()
+    ng, active, caps = agg.update([report('gap', q=0.17, side=br.SIDE_RIGHT, active=False), report('ref', no_growth=False)])
+    assert ng and not active and caps == {br.SIDE_RIGHT: 0.17}
+
+  def test_unknown_side_caps_both_until_it_is_known_then_only_that_side(self):
+    agg = br.YieldAggregator()
+    _, _, caps = agg.update([report('ref', q=0.2, side=0)])
+    assert caps == {br.SIDE_RIGHT: 0.2, br.SIDE_LEFT: 0.2}
+    _, _, caps = agg.update([report('ref', q=0.2, side=br.SIDE_LEFT)])
+    assert caps == {br.SIDE_LEFT: 0.2}
+
+  def test_the_side_is_latched_for_the_phase(self):
+    agg = br.YieldAggregator()
+    agg.update([report('gap', q=0.3, side=br.SIDE_RIGHT)])
+    _, _, caps = agg.update([report('gap', q=0.3, side=br.SIDE_LEFT)])  # the departure changes sign while the phase runs: no flip
+    assert caps == {br.SIDE_RIGHT: 0.3}
+
+  def test_disagreeing_triggers_cap_both_sides(self):
+    agg = br.YieldAggregator()
+    _, active, caps = agg.update([report('gap', q=0.25, side=br.SIDE_RIGHT), report('ref', q=0.2, side=br.SIDE_LEFT)])
+    assert active and caps == {br.SIDE_RIGHT: 0.25, br.SIDE_LEFT: 0.2}
+
+  def test_a_side_stays_capped_while_the_phase_runs_and_everything_resets_at_its_end(self):
+    agg = br.YieldAggregator()
+    agg.update([report('gap', q=0.25, side=br.SIDE_RIGHT), report('ref', no_growth=False)])
+    _, _, caps = agg.update([report('gap', no_growth=False), report('ref', q=0.2, side=br.SIDE_LEFT)])
+    assert caps == {br.SIDE_RIGHT: 0.0, br.SIDE_LEFT: 0.2}  # the right side keeps no growth (q 0); its cap memory can only fall
+    agg.update([report('gap', no_growth=False), report('ref', no_growth=False)])
+    assert not agg.phase and agg.latched == {} and agg.sides == set()
+    _, _, caps = agg.update([report('gap', q=0.12, side=br.SIDE_LEFT)])
+    assert caps == {br.SIDE_LEFT: 0.12}
+
+  def test_a_third_trigger_with_a_fixed_side_fits(self):
+    # rev 6 B6a: the radar clearance check is one more report, always with the right as its side
+    agg = br.YieldAggregator()
+    _, active, caps = agg.update([report('gap', no_growth=False), report('ref', no_growth=False),
+                                  report('radar_clearance', q=br.Q_CAP_FULL, side=br.SIDE_RIGHT)])
+    assert active and caps == {br.SIDE_RIGHT: br.Q_CAP_FULL}
+
+  def test_log_side(self):
+    assert br.log_side({}) == 0 and br.log_side({br.SIDE_RIGHT: 0.1}) == 1 and br.log_side({br.SIDE_LEFT: 0.1}) == -1
+    assert br.log_side({br.SIDE_RIGHT: 0.1, br.SIDE_LEFT: 0.1}) == br.LOG_SIDE_BOTH
+
+  def test_both_sides_capped_lets_nothing_grow_in_either_direction(self):
+    # BlendfulCorrection with caps on both sides: the correction can only shrink toward 0, whatever its sign
+    for sign in (1.0, -1.0):
+      ctl = BlendfulCorrection()
+      ctl.c = sign * 1e-3
+      rl = ctl.right
+      rl.update = lambda *a, sign=sign, **k: br.RightResult(k0=sign * 1.0, no_growth=True, yield_active=True,
+                                                              caps={br.SIDE_RIGHT: br.Q_CAP_FULL, br.SIDE_LEFT: br.Q_CAP_FULL})
+      cs = []
+      for _ in range(40):
+        ctl.update(Scene(v=13.0).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
+        cs.append(ctl.c)
+      mags = np.abs([sign * 1e-3] + cs)
+      assert np.all(np.diff(mags) <= 1e-15) and cs[-1] == 0.0
+
+
+class TestCentreLimitSource:
+  def test_two_references_from_0_5_and_back_to_one_below_0_4(self):
+    cs = br.CentreLimitSource()
+    assert cs.update(0.9, 0.45) == cs.RIGHT
+    assert cs.update(0.9, 0.51) == cs.BOTH
+    assert cs.update(0.9, 0.41) == cs.BOTH  # inside the band: no switch
+    assert cs.update(0.9, 0.39) == cs.RIGHT
+    assert cs.update(0.9, 0.49) == cs.RIGHT
+
+  def test_one_reference_side_changes_only_with_a_clear_quality_lead(self):
+    cs = br.CentreLimitSource()
+    assert cs.update(0.35, 0.3) == cs.RIGHT
+    assert cs.update(0.35, 0.44) == cs.RIGHT  # left better by 0.09: keep the right
+    assert cs.update(0.30, 0.45) == cs.LEFT  # by more than 0.1: switch
+    assert cs.update(0.42, 0.40) == cs.LEFT
+
+  def test_per_frame_flicker_across_0_5_switches_once(self):
+    rng = np.random.default_rng(3)
+    cs = br.CentreLimitSource()
+    srcs = [cs.update(0.9, 0.5 + 0.08 * (2 * rng.random() - 1)) for _ in range(400)]
+    assert sum(a != b for a, b in zip(srcs[:-1], srcs[1:], strict=True)) <= 1
+
+
+class TestNonFiniteGuard:
+  def test_finite_model_inputs_checks_what_the_instances_read(self):
+    ok = Scene(v=13.0, edges=True).model_output()
+    assert br.finite_model_inputs(ok, 13.0, 0.0)
+    assert not br.finite_model_inputs(ok, float('nan'), 0.0)
+    for key, idx in (('lane_lines', (0, 3, 5, 0)), ('lane_lines_stds', (0, 1, 5, 0)), ('lane_lines_prob', (0, 3)), ('road_edges', (0, 1, 7, 0)),
+                     ('road_edges_stds', (0, 0, 7, 0)), ('plan', (0, 4, 1)), ('plan', (0, 4, Plan.VELOCITY.start)),
+                     ('plan', (0, 0, Plan.ORIENTATION_RATE.start + 2))):
+      mo = Scene(v=13.0, edges=True).model_output()
+      mo[key][idx] = np.nan
+      assert not br.finite_model_inputs(mo, 13.0, 0.0), (key, idx)
+    mo = Scene(v=13.0).model_output()
+    mo['plan'][0, :, Plan.ACCELERATION.start] = np.nan  # a column no instance reads
+    assert br.finite_model_inputs(mo, 13.0, 0.0)
+    # without the right-line instance only what upstream's Blendful and the gain F read counts
+    for key, idx, read_by_upstream in (('lane_lines', (0, 0, 5, 0), False), ('lane_lines', (0, 3, 5, 0), False), ('lane_lines_prob', (0, 7), False),
+                                       ('road_edges', (0, 1, 7, 0), False), ('plan', (0, 0, Plan.ORIENTATION_RATE.start + 2), False),
+                                       ('lane_lines', (0, 1, 5, 0), True), ('lane_lines_stds', (0, 2, 5, 0), True), ('lane_lines_prob', (0, 5), True),
+                                       ('plan', (0, 4, 0), True), ('plan', (0, 4, Plan.VELOCITY.start), True)):
+      mo = Scene(v=13.0, edges=True).model_output()
+      mo[key][idx] = np.nan
+      assert br.finite_model_inputs(mo, 13.0, 0.0, right_line=False) != read_by_upstream, (key, idx)
+
+  def test_regular_without_the_right_line_instance_ignores_values_upstream_does_not_read(self):
+    # a non-finite far-right lane line: today's add-on does not read it, so Regular delivers it exactly
+    ctl, ref = BlendfulCorrection(), Blendful()
+    for i in range(200):
+      mo = Scene(v=13.0, center=0.4).model_output()
+      if i % 7 == 0:
+        mo['lane_lines'][0, 3, :, 0] = np.nan
+      ctl.update(mo, 13.0, True, 0.0, LAT_T, MODE_REGULAR, RightInputs())
+      up = ref.update(mo, 13.0, True, 0.0, enabled=True)
+      assert not ctl.invalid and abs(ctl.c - up) <= 1e-12
+
+  def test_invalid_frame_resets_the_instances_and_is_logged(self):
+    from openpilot.cereal import custom
+    ctl = BlendfulCorrection()
+    drive(ctl, [Scene(v=13.0, center=0.4)] * 100)
+    assert ctl.right.filters[2].initialized and ctl.reference.trust > 0.0
+    mo = Scene(v=13.0).model_output()
+    mo['lane_lines'][0, 1, 3, 0] = np.inf
+    ctl.update(mo, 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
+    assert ctl.invalid and not ctl.right.filters[2].initialized and ctl.reference.trust == 0.0 and ctl.right_idle
+    msg = custom.ModelDataV2SP.new_message()
+    br.fill_log(msg, ctl, MODE_RIGHT, 13.0)
+    assert msg.blendfulNonFinite
+    drive(ctl, [Scene(v=13.0, center=0.4)] * 5)
+    assert not ctl.invalid
+
+  def test_non_finite_speed_keeps_the_last_speed_for_the_limiter(self):
+    ctl = BlendfulCorrection()
+    drive(ctl, [Scene(v=20.0, center=0.4)] * 150)
+    c0 = ctl.c
+    ctl.update(Scene(v=20.0, center=0.4).model_output(), float('nan'), True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
+    assert np.isfinite(ctl.c) and abs(ctl.c - c0) <= br.RELEASE / 20.0 ** 2 * DT_MDL + 1e-15
+
+
+def k1_world(world: str, s: float, v: float = 14.0, k: float = 1 / 100):
+  """Steady right circle R 100 m at 14 m/s with the plan speed v_x(0) = s vEgo, under one of the two K1 hypotheses (review S1 / S6):
+  H_axis: the lines' x axis carries the model's distance scale (x_model = s x_true), vEgo true; H_vego: the model's x is true metres and
+  vEgo reads low by 1/s (the true speed is s vEgo)."""
+  if world == 'H_axis':
+    return Scene(v=v, k=k, lever=True, vx_scale=s).model_output()
+  mo = Scene(v=v * s, k=k, lever=True).model_output()  # true geometry at the true speed s v
+  return mo
+
+
+class TestScaleHypotheses:
+  """Review S6: the 2 x 2 case.  The filter's rotation lever uses scale = vEgo / v_x(0) (round 2, unchanged in round 3 Part 1; the choice is
+  rev 6.3's, review S1).  Each variant is exact under its own hypothesis and biased under the other, so neither the steady-circle tests nor
+  the replay's sign argument decide K1; the E1 re-run has to."""
+  @pytest.mark.parametrize("world,s,variant,lo,hi", [
+    ('H_axis', 1.05, 'scaled', -0.01, 0.01), ('H_axis', 0.95, 'scaled', -0.01, 0.01),
+    ('H_vego', 1.05, 'scaled', 0.08, 0.16), ('H_vego', 0.95, 'scaled', -0.16, -0.08),
+    ('H_axis', 1.05, 'unscaled', -0.16, -0.08), ('H_axis', 0.95, 'unscaled', 0.08, 0.16),
+    ('H_vego', 1.05, 'unscaled', -0.01, 0.01), ('H_vego', 0.95, 'unscaled', -0.01, 0.01),
+  ])
+  def test_right_line_filter_bias_at_L(self, world, s, variant, lo, hi, monkeypatch):
+    if variant == 'unscaled':  # design B2 verbatim: the rotation acts at x
+      orig = br.motion_predict
+      monkeypatch.setattr(br, 'motion_predict', lambda y, vx0, yr, dt, scale=1.0: orig(y, vx0, yr, dt, 1.0))
+    rl = RightLineBlendful()
+    for _ in range(400):
+      res = rl.update(k1_world(world, s), 14.0, True, 1 / 100, 0.0, RightInputs())
+    assert lo <= float(res.log['filter_offset'][2]) <= hi
+
+
+class TestLagBoundUnderFarFieldErrors:
+  """Review S1 / S6: a harder lag-bound fixture than test_lag_bound_holds_under_a_systematic_prediction_error (0.015 m per frame).  The
+  design's claim |T_lim - T_raw| <= 1.0 m (R5-3) does not hold once far-field prediction errors exceed the 0.025 m per frame of the lag-bound
+  rate, because the ground-fixed shift carries them inward.  Strict xfail: the test turns into a failure as soon as the bound holds."""
+  XFAIL = pytest.mark.xfail(strict=True, reason="review S1: lag bound vs far-field errors; deferred to design rev 6.3 (Part 2)")
+
+  @XFAIL
+  @pytest.mark.parametrize("yaw_bias", [0.01, -0.01])
+  def test_target_lag_under_a_yaw_rate_bias(self, yaw_bias):
+    # 0.01 rad/s mispredicts the far field by up to 0.01 x 0.05 s x 190 m = 0.095 m per frame (lag at 30 m: 5.3 m in round 2 / 3)
+    gt = GroundTarget()
+    raw = np.full(br.NX, 0.3)
+    worst = 0.0
+    for _ in range(600):
+      gt.update(raw, 20.0, yaw_bias, DT_MDL)
+      worst = max(worst, float(np.abs(np.interp(30.0, X, gt.lag))))
+    assert worst <= br.LAG_BOUND + br.LAG_RATE * DT_MDL + 1e-6
+
+  @XFAIL
+  @pytest.mark.parametrize("s", [1.05, 0.95])
+  def test_target_lag_under_the_other_scale_hypothesis(self, s):
+    # the reviewer's S6 case: H_vego world, the implemented scale: lag at L +3.9 / -4.2 m in round 2 / 3
+    rl = RightLineBlendful()
+    for _ in range(400):
+      res = rl.update(k1_world('H_vego', s), 14.0, True, 1 / 100, 0.0, RightInputs())
+    lag = float(np.interp(1.5 * 14.0, X, res.log['t_lim'] - res.log['t_raw']))
+    assert abs(lag) <= br.LAG_BOUND + br.LAG_RATE * DT_MDL + 1e-6

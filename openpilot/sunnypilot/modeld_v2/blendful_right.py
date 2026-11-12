@@ -1,8 +1,10 @@
 """
 Right-line Blendful ("keep right", task A8): follows the right lane line (or road edge) at a speed dependent gap, never left of the lane
 centre, and hands back to regular upstream Blendful where the right reference is not usable.  Design: inster-dev
-results/2026-11-12_a8_right_line_blendful/DESIGN.md rev 5.1 (section letters B.. below refer to it); this is implementation round 2
-(results/2026-11-12_a8_impl_r2), which answers the E1 replay causes C1-C11 / K1 (results/2026-11-12_a8_replay).
+results/2026-11-12_a8_right_line_blendful/DESIGN.md rev 5.1 / 6.2 (section letters B.. below refer to it); implementation round 2
+(results/2026-11-12_a8_impl_r2) answers the E1 replay causes C1-C11 / K1 (results/2026-11-12_a8_replay), round 3 Part 1
+(results/2026-11-12_a8_impl_r3) the review of round 2: trigger aggregator with per-trigger obstacle sides (B1), the yield cap whenever this
+instance runs (B2), yield state reset while fading (S2), non-finite guard (S3), centre-limit hysteresis (S4), whole update time (S5).
 
 Everything is expressed as a lateral plan shift (plan_correction.py): the profile amplitude k0 is the quantity that is blended, capped
 and rate limited; the instantaneous desired-curvature correction is c = F k0 (F per frame with the plan's own v_x(0), C11).
@@ -73,7 +75,13 @@ EPISODE_WIDENING, EPISODE_WIDENING_TIME, EPISODE_MAX = 0.15, 1.0, 300.0  # m, s,
 WIDTH_TAU, WIDTH_STALE, WIDTH_REMEASURE = 10.0, 20.0, 2.0  # s
 # road class (B5 table, C4)
 ROAD_DWELL = 5.0  # s
-BLINKER_MAX_SPEED = 32 / 3.6
+# yield trigger aggregation (B6 / C8; review B1, N10)
+SIDE_KNOWN = 0.1  # m: a trigger knows the obstacle side once its own departure exceeds this ("the side of the first departure > 0.1 m")
+SIDE_RIGHT, SIDE_LEFT = 1, -1
+BOTH_SIDES = (SIDE_RIGHT, SIDE_LEFT)
+LOG_SIDE_BOTH = 2  # log value of the yield side while both directions are capped
+# left-limit formula hysteresis (review S4): two references from q > 0.5 on both sides, back to one when either falls below 0.4
+CENTRE_BOTH_ON, CENTRE_BOTH_OFF, CENTRE_SIDE_SWITCH = 0.5, 0.4, 0.1
 # episode end reasons and road classes (log)
 END_NONE, END_QUIET, END_WIDENING, END_MAX = 0, 1, 2, 3
 ROAD_EDGES, ROAD_SHARED, ROAD_LANES, ROAD_MOTORWAY = 0, 1, 2, 3
@@ -458,6 +466,9 @@ class JunctionEpisodes:
 class EndpointGap:
   """Model-independent yield trigger (B6, C7, R5-4).  x = Y_ref(L) - plan_y(L): the plan endpoint's gap to a reference (right reference, else
   left reference, else the plan alone: x = -plan_y); x grows when the plan moves left, shrinks when the car moves right.  Smoothed 0.25 s.
+  The plan-alone source is kept because B6 / C8 calls for it ("the left reference or the plan alone when the right reference is weak").  It
+  is not own-motion compensated: a move of the car to the right raises x by rho times the move, so it can only look like a left swerve
+  (review N1).  With that source q_R and q_L are < 0.3, a* is 0 and a false trigger can only fade or cap, never push toward an obstacle.
   Reference R_P: during a move to the right the running minimum of the 0.5 s median of x since the move started (not updated on jump frames
   or frames with a candidate weight change > 0.1); otherwise x low-passed 10 s (20 s while going around), like upstream's usual.
   q = |x - R_P| - 0.25 |k_m| L^2 / 2; departure = x - R_P (> 0: the model moves left of its usual place: obstacle on the right)."""
@@ -497,6 +508,101 @@ class EndpointGap:
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
+@dataclass
+class TriggerReport:
+  """One yield trigger's view of the current frame (B6, C8).  Every trigger supplies its own obstacle side: the endpoint gap from its
+  departure, the reference instance from its own offset - usual, and (rev 6, B6a) the radar clearance check always the right."""
+  name: str
+  no_growth: bool  # the trigger asks for the no-growth rule and the cap logic this frame
+  active: bool  # the trigger's yield is active (its own latch)
+  q: float  # in the units of the B6 cap ramp: >= 0.1 no growth, 0.15 .. 0.2 early cap ramp, >= 0.2 full cap
+  side: int = 0  # SIDE_RIGHT (+1, obstacle on the right), SIDE_LEFT (-1), 0 = not known this frame
+
+
+class YieldAggregator:
+  """Combines the yield triggers into one no-growth phase and the capped sides (review B1, N10).
+  - The phase runs while any trigger asks for no growth; it ends (and everything below resets) when none does.
+  - Each trigger latches its own side at the first frame of the phase in which it asks for no growth and knows its side; the latch holds
+    until the phase ends.  The phase's sides are the union of the latched sides and are not removed before the phase ends.
+  - While a trigger asks for no growth and has not latched a side yet, BOTH sides are capped.
+  - Two triggers that latched different sides cap both directions (no correction toward either side; as B6a item 4 states for a
+    clearance yield together with a left yield).
+  - The cap quantity q of a side is the largest q of the triggers that currently ask for no growth with that side (or with no side yet);
+    a latched side whose triggers no longer ask keeps q = 0, i.e. no growth only (its cap memory, which can only fall, still holds)."""
+  def __init__(self):
+    self.reset()
+
+  def reset(self):
+    self.phase = False
+    self.latched: dict[str, int] = {}
+    self.sides: set[int] = set()
+
+  def update(self, reports: list[TriggerReport]) -> tuple[bool, bool, dict[int, float]]:
+    """Returns (no_growth, yield_active, caps); caps maps each capped side to its q."""
+    asking = [r for r in reports if r.no_growth]
+    if not asking:
+      self.reset()
+      return False, False, {}
+    self.phase = True
+    for r in asking:
+      if r.name not in self.latched and r.side in BOTH_SIDES:
+        self.latched[r.name] = r.side
+        self.sides.add(r.side)
+    caps = dict.fromkeys(self.sides, 0.0)
+    for r in asking:
+      side = self.latched.get(r.name)
+      for s in ((side,) if side is not None else BOTH_SIDES):
+        caps[s] = max(caps.get(s, 0.0), float(r.q))
+    return True, any(r.active for r in reports), caps
+
+
+def log_side(caps: dict[int, float]) -> int:
+  """Capped sides as one log value: 0 none, +1 right, -1 left, LOG_SIDE_BOTH both."""
+  if len(caps) == 2:
+    return LOG_SIDE_BOTH
+  return next(iter(caps), 0)
+
+
+class CentreLimitSource:
+  """Which formula the left limit T_C' uses (B5 step 4; review S4).  Two references: their midpoint (the unclipped width); one reference:
+  that reference minus / plus upstream's filtered half width.  Confidence hysteresis: two references once q_R and q_L both exceed 0.5, back to
+  one when either falls below 0.4; between the one-reference formulas the side changes only when the other side's quality is higher by more
+  than 0.1.  Quality flicker around a threshold therefore cannot switch the formula, and step the final target, from frame to frame."""
+  BOTH, RIGHT, LEFT = 0, 1, 2
+
+  def __init__(self):
+    self.src: int | None = None
+
+  def update(self, q_r: float, q_l: float) -> int:
+    if self.src == self.BOTH and min(q_r, q_l) >= CENTRE_BOTH_OFF:
+      return self.src
+    if q_r > CENTRE_BOTH_ON and q_l > CENTRE_BOTH_ON:
+      self.src = self.BOTH
+    elif self.src == self.RIGHT:
+      self.src = self.LEFT if q_l > q_r + CENTRE_SIDE_SWITCH else self.RIGHT
+    elif self.src == self.LEFT:
+      self.src = self.RIGHT if q_r > q_l + CENTRE_SIDE_SWITCH else self.LEFT
+    else:  # first frame, or two references just ended
+      self.src = self.RIGHT if q_r >= q_l else self.LEFT
+    return self.src
+
+
+def finite_model_inputs(mo: dict, *scalars: float, right_line: bool = True) -> bool:
+  """The model outputs this frame's instances read, and the given scalars, are finite (review S3).  Always: what the reference instance
+  (upstream's Blendful) reads, the near lane lines with their stds and probabilities and the plan's x and y, and the plan speed of the gain F.
+  With the right-line instance running also all four lane lines, their probabilities, the plan's yaw rate and the road edges when present.
+  So Regular without the right-line instance reacts only to values that today's add-on or the plan-shift delivery reads."""
+  plan = mo['plan'][0]
+  arrays = [mo['lane_lines'][0, 1:3, :, 0], mo['lane_lines_stds'][0, 1:3, :, 0], mo['lane_lines_prob'][0, 3:6:2], plan[:, :2],
+            plan[:, Plan.VELOCITY.start]]
+  if right_line:
+    arrays += [mo['lane_lines'][0, :, :, 0], mo['lane_lines_stds'][0, :, :, 0], mo['lane_lines_prob'][0], plan[0, Plan.ORIENTATION_RATE.start + 2]]
+    if 'road_edges' in mo and 'road_edges_stds' in mo:
+      arrays += [mo['road_edges'][0, :, :, 0], mo['road_edges_stds'][0, :, :, 0]]
+  return bool(np.isfinite(np.concatenate([np.ravel(a) for a in arrays] + [np.asarray(scalars, dtype=float)])).all())
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
 # Junction policy (B7, owner 20:55 and Q10): the ONLY place that decides what a junction episode does to the correction.
 @dataclass
 class PolicyWeights:
@@ -529,6 +635,7 @@ class RightInputs:
   frame_dt: float = DT_MDL  # true interval between model frames (timestampEof), s
   ref_going_around: bool = False  # the reference instance's going-around yield latch
   ref_yield_fade: float = 1.0  # the reference instance's going-around / away fade (< 1: upstream sees an obstacle)
+  ref_departure: float = 0.0  # the reference instance's offset - usual, m (> 0: its plan end moved right, i.e. an obstacle on the left)
   ref_lane_width: float = LANE_WIDTH_DEFAULT  # the reference instance's filtered lane width (left limit with one reference)
   building: bool = False  # last frame's final limiter was still building the correction toward the right
 
@@ -538,9 +645,10 @@ class RightResult:
   k0: float = 0.0  # profile amplitude before the yield cap and the final limiter
   fading: bool = False
   yield_active: bool = False
-  no_growth: bool = False  # q >= 0.1 or a yield is active: the cap logic of BlendfulCorrection acts
-  yield_q: float = 0.0
-  yield_side: int = 0  # +1: obstacle on the right (model moves left), -1: obstacle on the left; latched at the start of a yield
+  no_growth: bool = False  # a trigger asks for no growth (endpoint gap q >= 0.1, or any yield active): the cap logic of BlendfulCorrection acts
+  caps: dict = field(default_factory=dict)  # capped side (SIDE_RIGHT / SIDE_LEFT) -> its cap quantity q (YieldAggregator)
+  yield_q: float = 0.0  # largest q of the capped sides (log)
+  yield_side: int = 0  # log_side(caps): 0 none, +1 right, -1 left, 2 both
   episode: bool = False
   log: dict = field(default_factory=dict)
 
@@ -553,29 +661,43 @@ class RightLineBlendful:
     self.reset()
 
   def reset(self):
+    self.quality_gate = ConfGate()
+    self.authority = Authority()
+    self.episodes = JunctionEpisodes()
+    self.road = RoadClass()
+    self.bend_active = Timed(off_time=1.0)
+    self.blink_on = Timed(off_time=1.0, on_time=0.3)
+    self.f_blink = 1.0
+    self.width_mem = WidthMemory()
+    self.restart_lane_tracking()
+    self.inactive_prev = False
+
+  def restart_lane_tracking(self):
+    """Everything that describes the lane the car is in: the input filters and their confidence gates, the probability filters, the
+    ground-fixed target, the jump counters, the candidate weights, the left-limit formula, the width memory (re-measured) and the yield
+    state.  Restarted on the first active frame after a lane change (review S2): the lines re-index during the change, and filters or
+    references carried across it would compare the old lane with the new one (a re-indexed right line converging over about a second looks
+    like a 0.37 m left swerve, a different lane width like a widening)."""
     for f in self.filters:
       f.__init__()
     for g in self.gates:
       g.c = 0.0
     self.line_probs = FirstOrderFilter(np.zeros(2), 0.5, DT_MDL)
     self.edge_q = FirstOrderFilter(np.zeros(2), 0.5, DT_MDL)
-    self.quality_gate = ConfGate()
-    self.authority = Authority()
-    self.episodes = JunctionEpisodes()
-    self.width_mem = WidthMemory()
     self.ground = GroundTarget()
-    self.gap = EndpointGap()
     self.jumps = JumpDetector()
-    self.road = RoadClass()
-    self.bend_active = Timed(off_time=1.0)
-    self.blink_on = Timed(off_time=1.0, on_time=0.3)
-    self.f_blink = 1.0
+    self.centre_src = CentreLimitSource()
+    self.w_prev = None
+    self.width_mem.remeasure()
+    self.reset_yields()
+
+  def reset_yields(self):
+    """Yield state: endpoint-gap trigger, both latches, the aggregator and the move flag (also while the instance fades, review S2)."""
+    self.gap = EndpointGap()
     self.yield_latch = Timed(off_time=1.0)
     self.ref_yield_latch = Timed(off_time=1.0)
-    self.yield_phase = False
-    self.yield_side = 1
+    self.yields = YieldAggregator()
     self.moving_t = 0.0
-    self.w_prev = None
     self.no_growth_prev = False
 
   @property
@@ -611,6 +733,11 @@ class RightLineBlendful:
     dt = float(p.frame_dt) if 0.2 * DT_MDL <= p.frame_dt <= 5.0 * DT_MDL else DT_MDL
     v = max(float(v_ego), 0.0)
     fading = (not active) or v < MIN_SPEED
+    if not active:  # lane change (or another desire): the width memory describes no lane until the car is in the new one (S2)
+      self.width_mem.remeasure()
+    elif self.inactive_prev:  # the first frame after it: restart from the new lane (S2)
+      self.restart_lane_tracking()
+    self.inactive_prev = not active
     look = max(v * LOOKAHEAD_TIME, MIN_LOOKAHEAD)
     iL = look  # look-ahead distance for scalar read outs
     lines = mo['lane_lines'][0, :, :, 0]
@@ -669,11 +796,12 @@ class RightLineBlendful:
     f_jump_t = 0.0 if jump_on else 1.0
     cand_changed = self.w_prev is not None and max(abs(w_at[0] - self.w_prev[0]), abs(w_at[1] - self.w_prev[1])) > CAND_CHANGE
     self.w_prev = w_at
-    # --- left limit T_C': the centre between the references (unclipped width with two references, upstream's filtered width with one)
-    if both:
-      hw = (y_r - y_l) / 2
-      c_ctr, _ = Blendful.centre_and_weight(y_l, y_r, lstds[1], lstds[2], max(q_L, 1e-4), max(q_R, 1e-4), hw)
-    elif q_R >= q_L:
+    # --- left limit T_C': the centre between the references (unclipped width with two references, upstream's filtered width with one);
+    # the formula changes with confidence hysteresis (S4)
+    centre_src = self.centre_src.update(q_R, q_L)
+    if centre_src == CentreLimitSource.BOTH:
+      c_ctr = (y_l + y_r) / 2
+    elif centre_src == CentreLimitSource.RIGHT:
       c_ctr = y_r - p.ref_lane_width / 2
     else:
       c_ctr = y_l + p.ref_lane_width / 2
@@ -747,23 +875,29 @@ class RightLineBlendful:
       src, ref_L = 0, 0.0
     x_gap = ref_L - float(np.interp(look, plan_x, plan_y))
     allow = 0.25 * abs(model_curvature) * look ** 2 / 2
-    move_now = (not self.no_growth_prev) and (lag_L > MOVE_LAG_EPS or self.authority.a < self.authority.a_cmd - 1e-6 or p.building)
-    self.moving_t = MOVE_SETTLE if move_now else max(0.0, self.moving_t - dt)
-    skip = (not f_jump_t) or cand_changed
-    q_y = self.gap.update(x_gap, src, self.moving_t > 0.0, bool(skip), allow, self.ref_around(p), dt) if not fading else 0.0
-    dep = self.gap.departure
-    car_trig = self.yield_latch.update(q_y > Q_CAP_FULL if not self.yield_latch.state else q_y >= Q_RELEASE)
-    ref_trig = self.ref_yield_latch.update(self.ref_around(p))
-    yield_active = bool(car_trig or ref_trig) and not fading
-    no_growth = bool(q_y >= Q_NO_GROWTH or yield_active) and not fading
-    if no_growth and not self.yield_phase:  # the obstacle side is latched at the start of a yield and kept until it ends
-      self.yield_side = 1 if dep > 0 else -1
-    self.yield_phase = no_growth
+    if fading:  # lane change or v < 5 m/s: the gap state and the latches would compare the old lane with the new one (S2)
+      self.reset_yields()
+      q_y, no_growth, yield_active, caps = 0.0, False, False, {}
+    else:
+      move_now = (not self.no_growth_prev) and (lag_L > MOVE_LAG_EPS or self.authority.a < self.authority.a_cmd - 1e-6 or p.building)
+      self.moving_t = MOVE_SETTLE if move_now else max(0.0, self.moving_t - dt)
+      skip = (not f_jump_t) or cand_changed
+      q_y = self.gap.update(x_gap, src, self.moving_t > 0.0, bool(skip), allow, self.ref_around(p), dt)
+      dep = self.gap.departure
+      car_trig = self.yield_latch.update(q_y > Q_CAP_FULL if not self.yield_latch.state else q_y >= Q_RELEASE)
+      ref_trig = self.ref_yield_latch.update(self.ref_around(p))
+      # each trigger supplies its own side (B1): the endpoint gap from its departure (> 0: the plan moved left, obstacle on the right), the
+      # reference instance from its own offset - usual (> 0: its plan end moved right, obstacle on the left)
+      side_gap = (SIDE_RIGHT if dep > 0 else SIDE_LEFT) if abs(dep) > SIDE_KNOWN else 0
+      side_ref = (SIDE_LEFT if p.ref_departure > 0 else SIDE_RIGHT) if abs(p.ref_departure) > SIDE_KNOWN else 0
+      no_growth, yield_active, caps = self.yields.update([
+        TriggerReport('endpoint_gap', bool(q_y >= Q_NO_GROWTH or car_trig), bool(car_trig), q_y, side_gap),
+        TriggerReport('reference', bool(ref_trig), bool(ref_trig), Q_CAP_FULL, side_ref),
+      ])
     self.no_growth_prev = no_growth
-    side = self.yield_side
-    q_eff = max(q_y, Q_CAP_FULL) if ref_trig else q_y
-    f_yl = 0.0 if (yield_active and side > 0) else 1.0
-    f_yr = float(np.interp(q_eff, (0.2, 0.45), (1.0, 0.0))) if (yield_active and side < 0) else 1.0
+    q_eff = max(caps.values()) if caps else 0.0
+    f_yl = 0.0 if (yield_active and SIDE_RIGHT in caps) else 1.0
+    f_yr = float(np.interp(caps[SIDE_LEFT], (0.2, 0.45), (1.0, 0.0))) if (yield_active and SIDE_LEFT in caps) else 1.0
     k0_rl *= f_yr
     # --- authority (B5)
     qa = self.quality_gate.update(q_R)
@@ -803,11 +937,11 @@ class RightLineBlendful:
       'widening': widening if widening is not None else 0.0,
       'width_mem': wm.w if wm.armed else 0.0, 'width_age': wm.age, 'width_state': int(wm.armed) | (int(wm.stale) << 1) | (int(not wm.armed) << 2),
       'road_class': road, 'frame_dt': dt, 'plan_speed': vx0, 'target_lag': lag_L,
-      'yield_side': side if no_growth else 0, 'yield_source': src, 'yield_moving': self.moving_t > 0.0,
+      'yield_side': log_side(caps), 'yield_source': src, 'centre_source': centre_src, 'yield_moving': self.moving_t > 0.0,
       't_raw': t_raw, 't_lim': t_lim, 'y_edge_r': filt[3], 'c_ctr': c_ctr, 'y_r': y_r, 'y_l': y_l, 'beta': beta, 'jump_inno': np.array(inno),
     }
-    return RightResult(k0=float(k0), fading=fading, yield_active=yield_active, no_growth=no_growth, yield_q=float(q_eff), yield_side=side,
-                       episode=in_episode, log=log)
+    return RightResult(k0=float(k0), fading=fading, yield_active=yield_active, no_growth=no_growth, caps=caps, yield_q=float(q_eff),
+                       yield_side=log_side(caps), episode=in_episode, log=log)
 
   @staticmethod
   def ref_around(p: RightInputs) -> bool:
@@ -823,16 +957,19 @@ class BlendfulCorrection:
     self.reference = reference if reference is not None else Blendful()
     self.right = right if right is not None else RightLineBlendful()
     self.mode = MODE_OFF
-    self.c = 0.0  # delivered instantaneous correction after the limiter (1/m)
+    self.c = 0.0  # delivered instantaneous correction after the limiter (1/m); always finite (S3)
     self.k0 = 0.0
-    self.gain = 1.0
+    self.gain = 1.0  # F of the last frame with a finite plan speed
+    self.v_limit = 1.0  # the last finite speed, for the limiter on a frame without one (S3)
     self.k_up = 0.0
     self.result = RightResult()
-    self.cap_mem: float | None = None  # the toward-obstacle correction at the no-growth point; lives as long as the yield (C8)
+    self.cap_mem: dict[int, float] = {}  # per capped side: the toward-obstacle correction at its no-growth point; lives with the phase (C8)
     self.cap_active = False
     self.release_window = False
     self.building = False
     self.right_idle = True
+    self.invalid = False  # this frame's inputs or computed correction were non-finite: released toward 0, instances reset (S3)
+    self.update_ms = 0.0  # time of the whole last update (S5); fill_log consumes it
 
   @property
   def releasing(self) -> bool:
@@ -847,15 +984,51 @@ class BlendfulCorrection:
 
   def update(self, mo: dict, v_ego: float, active: bool, model_curvature: float, lat_action_t: float, mode: int,
              p: RightInputs | None = None) -> float:
-    """Returns k0.  mode MODE_OFF only releases a remaining correction (2.0 m/s^3) and then resets the instances."""
-    p = p or RightInputs()
-    v_eff = max(v_ego, 1.0)
-    self.gain = instant_gain(v_eff, lat_action_t, mo['plan'][0][:, Plan.VELOCITY.start])  # F per frame with the plan's own v_x (C11)
-    f = self.gain
+    """Returns k0.  mode MODE_OFF only releases a remaining correction (2.0 m/s^3) and then resets the instances.  The whole update is
+    timed (S5)."""
+    t0 = time.perf_counter()
+    k0 = self._update(mo, v_ego, active, model_curvature, lat_action_t, mode, p or RightInputs())
+    self.update_ms = (time.perf_counter() - t0) * 1e3
+    return k0
+
+  def _release_invalid(self, v: float) -> float:
+    """S3: a non-finite input or result.  Both instances are reset (the reference instance is today's upstream Blendful, which a
+    non-finite lane line would also leave non-finite), the cap memory is dropped, and the delivered correction is released toward 0
+    through the limiter (2.0 m/s^3).  Nothing non-finite is kept, so the next finite frame (and Off) start clean."""
+    self.invalid = True
+    self.reference.__init__()
+    self.right.reset()
+    self.right_idle = True
+    self.result = RightResult(fading=True)
+    self.cap_mem = {}
+    self.cap_active = self.release_window = self.building = False
+    self.k_up = 0.0
+    self.c = self._limit(0.0, v, RELEASE)
+    self.k0 = self.c / self.gain
+    return self.k0
+
+  def _gain(self, mo: dict, lat_action_t: float, valid: bool) -> bool:
+    """F per frame with the plan's own v_x (C11), kept from the last frame where it is finite; returns whether this frame's F is."""
+    gain = instant_gain(self.v_limit, lat_action_t, mo['plan'][0][:, Plan.VELOCITY.start]) if valid else float('nan')
+    if np.isfinite(gain) and abs(gain) > 1e-9:
+      self.gain = gain
+      return True
+    return False
+
+  def _update(self, mo: dict, v_ego: float, active: bool, model_curvature: float, lat_action_t: float, mode: int, p: RightInputs) -> float:
+    self.invalid = False
+    if not np.isfinite(self.c):
+      self.c = 0.0
+    if np.isfinite(v_ego):
+      self.v_limit = max(float(v_ego), 1.0)
+    v_lim = self.v_limit
     if mode == MODE_OFF:
+      self._gain(mo, lat_action_t, finite_model_inputs(mo, lat_action_t, right_line=False))
+      f = self.gain
       self.reference.update(mo, v_ego, active, model_curvature, enabled=False)
-      self.cap_active = False
-      c = self._limit(0.0, v_ego, RELEASE)
+      self.cap_active = self.release_window = False
+      self.cap_mem = {}
+      c = self._limit(0.0, v_lim, RELEASE)
       self.c, self.k0, self.k_up = c, c / f, 0.0
       self.result = RightResult()
       if self.c == 0.0:
@@ -868,14 +1041,26 @@ class BlendfulCorrection:
     if mode == MODE_REGULAR and self.mode == MODE_RIGHT:
       self.right.episodes.reset()
     self.mode = mode
+    # the right-line instance runs in Right line, and in Regular while its share a is still handed back or its yield phase still runs, so
+    # the yield cap acts in the hand-back window for as long as the yield lasts (B2)
+    right_runs = mode == MODE_RIGHT or (mode == MODE_REGULAR and (self.right.a > 0.0 or self.right.yields.phase))
+    if right_runs:
+      valid = finite_model_inputs(mo, v_ego, model_curvature, lat_action_t, p.gap_low, p.gap_high, p.c_set, p.c_applied, p.frame_dt)
+    else:
+      valid = finite_model_inputs(mo, v_ego, model_curvature, lat_action_t, right_line=False)
+    valid = self._gain(mo, lat_action_t, valid)
+    f = self.gain
+    if not valid:
+      return self._release_invalid(v_lim)
     self.k_up = self.reference.update(mo, v_ego, active, model_curvature, enabled=True)
     k0_up = self.k_up / f
     p.ref_going_around = self.reference.going_around
     p.ref_yield_fade = self.reference.yield_fade
+    p.ref_departure = self.reference.yield_departure
     p.ref_lane_width = float(self.reference.lane_width.x)
     p.building = self.building
     res = RightResult()
-    if mode == MODE_RIGHT or (mode == MODE_REGULAR and self.right.a > 0.0):
+    if right_runs:
       if self.right_idle:  # the instance was not running (Regular with a = 0): its filters are stale
         self.right.reset()
       self.right_idle = False
@@ -885,33 +1070,44 @@ class BlendfulCorrection:
       self.right_idle = True
       k0_target = k0_up
       res.fading = (not active) or v_ego < MIN_SPEED
+    if not (np.isfinite(k0_target) and np.isfinite(self.k_up)):
+      return self._release_invalid(v_lim)
     self.result = res
     c_target = f * k0_target
     release = FADING_RELEASE if res.fading else RELEASE
     self.cap_active = False
     self.release_window = False
-    if mode == MODE_RIGHT and res.no_growth:
-      s, q = res.yield_side, res.yield_q
-      toward, prev = s * c_target, max(s * self.c, 0.0)
-      if self.cap_mem is None:
-        self.cap_mem = prev
-      self.cap_mem = min(self.cap_mem, prev)  # non-increasing: no latched remainder can come back
-      if toward > prev:  # no growth toward the obstacle from q = 0.1 m
-        toward, self.cap_active = prev, True
-      x_cap = self.cap_mem * float(np.clip((Q_CAP_FULL - q) / (Q_CAP_FULL - Q_CAP_START), 0.0, 1.0))
-      if toward > x_cap:
-        toward, self.cap_active = x_cap, True
-      if q >= Q_CAP_FULL and s * self.c > x_cap + 1e-12:
-        release, self.release_window = SWERVE_RELEASE, True
-      if self.cap_active:
-        c_target = s * toward if s * c_target > toward else c_target
+    if right_runs and res.no_growth:
+      for s in BOTH_SIDES:  # B6 cap per capped side; a side that is not capped (any more) drops its memory
+        if s not in res.caps:
+          self.cap_mem.pop(s, None)
+          continue
+        q = res.caps[s]
+        toward, prev = s * c_target, max(s * self.c, 0.0)
+        self.cap_mem[s] = min(self.cap_mem.get(s, prev), prev)  # set at the no-growth point, non-increasing: no latched remainder comes back
+        capped = False
+        if toward > prev:  # no growth toward the obstacle from q = 0.1 m
+          toward, capped = prev, True
+        x_cap = self.cap_mem[s] * float(np.clip((Q_CAP_FULL - q) / (Q_CAP_FULL - Q_CAP_START), 0.0, 1.0))
+        if toward > x_cap:
+          toward, capped = x_cap, True
+        if q >= Q_CAP_FULL and s * self.c > x_cap + 1e-12:
+          release, self.release_window = SWERVE_RELEASE, True
+        if capped:
+          c_target = s * toward
+          self.cap_active = True
     else:
-      self.cap_mem = None
-    c_new = self._limit(c_target, v_ego, release)
+      self.cap_mem = {}
+    c_new = self._limit(c_target, v_lim, release)
     self.building = (c_target - c_new) > 1e-9  # still building toward the right
-    self.c = c_new
+    self.c = c_new if np.isfinite(c_new) else 0.0
     self.k0 = self.c / f
     return self.k0
+
+  def take_update_ms(self) -> float:
+    """The last update's time (ms), once: 0 on frames where the class did not run (S5)."""
+    ms, self.update_ms = self.update_ms, 0.0
+    return ms
 
 
 def mode_from_params(blendful_on: bool, kind: int) -> int:
@@ -935,13 +1131,15 @@ def apply_correction(mo: dict, k0: float, v_ego: float) -> dict:
 
 
 def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
-  """Additive modelDataV2SP fields (DESIGN D logging).  Fields of the first implementation that no longer have a meaning (rho, bias, split
-  score, latch / ramp / hold, split fade) are kept in the schema (additive only) and written as constants."""
+  """Additive modelDataV2SP fields (DESIGN D logging).  The first implementation's fields without a meaning since rev 5 are gone from the
+  schema (round 3; that implementation was never pushed or driven, so no log or reader depends on them)."""
   builder.blendfulMode = int(mode)
   builder.blendfulGainF = float(ctl.gain)
   builder.blendfulKappaUp = float(ctl.k_up)
   builder.blendfulKappa0 = float(ctl.k0)
   builder.blendfulCapActive = bool(ctl.cap_active)
+  builder.blendfulUpdateTime = float(ctl.take_update_ms())  # the whole update of this frame, ms; 0 when the class did not run (S5)
+  builder.blendfulNonFinite = bool(ctl.invalid)
   lg = ctl.result.log
   if mode == MODE_OFF or not lg:
     return
@@ -955,8 +1153,7 @@ def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
                     ('WidthMemory', 'width_mem'), ('WidthMemoryAge', 'width_age'), ('ModelAloneTime', 'model_alone_time'),
                     ('FrameDt', 'frame_dt'), ('PlanSpeed', 'plan_speed'), ('TargetLag', 'target_lag')):
     setattr(builder, 'blendful' + name, float(lg.get(key, 0.0)))
-  builder.blendfulCapMemory = float(ctl.cap_mem or 0.0)
-  builder.blendfulFadeSplit = 1.0  # superseded (junction rev 5): no split fade
+  builder.blendfulCapMemory = float(max(ctl.cap_mem.values(), default=0.0))
   builder.blendfulRightOnly = bool(lg['right_only'])
   builder.blendfulYieldActive = bool(lg['yield_active'])
   builder.blendfulBoundActive = bool(lg['bound_active'])
@@ -969,6 +1166,7 @@ def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
   builder.blendfulRoadClass = int(lg['road_class'])
   builder.blendfulYieldSide = int(lg['yield_side'])
   builder.blendfulYieldSource = int(lg['yield_source'])
+  builder.blendfulCentreSource = int(lg['centre_source'])
   builder.blendfulJunctionCueValues = [float(x) for x in lg['cue_values']]
   builder.blendfulInputFiltered = [float(x) for x in lg['filtered']]
   builder.blendfulInputRaw = [float(x) for x in lg['raw']]

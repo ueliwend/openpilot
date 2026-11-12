@@ -476,8 +476,9 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   blendfulRightProb @8 :Float32;
   blendfulLaneWidth @9 :Float32;
 
-  # Right-line Blendful (A8), additive. Lists named "input" hold the four inputs in the order
-  # [left line, left edge, right line, right edge]; position lists hold x = 0, 0.5 L, L, 1.5 L per input (L = max(1.5 v, 10 m)).
+  # Right-line Blendful (A8), additive (implementation round 3: renumbered without the fields of the never-driven first implementation).
+  # Lists named "input" hold the four inputs in the order [left line, left edge, right line, right edge]; position lists hold
+  # x = 0, 0.5 L, L, 1.5 L per input (L = max(1.5 v, 10 m)).
   blendfulMode @10 :UInt8;  # 0 off, 1 regular, 2 right line
   blendfulRightApplied @11 :Bool;
   blendfulRightGap @12 :Float32;  # g(v), m
@@ -487,63 +488,57 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   blendfulAuthority @16 :Float32;  # a
   blendfulAuthorityTarget @17 :Float32;  # a*
   blendfulFadeBend @18 :Float32;
-  blendfulFadeSplit @19 :Float32;  # superseded by junction rev 5: always 1.0
-  blendfulFadeYieldLeft @20 :Float32;
-  blendfulFadeYieldRight @21 :Float32;
-  blendfulFadeJump @22 :Float32;
-  blendfulFadePlausibility @23 :Float32;
-  blendfulFadeBlinker @24 :Float32;
-  blendfulAwayCar @25 :Float32;  # car-referenced yield trigger quantity, m
-  blendfulRho @26 :Float32;  # superseded (rho estimator removed, rev 5): always 0
-  blendfulBias @27 :Float32;  # superseded (rev 5): always 0
-  blendfulStrength @28 :Float32;  # s_R
-  blendfulStrengthWeight @29 :Float32;  # w_c
-  blendfulRightOnly @30 :Bool;  # right-only episode: q_R from line or edge with left line quality < 0.3
-  blendfulCurveAccel @31 :Float32;  # |kappa_m| v^2, m/s^2
-  blendfulYieldActive @32 :Bool;
-  blendfulCapActive @33 :Bool;
-  blendfulBoundActive @34 :Bool;
-  blendfulKappaUp @35 :Float32;  # reference instance output (instantaneous)
-  blendfulKappaRL @36 :Float32;  # right-line part, profile amplitude
-  blendfulKappa0 @37 :Float32;  # delivered profile amplitude
-  blendfulGainF @38 :Float32;
-  blendfulProfileLength @39 :Float32;  # L_c, m
-  blendfulProfileShift @40 :Float32;  # D, m
-  blendfulFilterTime @41 :Float32;  # ms per frame
-  blendfulInputFiltered @42 :List(Float32);
-  blendfulInputRaw @43 :List(Float32);
-  blendfulFilterOffset @44 :List(Float32);  # filtered minus raw at x = L, per input
-  blendfulInputConfidence @45 :List(Float32);
-  blendfulInputState @46 :List(UInt8);  # bit 0 coasting, bit 1 re-initialised this frame
-  blendfulCandidateConfidence @47 :List(Float32);  # c_i per input (hysteresis gate)
-  blendfulCandidateWeight @48 :List(Float32);  # softmin weight w_i per input at x = L
-  blendfulReference @49 :List(Float32);  # [left, right] reference at x = L
-  blendfulTarget @50 :List(Float32);  # target lateral position per model x index (right line mode)
-  blendfulJunctionEpisode @51 :Bool;
-  blendfulJunctionLatched @52 :Bool;  # superseded (rev 5): always false
-  blendfulJunctionRamp @53 :Bool;  # superseded (rev 5): always false
-  blendfulJunctionHold @54 :Bool;  # superseded (rev 5): always false
-  blendfulSplitScore @55 :Float32;  # superseded (rev 5): always 0
-
-  # Right-line Blendful rev 5 (implementation round 2), additive.
-  blendfulJunctionCues @56 :UInt8;  # bit 0 widening in frame, 1 widening over time, 2 edge divergence, 3 gore / kink, 4 sharp bend
-  blendfulJunctionCueValues @57 :List(Float32);  # [widening in frame m, width excess m, edge divergence m, edge angle deg, gore min separation m, kink deg, bend b]
-  blendfulJunctionEpisodeDistance @58 :Float32;  # m since the episode started
-  blendfulJunctionWidening @59 :Float32;  # the widening quantity of the episode end rule, m
-  blendfulWidthMemory @60 :Float32;  # m (0 while not armed)
-  blendfulWidthMemoryAge @61 :Float32;  # s since the last update
-  blendfulWidthMemoryState @62 :UInt8;  # bit 0 armed, 1 stale, 2 measuring
-  blendfulModelAloneTime @63 :Float32;  # s spent in junction episodes since the mode started
-  blendfulJunctionEnded @64 :UInt8;  # 0 no end this frame, 1 quiet (2 s and 30 m), 2 widening gone (1 s), 3 maximum length (300 m)
-  blendfulRoadClass @65 :UInt8;  # 0 edges only, 1 shared, 2 lanes, 3 motorway (hysteresis, 5 s dwell)
-  blendfulFrameDt @66 :Float32;  # true model frame interval used by the filters and the target, s
-  blendfulPlanSpeed @67 :Float32;  # the raw plan's own v_x(0), m/s
-  blendfulTargetLag @68 :Float32;  # raw target minus rate-limited target at x = L, m
-  blendfulDClipped @69 :Bool;  # the fitted amplitude was clipped at 1.0 m
-  blendfulYieldSide @70 :Int8;  # latched obstacle side while a yield / no-growth phase runs: +1 right, -1 left, 0 none
-  blendfulYieldSource @71 :UInt8;  # reference of the endpoint-gap trigger: 0 plan alone, 1 right, 2 left
-  blendfulYieldMoving @72 :Bool;  # a move to the right is on (running minimum)
-  blendfulCapMemory @73 :Float32;  # toward-obstacle correction held at the no-growth point (1/m)
+  blendfulFadeYieldLeft @19 :Float32;
+  blendfulFadeYieldRight @20 :Float32;
+  blendfulFadeJump @21 :Float32;
+  blendfulFadePlausibility @22 :Float32;
+  blendfulFadeBlinker @23 :Float32;
+  blendfulAwayCar @24 :Float32;  # car-referenced yield trigger quantity, m
+  blendfulStrength @25 :Float32;  # s_R
+  blendfulStrengthWeight @26 :Float32;  # w_c
+  blendfulRightOnly @27 :Bool;  # right-only episode: q_R from line or edge with left line quality < 0.3
+  blendfulCurveAccel @28 :Float32;  # |kappa_m| v^2, m/s^2
+  blendfulYieldActive @29 :Bool;
+  blendfulCapActive @30 :Bool;
+  blendfulBoundActive @31 :Bool;
+  blendfulKappaUp @32 :Float32;  # reference instance output (instantaneous)
+  blendfulKappaRL @33 :Float32;  # right-line part, profile amplitude
+  blendfulKappa0 @34 :Float32;  # delivered profile amplitude
+  blendfulGainF @35 :Float32;
+  blendfulProfileLength @36 :Float32;  # L_c, m
+  blendfulProfileShift @37 :Float32;  # D, m
+  blendfulFilterTime @38 :Float32;  # ms per frame, the four input filters only
+  blendfulInputFiltered @39 :List(Float32);
+  blendfulInputRaw @40 :List(Float32);
+  blendfulFilterOffset @41 :List(Float32);  # filtered minus raw at x = L, per input
+  blendfulInputConfidence @42 :List(Float32);
+  blendfulInputState @43 :List(UInt8);  # bit 0 coasting, bit 1 re-initialised this frame
+  blendfulCandidateConfidence @44 :List(Float32);  # c_i per input (hysteresis gate)
+  blendfulCandidateWeight @45 :List(Float32);  # softmin weight w_i per input at x = L
+  blendfulReference @46 :List(Float32);  # [left, right] reference at x = L
+  blendfulTarget @47 :List(Float32);  # target lateral position per model x index (right line mode)
+  blendfulJunctionEpisode @48 :Bool;
+  blendfulJunctionCues @49 :UInt8;  # bit 0 widening in frame, 1 widening over time, 2 edge divergence, 3 gore / kink, 4 sharp bend
+  blendfulJunctionCueValues @50 :List(Float32);  # [widening in frame m, width excess m, edge divergence m, edge angle deg, gore min separation m, kink deg, bend b]
+  blendfulJunctionEpisodeDistance @51 :Float32;  # m since the episode started
+  blendfulJunctionWidening @52 :Float32;  # the widening quantity of the episode end rule, m
+  blendfulWidthMemory @53 :Float32;  # m (0 while not armed)
+  blendfulWidthMemoryAge @54 :Float32;  # s since the last update
+  blendfulWidthMemoryState @55 :UInt8;  # bit 0 armed, 1 stale, 2 measuring
+  blendfulModelAloneTime @56 :Float32;  # s spent in junction episodes since the mode started
+  blendfulJunctionEnded @57 :UInt8;  # 0 no end this frame, 1 quiet (2 s and 30 m), 2 widening gone (1 s), 3 maximum length (300 m)
+  blendfulRoadClass @58 :UInt8;  # 0 edges only, 1 shared, 2 lanes, 3 motorway (hysteresis, 5 s dwell)
+  blendfulFrameDt @59 :Float32;  # true model frame interval used by the filters and the target, s
+  blendfulPlanSpeed @60 :Float32;  # the raw plan's own v_x(0), m/s
+  blendfulTargetLag @61 :Float32;  # raw target minus rate-limited target at x = L, m
+  blendfulDClipped @62 :Bool;  # the fitted amplitude was clipped at 1.0 m
+  blendfulYieldSide @63 :Int8;  # capped obstacle side(s) while a no-growth phase runs: +1 right, -1 left, 2 both (side not yet known, or triggers disagree), 0 none
+  blendfulYieldSource @64 :UInt8;  # reference of the endpoint-gap trigger: 0 plan alone, 1 right, 2 left
+  blendfulYieldMoving @65 :Bool;  # a move to the right is on (running minimum)
+  blendfulCapMemory @66 :Float32;  # toward-obstacle correction held at the no-growth point (1/m)
+  blendfulUpdateTime @67 :Float32;  # ms, the whole Blendful update of this frame (reference, right-line instance, cap, limiter); 0 when it did not run
+  blendfulNonFinite @68 :Bool;  # a non-finite input or result this frame: released toward 0, instances reset
+  blendfulCentreSource @69 :UInt8;  # left-limit formula: 0 midpoint of both references, 1 right reference, 2 left reference (hysteresis 0.5 / 0.4)
 
   enum TurnDirection {
     none @0;
