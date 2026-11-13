@@ -542,7 +542,7 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   # rev 6.5 final move-speed limit (B5 step 4b): values at x = L
   blendfulApproach @70 :Float32;  # weighted approach A to the right reference since the last reset, m
   blendfulGapReset @71 :Float32;  # G0, the gap to the right reference at the last reset (rebased by reference switches), m
-  blendfulApproachHeld @72 :Bool;  # A held at 0 after a reset until the car is at p0 and slow
+  blendfulStartFollowsCar @72 :Bool;  # the start followed the car this frame (car moving left of -0.02 m/s and left of the right-line target, rev 6.10)
   blendfulMoveLimiting @73 :Bool;  # the 0.05 m/s limit binds somewhere in the window
   blendfulMoveReset @74 :UInt8;  # reset reasons this frame: bit 0 a = 0, 1 junction end, 2 yield end, 3 right reference regained, 4 mode on
   blendfulSwitchPart @75 :Float32;  # switch part of the change of Y_R added to G0 this frame, m
@@ -561,6 +561,9 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   blendfulClearanceYield @87 :Bool;
   blendfulClearanceMargin @88 :Float32;  # m(v) = g(v) + e(v), m
   blendfulRightBlindspot @89 :Bool;
+  # rev 6.10 "Start and floor"
+  blendfulDeliveredSource @90 :UInt8;  # right-line share delivered: 0 right-line correction, 1 Regular's (larger of, target left of the centre), 2 right-line (larger of)
+  blendfulTargetMinusCentre @91 :Float32;  # T_RL - T_C' at x = L, m (< 0: the right-line target is left of the lane centre)
 
   enum TurnDirection {
     none @0;

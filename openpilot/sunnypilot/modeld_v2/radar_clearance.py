@@ -36,6 +36,7 @@ MARGIN_EXTRA = (0.2, 0.5)  # m at <= 50 km/h and >= 100 km/h
 MARGIN_SPEEDS = (50 / 3.6, 100 / 3.6)
 BOUND_HOLD = 1.0  # s; the bound then rises at r_ref (blendful_right.REFERENCE_RATE, passed in)
 DEFICIT_RAMP, DEFICIT_RELEASE, DEFICIT_RELEASE_TIME = 0.05, -0.1, 1.0  # m, m, s
+GHOST_TIME = 1.0  # s, a track that lost its confirmation stays the remembered object this long (or until 1 m behind the rear bumper)
 STALE_AGE, HEALTHY_RETURN = 0.3, 1.0  # s
 MOVING_SPEED, MOVING_WINDOW, MOVING_MIN = 1.0, 10, 8  # m/s, messages
 POPUP_TIME = 2.0  # s ahead
@@ -100,6 +101,7 @@ class Track:
   confirmed: bool = False
   popup: bool = False
   seen: bool = True  # in the newest message (False: remembered beside the car)
+  ghost_t: float = 0.0  # > 0: a track that lost its confirmation, kept as the remembered object for this long (B6a item 4, rev 6.8)
   moving_votes: deque = field(default_factory=lambda: deque(maxlen=MOVING_WINDOW))
 
   @property
@@ -129,6 +131,7 @@ class ClearanceResult:
 class RadarClearance:
   def __init__(self):
     self.tracks: dict[int, Track] = {}
+    self.ghosts: list[Track] = []  # confirmed tracks that lost their confirmation: remembered for 1 s or until 1 m behind the rear bumper
     self.t_obj = NO_BOUND
     self.hold = 0.0
     self.healthy_t = 0.0
@@ -160,6 +163,8 @@ class RadarClearance:
       tr = self.tracks.get(tid)
       if tr is not None and tr.seen:
         consistent = abs(d_rel - (tr.d_rel + tr.v_rel * msg_dt)) <= CONSISTENT_DIST and abs(y_rel - tr.y_rel) <= CONSISTENT_LAT
+        if tr.confirmed and not consistent:
+          self._remember(tr)  # the slot jumped: the confirmed object stays remembered at its last position (rev 6.8, R3-S3)
         count = tr.count + 1 if consistent else 1
         votes = tr.moving_votes if consistent else deque(maxlen=MOVING_WINDOW)
         confirmed = tr.confirmed and consistent
@@ -178,7 +183,13 @@ class RadarClearance:
       if tr.confirmed and tr.x < MEMORY_X:
         tr.seen, tr.popup = False, False  # left the field of view: remembered beside the car
       else:
+        if tr.confirmed and tr.seen:
+          self._remember(tr)  # lost while ahead: remembered for 1 s (rev 6.8, R3-S3)
         del self.tracks[tid]
+
+  def _remember(self, tr: Track):
+    self.ghosts.append(Track(x=tr.x, y=tr.y, d_rel=tr.d_rel, y_rel=tr.y_rel, v_rel=tr.v_rel, count=tr.count, confirmed=True, seen=False,
+                             ghost_t=GHOST_TIME, moving_votes=tr.moving_votes))
 
   def _move_memory(self, vx0: float, yaw_rate: float, dt: float, l_d: float):
     """Remembered objects are ground-fixed: moved with the B2 motion model into the new car frame (and forgotten behind the car)."""
@@ -189,6 +200,11 @@ class RadarClearance:
       tr.y -= yaw_rate * dt * (tr.x + l_d + vx0 * dt / 2)
       if tr.x < FORGET_X:
         del self.tracks[tid]
+    for g in self.ghosts:
+      g.x -= vx0 * dt
+      g.y -= yaw_rate * dt * (g.x + l_d + vx0 * dt / 2)
+      g.ghost_t -= dt
+    self.ghosts = [g for g in self.ghosts if g.ghost_t > 1e-9 and g.x >= FORGET_X]
 
   def update(self, radar: RadarFrame | None, v: float, vx0: float, yaw_rate: float, gap: float, dc: float, w_r: float,
              x_idxs: np.ndarray, c_ctr: np.ndarray, y_edge: np.ndarray, edge_weight: np.ndarray, dt: float = DT_MDL, l_d: float = 1.95,
@@ -203,13 +219,14 @@ class RadarClearance:
     self._move_memory(vx0, yaw_rate, dt, l_d)
     if not fresh:  # a stale or faulty radar gives no objects; the caller fades Right line to Regular
       self.tracks = {k: t for k, t in self.tracks.items() if not t.seen}
+      self.ghosts = []
     res.healthy = self.healthy
     res.right_blindspot = bool(radar.right_blindspot) if radar is not None else False
     m = gap + margin_extra(v)
     res.margin = m
     x_h = max(CORRIDOR_MIN, CORRIDOR_TIME * v)
     t_raw, d, nearest = NO_BOUND, -NO_BOUND, None
-    for tr in self.tracks.values():
+    for tr in list(self.tracks.values()) + self.ghosts:
       if not tr.confirmed or tr.x > x_h or tr.x < FORGET_X:
         continue
       xq = min(max(tr.x, x_idxs[0]), x_idxs[-1])
@@ -236,8 +253,9 @@ class RadarClearance:
       if self.hold >= BOUND_HOLD - 1e-9:
         self.t_obj = min(t_raw, self.t_obj + rise * dt) if t_raw < NO_BOUND else min(NO_BOUND, self.t_obj + rise * dt)
     res.t_obj_raw, res.t_obj, res.hold = t_raw, self.t_obj, self.hold
-    # clearance yield (obstacle side right): starts at d > 0; released when d < -0.1 m (or no confirmed object is left, e.g. a track that
-    # lost its confirmation for a message, R3-S3) for 1 s, or at once when the object that set it is 1 m behind the rear bumper
+    # clearance yield (obstacle side right): starts at d > 0; released when d < -0.1 m for 1 s (no object left counts as d < -0.1 m; a
+    # track that lost its confirmation stays the remembered object meanwhile, see _remember), or at once when the object that set it is
+    # 1 m behind the rear bumper
     res.deficit = d
     if self.yield_obj_x is not None:
       self.yield_obj_x -= vx0 * dt

@@ -675,12 +675,17 @@ class TestBoundOrder:
     # the lane centre moves 1.0 m to the right (the car is left of it): the target may glide right only at 0.05 m/s, but is never left of
     # the centre limit
     scenes = [Scene(v=13.0, width=2.6, center=0.0)] * 150 + [Scene(v=13.0, width=2.6, center=0.8)] * 100
+    # rev 6.10: the step-4 target T4 keeps the left limit; the right-line target after the move limit is not floored, and while it lies
+    # left of the centre the larger of Regular's and the right-line correction is delivered
     rl, logs = frames_of(scenes)
-    lagged = False
+    lagged = left = False
     for lg in logs[150:]:
-      assert np.all(lg['target'] >= lg['c_ctr'] - 1e-9)
+      assert np.all(lg['t4'] >= np.minimum(lg['c_ctr'], lg['t4'] + 1.0) - 1e-9) and np.all(lg['t4'] >= lg['c_ctr'] - 1e-9)
       lagged |= bool(np.any(lg['t_lim'] < lg['c_ctr'] - 1e-3))
-    assert lagged
+      if lg['trl_minus_centre'] < -1e-3:
+        left = True
+        assert lg['delivered'] != br.DELIVER_RIGHT_LINE or lg['bound_active']
+    assert lagged and left
 
 
 class TestWidthMemory:
@@ -1216,7 +1221,7 @@ class TestDClip:
     assert not clipped and 0.0 < d < 0.4 and la > 0
 
   def test_integration_never_exceeds_one_metre(self):
-    rl, logs = frames_of([Scene(v=20.0, width=8.0)] * 300)  # a very wide lane: saturated error
+    rl, logs = frames_of([Scene(v=20.0, width=8.0)] * 900)  # a very wide lane: saturated error (the target approaches at r_ref)
     assert max(abs(lg['d']) for lg in logs) <= br.D_MAX + 1e-12
     assert any(lg['d_clipped'] for lg in logs)
 

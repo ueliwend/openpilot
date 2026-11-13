@@ -29,25 +29,25 @@ def inputs(radar=None, **kw):
 # ---------------------------------------------------------------------------------------------------------------------------------
 # the limit itself (pure)
 class TestMoveSpeedLimitUnit:
+  """B5 step 4b with "Start and floor" (rev 6.10): the start is the car's own gap at every reset, no floor, no hold; the start follows a car
+  still moving left."""
   def setup_method(self):
     self.y_r = np.full(br.NX, 1.75)
-    self.c_ctr = np.zeros(br.NX)
 
-  def run(self, ml, t4, frames, w=1.0, sw=None, reset_first=True, y_r=None, c_ctr=None):
+  def run(self, ml, t4, frames, w=1.0, sw=None, reset_first=True, y_r=None):
     out = []
     for i in range(frames):
-      out.append(ml.update(self.y_r if y_r is None else y_r, t4, self.c_ctr if c_ctr is None else c_ctr, w,
-                           np.zeros(br.NX) if sw is None else sw, 0.0, DT_MDL, reset_first and i == 0))
+      out.append(ml.update(self.y_r if y_r is None else y_r, t4, w, np.zeros(br.NX) if sw is None else sw, 0.0, DT_MDL, reset_first and i == 0))
     return out
 
-  def test_after_a_reset_the_approach_grows_at_0_05_m_s_and_a_decrease_passes_at_once(self):
+  def test_after_a_reset_the_approach_grows_at_r_ref_and_a_decrease_passes_at_once(self):
     ml = MoveSpeedLimit()
     t4 = np.full(br.NX, 0.44)
     ts = self.run(ml, t4, 300)
     assert np.all(ts[0] <= RATE + 1e-12)  # starts where the car is (gap 1.75 at the reset), plus the first step
     steps = np.diff([t[10] for t in ts])
     assert steps.max() <= RATE + 1e-12 and abs(ts[-1][10] - 0.44) < 1e-9  # r_ref, then on T4
-    t_left = ml.update(self.y_r, np.full(br.NX, 0.1), self.c_ctr, 1.0, np.zeros(br.NX), 0.0, DT_MDL, False)
+    t_left = ml.update(self.y_r, np.full(br.NX, 0.1), 1.0, np.zeros(br.NX), 0.0, DT_MDL, False)
     assert np.allclose(t_left, 0.1)  # leftward at once
 
   def test_weighted_approach_and_w_zero(self):
@@ -55,19 +55,36 @@ class TestMoveSpeedLimitUnit:
     t4 = np.full(br.NX, 0.44)
     ts = self.run(ml, t4, 20, w=0.5)
     assert abs(ts[-1][5] - min(0.44, 20 * RATE / 0.5)) < 1e-9  # A = w (G0 - G) grows at r_ref: the target moves 1 / w as fast
-    ml2 = MoveSpeedLimit()
-    assert np.allclose(self.run(ml2, t4, 5, w=0.0)[-1], 0.0)  # G = G0 at w = 0
+    assert np.allclose(self.run(MoveSpeedLimit(), t4, 5, w=0.0)[-1], 0.0)  # G = G0 at w = 0
 
-  def test_reset_at_the_centre_limit_when_the_car_is_left_of_it_and_held_until_the_car_is_there(self):
+  def test_reset_starts_at_the_car_wherever_it_is_with_no_floor_and_no_hold(self):
+    # the car 0.3 m left of the lane centre (rev 6.10: no p0 = max(car, centre), no hold): the target starts at the car, left of the centre
     ml = MoveSpeedLimit()
-    c_ctr = np.full(br.NX, 0.3)  # the car is 0.3 m left of the centre limit
-    t4 = np.full(br.NX, 0.6)
-    ts = self.run(ml, t4, 40, c_ctr=c_ctr)
-    assert all(np.allclose(t, 0.3) for t in ts) and not ml.released  # the floor; A held at 0 while the car is not at p0
-    y_r = self.y_r - 0.27  # the car came to within 0.03 m of p0 (its gap fell), slowly
-    for _ in range(3):
-      t = ml.update(y_r, t4, c_ctr - 0.27, 1.0, np.zeros(br.NX), 0.0, DT_MDL, False)
-    assert ml.released and t[5] > 0.03 + 1e-9
+    ts = self.run(ml, np.full(br.NX, 0.6), 3)
+    assert np.allclose(ts[0], RATE) and np.allclose(ts[2], 3 * RATE)
+    assert not hasattr(ml, 'released')
+
+  def test_the_start_follows_a_car_still_moving_left(self):
+    ml = MoveSpeedLimit()
+    t4 = np.full(br.NX, 0.44)
+    self.run(ml, t4, 40)
+    gap, followed = 1.75, []
+    for _ in range(40):  # the car moves left at 0.1 m/s for 2 s: its gap grows 5 mm per frame
+      gap += 0.1 * DT_MDL
+      t = ml.update(np.full(br.NX, gap), t4 + (gap - 1.75), 1.0, np.zeros(br.NX), 0.0, DT_MDL, False)
+      followed.append(ml.followed)
+    assert followed[-1] and np.allclose(t, 0.0)  # the start is at the car (after the 1 s speed filter has seen it)
+    assert not followed[0] and ml.sideways_speed < br.FOLLOW_SPEED
+    for _ in range(80):  # the car stopped: the filtered speed decays, the follow ends and the approach grows again
+      t = ml.update(np.full(br.NX, gap), t4 + (gap - 1.75), 1.0, np.zeros(br.NX), 0.0, DT_MDL, False)
+    assert not ml.followed and t[5] > 0.0
+
+  def test_a_slow_leftward_drift_below_the_threshold_does_not_follow(self):
+    ml = MoveSpeedLimit()
+    t4 = np.full(br.NX, 0.44)
+    self.run(ml, t4, 40)
+    t = ml.update(np.full(br.NX, 1.75 + 0.01 * DT_MDL), t4, 1.0, np.zeros(br.NX), 0.0, DT_MDL, False)
+    assert not ml.followed and t[5] > 0.0
 
   def test_an_outward_switch_of_the_reference_does_not_move_the_target(self):
     ml = MoveSpeedLimit()
@@ -75,26 +92,21 @@ class TestMoveSpeedLimitUnit:
     ts = self.run(ml, t4, 100)
     before = ts[-1][5]
     sw = np.full(br.NX, 0.3)  # the reference moves 0.3 m outward through the weights (line -> edge), not with the road
-    t = ml.update(self.y_r + 0.3, t4 + 0.3, self.c_ctr, 1.0, sw, 0.0, DT_MDL, False)
-    assert abs(t[5] - (before + RATE)) < 1e-9  # the switch itself moves nothing; the approach continues at r_ref
+    t = ml.update(self.y_r + 0.3, t4 + 0.3, 1.0, sw, 0.0, DT_MDL, False)
+    assert abs(t[5] - (before + RATE)) < 1e-9 and not ml.followed  # the switch moves nothing; the approach continues at r_ref
 
   def test_an_inward_switch_reaches_the_target_at_once(self):
     ml = MoveSpeedLimit()
     ts = self.run(ml, np.full(br.NX, 0.44), 400)
-    t = ml.update(self.y_r - 0.3, np.full(br.NX, 0.14), self.c_ctr, 1.0, np.full(br.NX, -0.3), 0.0, DT_MDL, False)
+    t = ml.update(self.y_r - 0.3, np.full(br.NX, 0.14), 1.0, np.full(br.NX, -0.3), 0.0, DT_MDL, False)
     assert np.allclose(t, 0.14) and ts[-1][5] == pytest.approx(0.44)
 
   def test_a_geometric_widening_carries_the_target_with_its_gap(self):
     ml = MoveSpeedLimit()
     ts = self.run(ml, np.full(br.NX, 1.75 - 0.81 - 0.5), 400)
     widened = self.y_r + 0.5 * (X > 30)
-    t = ml.update(widened, widened - 0.81 - 0.5, self.c_ctr, 1.0, np.zeros(br.NX), 0.0, DT_MDL, False)
+    t = ml.update(widened, widened - 0.81 - 0.5, 1.0, np.zeros(br.NX), 0.0, DT_MDL, False)
     assert np.allclose(t - ts[-1], 0.5 * (X > 30), atol=RATE + 1e-9)
-
-  def test_the_centre_limit_is_a_floor(self):
-    ml = MoveSpeedLimit()
-    t = self.run(ml, np.full(br.NX, 0.44), 50, c_ctr=np.full(br.NX, 0.2))[-1]
-    assert np.all(t >= 0.2 - 1e-12)
 
   def test_a_lateral_prediction_error_leaves_the_approach_unchanged(self, monkeypatch):
     # B2's motion model with a constant lateral error of 5 mm per frame: T_lim (step 3) sees it, the approach A (step 4b, same-frame
@@ -103,16 +115,21 @@ class TestMoveSpeedLimitUnit:
       rl = RightLineBlendful()
       return [rl.update(Scene(v=13.0).model_output(), 13.0, True, 0.0, 0.0, inputs()).log['approach'] for _ in range(150)]
     clean = run()
-    orig = br.motion_predict
-    monkeypatch.setattr(br, 'motion_predict', lambda *a, **k: orig(*a, **k) + 0.005)
+    orig = br.GroundTarget.update
+
+    def drifting(self, *a, **k):  # T_lim's own lateral prediction is off by 5 mm per frame
+      if self.t is not None:
+        self.t = self.t + 0.005
+      return orig(self, *a, **k)
+    monkeypatch.setattr(br.GroundTarget, 'update', drifting)
     drifted = run()
     assert max(abs(c - d) for c, d in zip(clean, drifted, strict=True)) < 1e-12 and clean[-1] > 0.1
 
   def test_g0_is_carried_along_the_lane(self):
     ml = MoveSpeedLimit()
-    ml.update(self.y_r, np.full(br.NX, 0.44), self.c_ctr, 1.0, np.zeros(br.NX), 0.0, DT_MDL, True)
+    ml.update(self.y_r, np.full(br.NX, 0.44), 1.0, np.zeros(br.NX), 0.0, DT_MDL, True)
     ml.g0 = 1.75 - 0.01 * X
-    ml.update(self.y_r, np.full(br.NX, 0.44), self.c_ctr, 1.0, np.zeros(br.NX), 20.0, DT_MDL, False)
+    ml.update(self.y_r, np.full(br.NX, 0.44), 1.0, np.zeros(br.NX), 20.0, DT_MDL, False)
     inside = X + 20.0 * DT_MDL <= X[-1]
     np.testing.assert_allclose(ml.g0[inside], (1.75 - 0.01 * (X + 1.0))[inside], atol=1e-9)
 
@@ -185,15 +202,17 @@ class TestReEntries:
       assert logs[200]['f_radar'] == 0.0 and logs[-1]['f_radar'] == 1.0
 
   def test_junction_episode_end_with_the_car_left_of_the_centre(self):
-    # the lane centre 0.3 m right of the car when the episode ends: the target starts at the centre limit and A is held there
+    # the lane centre 0.3 m right of the car when the episode ends: the target starts at the car (rev 6.10), left of the centre, and while
+    # it is left of the centre the larger of Regular's and the right-line correction is delivered
     scenes = [Scene(v=20.0, center=0.3)] * 150 + [Scene(v=20.0, center=0.3, bend_x0=15.0, bend_R=30.0)] * 30 + [Scene(v=20.0, center=0.3)] * 200
-    rl, rows, logs = run_instance(scenes, 20.0)
+    rl, rows, logs = run_instance(scenes, 20.0, k0_up=1e-4)
     ends = reset_frames(rows, 1)
     assert ends, 'no junction episode ended'
     e = ends[0]
-    assert logs[e]['approach_held']
-    lg = logs[e + 5]
-    np.testing.assert_allclose(lg['target'], np.minimum(lg['c_ctr'], lg['t4']), atol=1e-6)  # at the centre limit (the floor)
+    self.check_reset_then_growth(rows, e)
+    lg = logs[e + 20]  # (at the episode end the bent right line still lets the line bound bind somewhere in the window: right-line share)
+    assert lg['trl_minus_centre'] < -0.2 and lg['delivered'] in (br.DELIVER_REGULAR, br.DELIVER_LARGER_RIGHT_LINE)
+    assert float(np.interp(30.0, X, lg['target'])) < float(np.interp(30.0, X, lg['c_ctr'])) - 0.2  # not floored at the centre
 
   @pytest.mark.parametrize("kind", ['right', 'left', 'going_around'])
   def test_yield_end(self, kind):
@@ -364,29 +383,6 @@ class TestClosedLoop:
     stop = int(np.argmax(episode[i0:])) + i0 if episode[i0:].any() else len(t)
     assert abs(step) > 1.0 or stop == len(t)  # -0.3 m is no junction cue
     assert stop > i0 + 2 and np.diff(tg[i0 - 2:stop]).min() >= -0.003  # never moves left (the car's own heading noise only, mm)
-
-  @pytest.mark.parametrize("kmh", SPEEDS)
-  def test_binding_centre_limit_step_is_followed_at_the_loop_pace_to_the_centre(self, kmh):
-    # a large GUI gap puts the right-line target left of the centre: the centre limit binds; it then steps 0.2 m right (left line 0.4 m in)
-    def scene(t):
-      return {'left': -1.75 + (0.4 if t > 5.0 else 0.0)}
-    t, y, vs, tg, tc = closed_loop(kmh / 3.6, scene, seconds=40.0, gap=2.0)
-    on = t >= 0.5
-    assert np.all(tg[on] >= tc[on] - 1e-6)
-    assert abs(y[-1] - 0.2) < 0.01  # ends at the new centre
-    assert vs[t > 5.0].max() > 0.06  # at the loop's (Regular's) pace, not limited to 0.05 m/s
-
-  @pytest.mark.parametrize("kmh", SPEEDS)
-  def test_start_left_of_the_centre_returns_at_the_loop_pace_then_0_05_m_s_beyond(self, kmh):
-    # mode on with the car 0.4 m left of the lane centre, as after a model-alone junction episode (reset at p0 = T_C'(0), held until the
-    # car is there): the return to the centre runs at the loop's pace, the move beyond the centre at <= 0.055 m/s (design E3).  In check
-    # 20's loop the plan follows the car's heading, so the 0.17 m/s return makes upstream's own going-around latch (its plan end moves
-    # right): with it as a trigger the cap (obstacle on the left) leaves the crude loop no way to turn the heading back.  That trigger is
-    # therefore not passed on here (ReferenceWithoutOwnYield); with a real model the plan follows the road.
-    t, y, vs, tg, tc = closed_loop(kmh / 3.6, lambda t: {}, seconds=50.0, regular_s=0.0, y0=-0.4, reference=ReferenceWithoutOwnYield())
-    assert vs[y < -0.05].max() > 0.06
-    assert vs[y > 0.05].max() <= 0.055
-    assert abs(y[-1] - (1.75 - br.W_R - 0.44)) < 0.01
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -580,66 +576,190 @@ class TestThreeTriggerSides:
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
-# the car's own speed with a heading-keeping model (design rev 6.7 B5 / E3: r_ref so that the car moves at <= 0.05 m/s; bound 0.052 m/s)
-def model_loop(seconds, v_fn, scene_fn, mode_fn=lambda t: MODE_RIGHT, y0=0.0, regular_s=5.0, gap=(0.5, 1.0)):
-  """The review's loop (results/2026-11-12_a8_impl_r3/review/rv3_move_model.py, model=True): check 20's car (0.2 s dead time, 0.3 s lag) with a
-  model that keeps the road's direction (plan along the road from the car; its curvature turns the heading back in about 1 s), healthy
-  empty radar.  Returns the car's peak sideways speed toward the right while it is right of the lane centre (+0.02 m), from t = 0."""
+# "Start and floor" (design rev 6.10 E3, check 23b as a test): the car's own speed with a model that keeps the road's direction
+def scene_loop(kmh, scene, seconds=45.0, regular=False, gap=0.44):
+  """The heading-keeping loop of the round-3 review (rv3_move_model.py, model=True): check 20's car (0.2 s dead time, 0.3 s lag) with a model
+  that keeps the road's direction (plan along the road from the car; its curvature turns the heading back in about 1 s) and, in 'resting',
+  pulls toward 0.75 m left of the centre at line probabilities 0.55 (Regular's trust about 0.8: Regular rests about 0.15 m left of it).
+  regular: the same scene in Regular only (the comparison).  Ground frame, lane centre 0, right line 1.75 m; gap 0.44 m: the right-hand
+  position is +0.5 m.  Returns time, car position, sideways speed, the right-line target and the centre limit at L (ground), delivered
+  source and follow events per frame."""
+  v = kmh / 3.6
   ctl = BlendfulCorrection()
-  y, psi, kc = y0, 0.0, 0.0
+  sc = {'y0': 0.0, 'regular_s': 5.0, 'pull': None, 'probs': 0.9, 'mode': lambda t: MODE_RIGHT, 'prob': lambda t: None, 'left': lambda t: -1.75,
+        'gap': gap}
+  sc.update(SCENES[scene])
+  y, psi, kc = sc['y0'], 0.0, 0.0
   buf = [0.0] * 4
-  peak = 0.0
+  rows = []
+  look = max(1.5 * v, 10.0)
   for i in range(int(seconds / DT_MDL)):
-    t = i * DT_MDL - regular_s
-    v = v_fn(t)
-    mo = model_output(v, y, psi, kc, **scene_fn(t))
-    mo['plan'][0, :, 1] = -psi * X
+    t = i * DT_MDL - sc['regular_s']
+    pr = sc['prob'](t)
+    mo = model_output(v, y, psi, kc, left=sc['left'](t), right_line_prob=sc['probs'] if pr is None else pr)
+    mo['lane_lines_prob'][0, 3] = sc['probs']
     k_model = -psi / max(v, 1.0)
-    ctl.update(mo, v, True, k_model, LAT_T, MODE_REGULAR if t < 0 else mode_fn(t), inputs(gap_low=gap[0], gap_high=gap[1]))
+    mo['plan'][0, :, 1] = -psi * X
+    if sc['pull'] is not None:  # the model wants to be at the pull position (relative to the centre): plan and curvature toward it
+      e = sc['pull'][kmh] - y
+      mo['plan'][0, :, 1] += e * np.clip(X / look, 0.0, 1.0)
+      k_model += 2.0 * e / look ** 2
+    mode = MODE_REGULAR if (regular or t < 0) else sc['mode'](t)
+    ctl.update(mo, v, True, k_model, LAT_T, mode, inputs(gap_low=sc['gap'], gap_high=sc['gap']))
     buf.append(ctl.c + k_model)
     cmd = buf.pop(0)
     for _ in range(5):
       kc += (cmd - kc) * 0.01 / 0.3
       psi += v * kc * 0.01
       y += v * psi * 0.01
-    if t >= 0 and y > 0.02:
-      peak = max(peak, v * psi)
-  return peak
+    lg = ctl.result.log
+    shift = y + psi * look
+    rows.append((t, y, v * psi, float(np.interp(look, X, lg['target'])) + shift if lg else np.nan,
+                 float(np.interp(look, X, lg['c_ctr'])) + shift if lg else np.nan, lg.get('delivered', -1) if lg else -1,
+                 bool(lg.get('start_follows_car', False)) if lg else False))
+  scene_loop.last_log = ctl.result.log
+  r = np.array(rows, dtype=float)
+  return r[:, 0], r[:, 1], r[:, 2], r[:, 3], r[:, 4], r[:, 5], r[:, 6]
 
 
-def const(val):
-  return lambda t: val
+def toggling(t):
+  return MODE_RIGHT if (t < 0 or t > 30 or int(t / 2) % 2 == 0) else MODE_REGULAR
 
 
-V50 = 50 / 3.6
-FLICKER = 'right-line probability 0.45 +- 0.3 at 1 Hz'
+def flicker(t):
+  """The ONE shared quality-flicker fixture (design rev 6.10 E3): q(t) = 0.45 + 0.3 sin(2 pi t) on the right line, from t = 0 to 30 s."""
+  return float(0.45 + 0.3 * np.sin(2 * np.pi * t)) if 0 <= t < 30 else 0.9
 
 
-class TestCarSpeedWithAHeadingKeepingModel:
-  """Review R3-S1 numbers at r_ref 0.042 m/s (review/rref.txt): 0.0497 / 0.0509 / 0.0500, switch 0.0511, 100 -> 50 km/h 0.0491."""
+SCENES = {
+  'plain': {},
+  'return': {'y0': -0.4, 'regular_s': 0.0},  # mode on with the car 0.4 m left of the centre (as after a model-alone junction episode)
+  # Regular rests about 0.15 m left of the centre: line probabilities 0.55 (Regular's trust about 0.8) and a model pull calibrated per speed
+  'resting': {'y0': -0.4, 'regular_s': 0.0, 'pull': {30: -0.396, 50: -0.55, 80: -0.462}, 'probs': 0.55},
+  'toggle': {'y0': 0.5, 'regular_s': 0.0, 'mode': toggling},  # at the right-hand position, then Right line <-> Regular every 2 s
+  'flicker': {'y0': 0.5, 'regular_s': 0.0, 'prob': flicker},
+  # a large GUI gap puts the right-line target left of the centre; the centre then steps 0.2 m right (the left line 0.4 m in)
+  'centre_step': {'gap': 2.0, 'left': lambda t: -1.75 + (0.4 if t > 5.0 else 0.0)},
+}
+
+
+def right_of_centre_peak(t, y, vs):
+  m = (t >= 0) & (y > 0.0)
+  return float(vs[m].max()) if m.any() else 0.0
+
+
+def own_move_peak(t, y, vs, tg, tc):
+  """Keep Right's own move: the right-line target and the car beyond the centre (as design check 23b counts it)."""
+  m = (t >= 0) & (tg >= tc + 0.1) & (y > 0.05)
+  return float(vs[m].max()) if m.any() else 0.0
+
+
+class TestStartAndFloor:
+  """Design numbers (EST, the design's crude loop): plain 0.0498-0.0506; return 0.0665 / 0.0750 / 0.0732 vs Regular 0.0667 / 0.0752 / 0.0733;
+  resting <= 0.048; toggling 0.041-0.049; flicker 0.038-0.044.  Whole instance (round 4, TEST in this loop): plain 0.0497 / 0.0509 / 0.0508;
+  return equal to Regular (0.0886 / 0.1262 / 0.1023), Keep Right's own move 0.0484-0.0515; resting: see the test; toggling own move
+  0.0546-0.0563 and flicker 0.0543-0.0674 (strict xfail, round-4 open points)."""
   @pytest.mark.parametrize("kmh", SPEEDS)
-  def test_step(self, kmh):
-    assert model_loop(60, const(kmh / 3.6), lambda t: {}) <= 0.052
+  def test_plain_move(self, kmh):
+    t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'plain', seconds=50.0)
+    assert own_move_peak(t, y, vs, tg, tc) <= 0.052 and right_of_centre_peak(t, y, vs) <= 0.052
+    assert abs(y[-1] - 0.5) < 0.01
 
-  def test_line_to_edge_switch_mid_move(self):
-    peak = model_loop(60, const(V50), lambda t: {'right_edge': 2.15, 'right_line_prob': float(np.clip(0.9 - 0.9 * (t - 5), 0, 0.9)) if t > 5 else 0.9})
-    assert peak <= 0.053  # w changes during the move (design rev 6.7 E3)
+  @pytest.mark.parametrize("kmh", SPEEDS)
+  def test_return_from_left_of_the_centre(self, kmh):
+    t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'return', seconds=50.0)
+    tr, yr, vr, *_ = scene_loop(kmh, 'return', seconds=50.0, regular=True)
+    assert right_of_centre_peak(t, y, vs) <= right_of_centre_peak(tr, yr, vr) + 0.002
+    assert own_move_peak(t, y, vs, tg, tc) <= 0.052
+    assert np.any(src == br.DELIVER_REGULAR) and abs(y[-1] - 0.5) < 0.02
 
-  def test_speed_drop_100_to_50_km_h(self):
-    assert model_loop(80, lambda t: float(np.interp(t, [40, 50], [100 / 3.6, 50 / 3.6])), lambda t: {}) <= 0.052
+  @pytest.mark.parametrize("kmh", SPEEDS)
+  def test_regular_resting_left_of_the_centre(self, kmh):
+    # Design: the car reaches +0.5 m.  In the whole instance a model pull that holds Regular 0.15 m left of the centre at trust 0.8 is a
+    # plan 0.40-0.55 m left of the centre; the right-line fit is clipped at D_MAX 1.0 m (C9) and scaled by s_R (0.75 at probabilities 0.55),
+    # so the right-line correction saturates below what +0.5 m needs: Keep Right ends at -0.15 .. -0.05 m, never left of Regular (round-4
+    # open point).  Asserted: never left of Regular's rest, everything right of the centre <= 0.052 m/s, overall peak <= Regular's settling +
+    # 0.002, and the right-line fit at its clip at the end (the reason)
+    t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'resting', seconds=60.0)
+    lg = scene_loop.last_log
+    tr, yr, vr, *_ = scene_loop(kmh, 'resting', seconds=60.0, regular=True)
+    assert -0.2 < yr[-1] < -0.1  # the fixture: Regular rests about 0.15 m left of the centre
+    assert right_of_centre_peak(t, y, vs) <= 0.052
+    assert vs[t >= 0].max() <= vr[tr >= 0].max() + 0.002
+    assert y[-1] >= yr[-1] - 0.005
+    assert lg['d_clipped'] or abs(y[-1] - 0.5) < 0.03
 
-  # Cases the review shows r_ref cannot bound (R3-S1); expected to fail until design rev 6.8's statement is implemented (round 4 Part B)
-  @pytest.mark.xfail(strict=True, reason="R3-S1: return from 0.4 m left of the centre crosses it at the loop's pace (review 0.0873 m/s at any r_ref)")
-  def test_return_from_left_of_the_centre(self):
-    assert model_loop(60, const(V50), lambda t: {}, y0=-0.4, regular_s=0.0) <= 0.055
+  @pytest.mark.parametrize("kmh", SPEEDS)
+  def test_reset_right_of_the_centre_with_mode_toggling_does_not_pull_back(self, kmh):
+    # Regular's phases move the car toward the centre; a reset never pulls it further back than Regular alone does
+    t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'toggle', seconds=45.0)
+    tr, yr, vr, *_ = scene_loop(kmh, 'toggle', seconds=45.0, regular=True)
+    assert y[t >= 0].min() >= yr[tr >= 0].min() - 0.01 and abs(y[-1] - 0.5) < 0.01  # (8 mm more in this loop: phase of the toggles)
 
-  @pytest.mark.xfail(strict=True, reason="R3-S1: Right line <-> Regular every 2 s (review 0.0659 m/s at r_ref 0.042)")
-  def test_mode_toggling_every_2_s(self):
-    assert model_loop(70, const(V50), lambda t: {}, mode_fn=lambda t: MODE_RIGHT if (t < 20 or t > 50 or int(t / 2) % 2 == 0) else MODE_REGULAR) <= 0.052
+  @pytest.mark.xfail(strict=True, reason="round-4 open point: toggling every 2 s, Keep Right's own move 0.0546-0.0563 m/s in the whole "
+                                         + "instance (design EST 0.041-0.049): a rising a moves the blend from Regular's centre toward the car")
+  @pytest.mark.parametrize("kmh", SPEEDS)
+  def test_mode_toggling_own_move(self, kmh):
+    t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'toggle', seconds=45.0)
+    assert own_move_peak(t, y, vs, tg, tc) <= 0.052
 
-  @pytest.mark.xfail(strict=True, reason="R3-S1: right-line quality flicker across the gate (review 0.0636 m/s at r_ref 0.042; needs <= 0.034)")
-  def test_quality_flicker_across_the_gate(self):
-    assert model_loop(70, const(V50), lambda t: {'right_line_prob': float(np.clip(0.45 + 0.3 * np.sin(2 * np.pi * t), 0, 1)) if 20 <= t < 50 else 0.9}) <= 0.052
+  @pytest.mark.xfail(strict=True, reason="round-4 open point: the shared flicker fixture, Keep Right's own move 0.0543-0.0674 m/s in the whole "
+                                         + "instance (design EST 0.038-0.044; Regular alone 0.033-0.058 right of the centre)")
+  @pytest.mark.parametrize("kmh", SPEEDS)
+  def test_quality_flicker_across_the_gate(self, kmh):
+    t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'flicker', seconds=45.0)
+    assert own_move_peak(t, y, vs, tg, tc) <= 0.052
+
+  @pytest.mark.parametrize("kmh", SPEEDS)
+  def test_quality_flicker_ends_at_the_right_hand_position(self, kmh):
+    t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'flicker', seconds=45.0)
+    assert abs(y[-1] - 0.5) < 0.02 and y[t >= 0].min() > -0.1
+
+  @pytest.mark.parametrize("kmh", SPEEDS)
+  def test_a_bound_left_of_the_centre_is_reached(self, kmh, monkeypatch):
+    # a safety bound putting the target 0.2 m left of the centre (the line bound made 1.14 m: 1.75 - 0.81 - 1.14 = -0.2): the car goes
+    # there; the right-line correction is delivered (no larger-of while a bound binds, no cap at Regular's pull)
+    monkeypatch.setattr(br, 'LINE_BOUND', 1.14)
+    t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'plain', seconds=50.0)
+    assert abs(y[-1] + 0.2) < 0.02
+    assert np.all(src[t > 1.0] == br.DELIVER_RIGHT_LINE)
+
+  @pytest.mark.parametrize("kmh", SPEEDS)
+  def test_centre_step_with_the_right_line_target_left_of_the_centre_follows_at_regular_pace(self, kmh):
+    t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'centre_step', seconds=40.0)
+    tr, yr, vr, *_ = scene_loop(kmh, 'centre_step', seconds=40.0, regular=True)
+    assert abs(y[-1] - yr[-1]) < 0.01 and abs(y[-1] - 0.2) < 0.03  # where Regular goes: the new centre
+    assert np.any(src[t > 5.0] == br.DELIVER_REGULAR)
+
+  def test_follow_threshold_against_line_jitter(self):
+    # a steady hold at the right-hand position with 3 cm of independent jitter on every line, 120 s: no leftward ratchet of the target
+    v = 50 / 3.6
+    rng = np.random.default_rng(7)
+    ctl = BlendfulCorrection()
+    y, psi, kc = 0.5, 0.0, 0.0
+    buf = [0.0] * 4
+    tgs, follows = [], 0
+    look = 1.5 * v
+    for i in range(int(150 / DT_MDL)):
+      mo = model_output(v, y, psi, kc)
+      mo['lane_lines'][0, :, :, 0] += 0.03 * rng.standard_normal((4, 1))
+      mo['plan'][0, :, 1] = -psi * X
+      k_model = -psi / v
+      ctl.update(mo, v, True, k_model, LAT_T, MODE_RIGHT, inputs(gap_low=0.44, gap_high=0.44))
+      buf.append(ctl.c + k_model)
+      cmd = buf.pop(0)
+      for _ in range(5):
+        kc += (cmd - kc) * 0.01 / 0.3
+        psi += v * kc * 0.01
+        y += v * psi * 0.01
+      lg = ctl.result.log
+      if i * DT_MDL >= 30:  # after the start-up (mode on at a = 0) has settled
+        tgs.append(float(np.interp(look, X, lg['target'])) + y + psi * look)
+        follows += int(lg['start_follows_car'])
+    tgs = np.array(tgs)
+    assert np.mean(tgs[-200:]) - np.mean(tgs[:200]) > -0.02  # no net leftward drift beyond the jitter
+    assert abs(y - 0.5) < 0.03
+    TestStartAndFloor.follow_events = follows
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -722,8 +842,19 @@ class TestClearanceYieldHold:
       res = step([(1, 8.0, -1.4, 0.0)])
     assert res.yield_active
     res = step([(1, 10.5, -1.4, 0.0)])  # a 2.5 m jump: confirmation restarts
-    actives = [res.yield_active] + [step([(1, 10.5, -1.4, 0.0)]).yield_active for _ in range(10)]
-    assert all(actives)  # held through the 0.3 s re-confirmation (and d > 0 again afterwards)
+    results = [res] + [step([(1, 10.5, -1.4, 0.0)]) for _ in range(10)]
+    assert all(r.yield_active for r in results)  # held through the 0.3 s re-confirmation (and d > 0 again afterwards)
+    # rev 6.10 B6a: the track that lost its confirmation stays the remembered object, the deficit is computed from it meanwhile
+    assert all(r.deficit == pytest.approx(0.11) for r in results) and all(r.memory >= 1 for r in results[:5])
+
+  def test_a_lost_track_is_remembered_for_one_second_only(self):
+    rcl = RadarClearance()
+    C, E, W0 = np.zeros(br.NX), np.full(br.NX, 1e3), np.zeros(br.NX)
+    for _ in range(6):
+      res = rcl.update(frame([(1, 30.0, -1.4, 0.0)]), 13.0, 0.0, 0.0, 0.5, 0.0, br.W_R, X, C, E, W0)  # 30 m ahead: beyond the memory zone
+    assert res.objects == 1
+    objs = [rcl.update(frame([]), 13.0, 0.0, 0.0, 0.5, 0.0, br.W_R, X, C, E, W0).objects for _ in range(25)]
+    assert objs[:19] == [1] * 19 and objs[-1] == 0
 
   def test_released_when_the_object_has_passed_the_rear_bumper(self):
     rcl = RadarClearance()

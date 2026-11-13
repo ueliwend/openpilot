@@ -63,10 +63,13 @@ RESEED_LOOKAHEADS = 2.0  # points beyond 2 L take T_raw every frame (rev 6.4)
 # final move-speed limit (B5 step 4b, rev 6.5 / 6.7; owner 21:44 question 9): the car moves at <= 0.05 m/s; the means is the reference
 # rate r_ref, the rate at which the approach to the right reference may grow (start value 0.042 m/s, rev 6.7; final value from the kit)
 REFERENCE_RATE = 0.042  # m/s, r_ref
-CAR_MOVE_SPEED = 0.05  # m/s, the decided move speed of the car (release condition after a reset)
-RELEASE_NEAR = 0.05  # m: after a reset the approach is held until the car is this close to p0 (and its own approach is <= CAR_MOVE_SPEED)
+CAR_MOVE_SPEED = 0.05  # m/s, the decided move speed of the car (r_ref is set so that the car stays below it)
+FOLLOW_SPEED = -0.02  # m/s: while the car moves left faster than this (and is left of T_RL) the start follows it (rev 6.10, EST)
+FOLLOW_SPEED_TAU = 1.0  # s, low-pass of the car's sideways speed for the follow rule (implementation choice: line jitter, round-4 open point)
 # measurement-filter rotation lever (B2, rev 6.3): "design" = lever x (scale 1, default); "model_axis" = lever x vEgo / v_x(0)
 ROTATION_SCALES = ("design", "model_axis")
+# delivered right-line share (rev 6.10, log): the right-line correction, or the larger of Regular's and it while T_RL is left of the centre
+DELIVER_RIGHT_LINE, DELIVER_REGULAR, DELIVER_LARGER_RIGHT_LINE = 0, 1, 2
 FILTER_ROTATION_SCALE = "design"
 # yields (B6, C7, C8)
 Q_NO_GROWTH, Q_CAP_START, Q_CAP_FULL, Q_RELEASE = 0.1, 0.15, 0.2, 0.1
@@ -223,49 +226,58 @@ class GroundTarget:
 
 
 class MoveSpeedLimit:
-  """Final move-speed limit (B5 step 4b, rev 6.5; question 9; reviews K62-1, C63-1; impl review B3).  Same frame, lane coordinates, no
-  lateral prediction.  Per window point the gap of the step-4 target to the right reference is G4 = Y_R - T4; G0 is the gap at the last
-  reset, carried along the lane by the model's own travel and rebased by the switch part of the change of Y_R (amendment 1).  The weighted
-  approach A = w (G0 - G), w = a s_R f_yieldR, grows by at most REFERENCE_RATE dt per frame, any decrease passes at once:
-  A_lim = min(w (G0 - G4), A_prev + REFERENCE_RATE dt), G = max(G4, G0 - A_lim / w) (G = max(G4, G0) at w = 0), and the target is
-  max(T_C', Y_R - G) (the centre limit as a floor, amendment 2); the caller applies the right safety bounds after it.
-  Reset (A = 0): p0 = max(car position, T_C'(0)), G0 := Y_R(0) - p0 along the lane, A held at 0 until the car's gap is within 0.05 m of
-  p0's and its own approach to the right reference (from Y_R(0), switch part removed) is <= CAR_MOVE_SPEED."""
+  """Final move-speed limit (B5 step 4b, rev 6.5 / 6.7; "Start and floor" rev 6.10; question 9; reviews K62-1, C63-1; impl reviews B3,
+  R3-S1).  Same frame, lane coordinates, no lateral prediction.  Per window point the gap of the step-4 target to the right reference is
+  G4 = Y_R - T4; G0 is the gap at the last reset, carried along the lane by the model's own travel and rebased by the switch part of the
+  change of Y_R (amendment 1).  The weighted approach A = w (G0 - G), w = a s_R f_yieldR, grows by at most r_ref dt per frame, any
+  decrease passes at once: A_lim = min(w (G0 - G4), A_prev + r_ref dt), G = max(G4, G0 - A_lim / w) (G = max(G4, G0) at w = 0).  The
+  right-line target is T_RL = Y_R - G, **not floored at the centre limit** (rev 6.10; the left limit acts through the delivered correction,
+  RightLineBlendful).  Reset (A = 0): G0 := the car's own gap Y_R(0), wherever the car is; no hold.  While the car's sideways speed (from its
+  gap to the filtered right reference, switch part removed) is below FOLLOW_SPEED and the car is left of T_RL, the start follows the car
+  leftward (G0 := the car's gap, A := 0)."""
   def __init__(self):
     self.g0: np.ndarray | None = None
     self.a_lim = np.zeros(NX)
-    self.released = False
     self.limiting = False
+    self.followed = False  # the start followed the car this frame
     self.yr0_prev: float | None = None
-    self.approach_speed = 0.0
+    self.sideways_speed = 0.0  # the car's sideways speed toward the right reference (> 0: moving right), m/s
 
-  def update(self, y_r: np.ndarray, t4: np.ndarray, c_ctr: np.ndarray, w: float, switch_part: np.ndarray, vx0: float, dt: float,
-             reset: bool) -> np.ndarray:
+  def _start_at_the_car(self, yr0: float):
+    self.g0 = np.full(NX, yr0)
+    self.a_lim = np.zeros(NX)
+
+  def update(self, y_r: np.ndarray, t4: np.ndarray, w: float, switch_part: np.ndarray, vx0: float, dt: float, reset: bool) -> np.ndarray:
     yr0 = float(y_r[0])
     if self.yr0_prev is not None:
-      self.approach_speed = (self.yr0_prev + float(switch_part[0]) - yr0) / dt
+      raw_speed = (self.yr0_prev + float(switch_part[0]) - yr0) / dt
+      self.sideways_speed += (raw_speed - self.sideways_speed) * dt / (dt + FOLLOW_SPEED_TAU)
     self.yr0_prev = yr0
     if self.g0 is not None:
       xs = X_IDXS + vx0 * dt
       self.g0 = np.interp(xs, X_IDXS, self.g0) + switch_part
       self.a_lim = np.interp(xs, X_IDXS, self.a_lim)
     if reset or self.g0 is None:
-      p0 = max(0.0, float(c_ctr[0]))
-      self.g0 = np.full(NX, yr0 - p0)
-      self.a_lim = np.zeros(NX)
-      self.released = False
-    if not self.released and yr0 <= float(self.g0[0]) + RELEASE_NEAR and self.approach_speed <= CAR_MOVE_SPEED:
-      self.released = True
+      self._start_at_the_car(yr0)
     g4 = y_r - t4
+    t_rl = self._target(y_r, g4, w, dt)
+    self.followed = False
+    if self.sideways_speed < FOLLOW_SPEED and float(t_rl[0]) > 0.0:  # the car still moves left and is left of T_RL: follow it
+      self._start_at_the_car(yr0)
+      t_rl = self._target(y_r, g4, w, 0.0)
+      self.followed = True
+    return t_rl
+
+  def _target(self, y_r: np.ndarray, g4: np.ndarray, w: float, dt: float) -> np.ndarray:
     if w > 1e-9:
       want = w * (self.g0 - g4)
-      self.a_lim = np.minimum(want, self.a_lim + (REFERENCE_RATE * dt if self.released else 0.0))
+      self.a_lim = np.minimum(want, self.a_lim + REFERENCE_RATE * dt)
       self.limiting = bool(np.any(self.a_lim < want - 1e-9))
       g = np.maximum(g4, self.g0 - self.a_lim / w)
     else:
       self.limiting = False
       g = np.maximum(g4, self.g0)
-    return np.maximum(c_ctr, y_r - g)
+    return y_r - g
 
 
 class Authority:
@@ -1014,13 +1026,23 @@ class RightLineBlendful:
     present = qa > 0.0
     reasons = (a <= 0.0, was_episode and not in_episode, yield_ended, present and not self.ref_present_prev, self.mode_on)
     self.ref_present_prev, self.mode_on = present, False
-    t_move = self.move.update(y_r, t4, c_ctr, a * s_r * f_yr, switch_part, vx0, dt, any(reasons))
-    target = self.safety_bounds(t_move, t_bound_line, t_bound_edge, w_e)
+    t_rl = self.move.update(y_r, t4, a * s_r * f_yr, switch_part, vx0, dt, any(reasons))
+    target = self.safety_bounds(t_rl, t_bound_line, t_bound_edge, w_e)  # T_RL <= T4 already holds the object bound and the bounds
     # --- correction (B4)
     d_rl, k0_rl, k_fit, d_clipped = self._correction(target, plan_x, plan_y, v, s_r)
     k0_rl *= f_yr
+    # delivered correction (rev 6.10, "Start and floor"): while T_RL lies left of the centre limit (at x = L) and no safety or object bound
+    # binds, the right-line share is the larger of Regular's and the right-line correction in the rightward sense, else the right-line one
+    # Deviation (round 4 open point): also while the car itself is left of the centre limit, so that the right-line share cannot drop
+    # below Regular's when T_RL passes the centre ahead of a car still left of it (kappa_RL(T_C') < kappa_up where s_R < trust: a limit
+    # cycle with the follow rule in the resting scene)
+    trl_minus_centre = float(np.interp(iL, X_IDXS, t_rl - c_ctr))
+    car_left_of_centre = float(c_ctr[0]) > 0.0
+    larger_of = (trl_minus_centre < -1e-6 or car_left_of_centre) and not bound_active and not rc.bound_active
+    k_r = max(k0_up, k0_rl) if larger_of else k0_rl
+    delivered = (DELIVER_REGULAR if k0_up > k0_rl else DELIVER_LARGER_RIGHT_LINE) if larger_of else DELIVER_RIGHT_LINE
     wts = junction_policy(in_episode, a, right_line_mode=not force_regular)
-    k0 = wts.w_rl * k0_rl + wts.w_up * k0_up
+    k0 = wts.w_rl * k_r + wts.w_up * k0_up
     if fading:
       k0 = 0.0
     right_only = bool(q_R > 0.5 and l_q < 0.3)
@@ -1050,7 +1072,8 @@ class RightLineBlendful:
       'road_class': road, 'frame_dt': dt, 'plan_speed': vx0, 'target_lag': lag_L,
       'yield_side': log_side(caps), 'yield_source': src, 'centre_source': centre_src, 'yield_moving': self.moving_t > 0.0,
       't_raw': t_raw, 't_lim': t_lim, 't4': t4, 'y_edge_r': filt[3], 'c_ctr': c_ctr, 'y_r': y_r, 'y_l': y_l, 'beta': beta, 'jump_inno': np.array(inno),
-      'approach': float(np.interp(iL, X_IDXS, mv.a_lim)), 'gap_reset': float(np.interp(iL, X_IDXS, mv.g0)), 'approach_held': not mv.released,
+      'approach': float(np.interp(iL, X_IDXS, mv.a_lim)), 'gap_reset': float(np.interp(iL, X_IDXS, mv.g0)), 'start_follows_car': mv.followed,
+      'delivered': delivered, 'trl_minus_centre': trl_minus_centre,
       'move_reset': sum(int(r_) << i for i, r_ in enumerate(reasons)), 'switch_part': float(np.interp(iL, X_IDXS, switch_part)),
       'move_limiting': mv.limiting, 'rotation_scale': ROTATION_SCALES.index(self.rotation_scale), 'radar': rc,
     }
@@ -1290,7 +1313,9 @@ def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
   # rev 6.5 final move-speed limit (B5 step 4b)
   builder.blendfulApproach = float(lg['approach'])
   builder.blendfulGapReset = float(lg['gap_reset'])
-  builder.blendfulApproachHeld = bool(lg['approach_held'])
+  builder.blendfulStartFollowsCar = bool(lg['start_follows_car'])
+  builder.blendfulDeliveredSource = int(lg['delivered'])
+  builder.blendfulTargetMinusCentre = float(lg['trl_minus_centre'])
   builder.blendfulMoveLimiting = bool(lg['move_limiting'])
   builder.blendfulMoveReset = int(lg['move_reset'])
   builder.blendfulSwitchPart = float(lg['switch_part'])
