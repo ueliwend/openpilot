@@ -54,7 +54,6 @@ ERROR_CLIP = 1.0  # m
 D_MAX = 1.0  # m, the fitted profile amplitude is clipped here (C9)
 BUILD, RELEASE, FADING_RELEASE, SWERVE_RELEASE = 0.5, 2.0, 0.5, 5.0  # m/s^3, final limiter (blendful.py:57-60; 5 = controlsd's limit)
 # authority (B5)
-A_DEAD, A_DWELL, A_OUT, A_IN, A_HOLD = 0.05, 0.5, 1.0, 0.5, 1.0
 # ground-fixed target T_lim (B5 step 3, C1): glide rate in both directions, lag-bound rate, far points re-seeded from T_raw
 TARGET_RATE = 0.25  # m/s, both directions (rev 6.3: the speed of moves to the right is set by the final move-speed limit)
 LAG_BOUND, LAG_RATE = 1.0, 0.5  # m, m/s: where the target lags its raw value by more, that point moves at LAG_RATE (still glide-limited)
@@ -63,9 +62,6 @@ RESEED_LOOKAHEADS = 2.0  # points beyond 2 L take T_raw every frame (rev 6.4)
 # rate r_ref, the rate at which the approach to the right reference may grow (start value 0.042 m/s, rev 6.7; final value from the kit)
 REFERENCE_RATE = 0.042  # m/s, r_ref
 CAR_MOVE_SPEED = 0.05  # m/s, the decided move speed of the car (r_ref is set so that the car stays below it)
-FOLLOW_SPEED = -0.02  # m/s: no longer used (follow rule removed, review of rev 6.15 item 2); kept for the harness
-FOLLOW_SPEED_TAU = 1.0  # s, low-pass of the car's sideways speed for the follow rule (rev 6.11 item 4, EST)
-RESEED_STABLE = 1.0  # s: the re-seed fires once a has reached a_cmd and a_cmd has been unchanged this long (rev 6.12 B5 item 2, C612-1)
 CAR_LEFT_HYST = 0.02  # m, hysteresis of 'car left of the centre' for the larger-of rule (rev 6.12, R4-S2)
 AUTHORITY_LIMITED_TIME = 2.0  # s: Regular delivered while T_RL is right of the centre this long -> 'authority-limited' (C611-2)
 # measurement-filter rotation lever (B2, rev 6.3): "design" = lever x (scale 1, default); "model_axis" = lever x vEgo / v_x(0)
@@ -74,14 +70,11 @@ ROTATION_SCALES = ("design", "model_axis")
 DELIVER_RIGHT_LINE, DELIVER_REGULAR, DELIVER_LARGER_RIGHT_LINE = 0, 1, 2
 FILTER_ROTATION_SCALE = "design"
 # yields (B6, C7, C8)
-Q_NO_GROWTH, Q_CAP_START, Q_CAP_FULL, Q_RELEASE = 0.1, 0.15, 0.2, 0.1
-GAP_SMOOTH_TAU, GAP_MEDIAN_S = 0.25, 0.5  # s, endpoint gap smoothing and the median window before the running minimum
+Q_NO_GROWTH, Q_CAP_START, Q_CAP_FULL = 0.1, 0.15, 0.2
 USUAL_TAU, USUAL_TAU_AROUND = 10.0, 20.0  # s
 SWERVE_YIELD = (0.2, 0.45)  # m, upstream Blendful's YIELD (blendful.py)
-MOVE_LAG_EPS, MOVE_SETTLE = 0.03, 3.0  # m, s: a move to the right is on while the target still glides or the correction builds, plus settle time (EST)
 # jumps (B5 table, C6)
 JUMP_LINE, JUMP_EDGE, JUMP_FRAMES, JUMP_HOLD, JUMP_WEIGHT = 0.6, 1.2, 2, 2.0, 0.5  # m, m, frames, s, candidate weight
-CAND_CHANGE = 0.1  # change of a candidate's weight per frame that freezes the running minimum
 # junctions (B7); all thresholds are EST start values, set on E1
 CUE_WIDEN_FRAME, CUE_WIDEN_TIME, CUE_EDGE_DIV, CUE_EDGE_ANGLE = 0.5, 0.5, 0.6, 4.0  # m, m, m, deg
 CUE_GORE_SEP, CUE_GORE_SPREAD, CUE_KINK, CUE_BEND = 0.6, 0.5, 4.0, 0.5  # m, m, deg, b
@@ -241,11 +234,7 @@ class MoveSpeedLimit:
     self.g0: np.ndarray | None = None
     self.a_lim = np.zeros(NX)
     self.limiting = False
-    self.followed = False  # always False: the follow rule is removed (review of rev 6.15 item 2); kept for the log field
-    self.yr0_prev: float | None = None
-    self.sideways_speed = 0.0  # the car's sideways speed toward the right reference (> 0: moving right), m/s (log only)
     self.u = np.zeros(NX)  # rev 6.15: unweighted approach U = G0 - G >= 0
-    self.w_prev = 0.0
     self.created = True  # rev 6.15: the first update after creation (start, lane-tracking restart) is a logged reset
 
   def _start_at_the_car(self, yr0: float):
@@ -255,10 +244,6 @@ class MoveSpeedLimit:
 
   def update(self, y_r: np.ndarray, t4: np.ndarray, w: float, switch_part: np.ndarray, vx0: float, dt: float, reset: bool) -> np.ndarray:
     yr0 = float(y_r[0])
-    if self.yr0_prev is not None:
-      raw_speed = (self.yr0_prev + float(switch_part[0]) - yr0) / dt
-      self.sideways_speed += (raw_speed - self.sideways_speed) * dt / (dt + FOLLOW_SPEED_TAU)
-    self.yr0_prev = yr0
     if self.g0 is not None:
       xs = X_IDXS + vx0 * dt
       self.g0 = np.interp(xs, X_IDXS, self.g0) + switch_part
@@ -268,18 +253,12 @@ class MoveSpeedLimit:
     if reset or self.g0 is None:
       self._start_at_the_car(yr0)
     g4 = y_r - t4
-    self.followed = False
     return self._target(y_r, g4, w, dt)
-
-  def reseed(self, y_r: np.ndarray, t4: np.ndarray, w: float) -> np.ndarray:
-    """Re-seed the start at the car (rev 6.12 B5 item 2): G0 := the car's gap, A := 0; returns the new T_RL."""
-    self._start_at_the_car(float(y_r[0]))
-    return self._target(y_r, y_r - t4, w, 0.0)
 
   def _target(self, y_r: np.ndarray, g4: np.ndarray, w: float, dt: float) -> np.ndarray:
     """rev 6.15 (E1 on round 5: the weighted state A could go negative and G = G0 - A / w diverged as w fell): state G0 (start) and the
     unweighted approach U = G0 - G >= 0.  A step-4 target left of the start moves the start with it (G stays within [G4, G0]); a falling w
-    keeps U (G continuous); the weighted approach w U grows by <= r_ref dt, also when w rises; w = 0 is a reset frame."""
+    keeps U (G continuous); rev 7: the unweighted U grows by <= r_ref dt; only the limiter's creation resets."""
     self.g0 = np.maximum(self.g0, g4)
     u_want = self.g0 - g4
     # rev 7 (owner 13 Nov 11:15-12:19, one continuous controller): only the growth of the UNWEIGHTED approach U is limited (<= r_ref dt per
@@ -287,7 +266,6 @@ class MoveSpeedLimit:
     # correction returns at the strength filter's pace, not with a restarted slow move.  A decrease passes at once.
     self.u = np.minimum(u_want, self.u + REFERENCE_RATE * dt)
     self.limiting = bool(np.any(self.u < u_want - 1e-9))
-    self.w_prev = w
     self.a_lim = w * self.u
     return y_r - (self.g0 - self.u)
 
@@ -753,11 +731,7 @@ class RightInputs:
   left_blinker: bool = False
   right_blinker: bool = False
   frame_dt: float = DT_MDL  # true interval between model frames (timestampEof), s
-  ref_going_around: bool = False  # the reference instance's going-around yield latch
-  ref_yield_fade: float = 1.0  # the reference instance's going-around / away fade (< 1: upstream sees an obstacle)
-  ref_departure: float = 0.0  # the reference instance's offset - usual, m (> 0: its plan end moved right, i.e. an obstacle on the left)
   ref_lane_width: float = LANE_WIDTH_DEFAULT  # the reference instance's filtered lane width (left limit with one reference)
-  building: bool = False  # last frame's final limiter was still building the correction toward the right
   c_delivered: float = 0.0  # last frame's delivered correction c, 1/m (rev 7.1: the detector's own-move estimate)
   lat_action_t: float = 0.275  # actuator delay, s (rev 7.1: the detector's own-move estimate)
   radar: RadarFrame | None = None  # the newest radarTracks message (B6a); None = no radar data: f_radar = 0, Right line = Regular
@@ -787,7 +761,6 @@ class RightLineBlendful:
     self.reset()
 
   def reset(self):
-    self.quality_gate = ConfGate()
     self.authority = Authority()
     self.episodes = JunctionEpisodes()
     self.road = RoadClass()
@@ -816,7 +789,6 @@ class RightLineBlendful:
     self.ground = GroundTarget()
     self.move = MoveSpeedLimit()
     self.ref_present_prev = False
-    self.reseed_armed = False  # rev 6.12 B5 item 2: armed at every reset, fires once
     self.car_left = False  # 'car left of the centre' with hysteresis (R4-S2)
     self.regular_right_t = 0.0  # how long Regular has been delivered while T_RL is right of the centre (C611-2)
     self.jumps = JumpDetector()
@@ -830,9 +802,7 @@ class RightLineBlendful:
     """Yield state: endpoint-gap trigger, both latches, the aggregator and the move flag (also while the instance fades, review S2)."""
     self.detector = SwerveDetector()
     self.gap_rebase = 0.0  # cumulative switch part of the right reference at L (log)
-    self.ref_yield_latch = Timed(off_time=1.0)
     self.yields = YieldAggregator()
-    self.moving_t = 0.0
     self.no_growth_prev = False
 
   @property
@@ -1068,7 +1038,6 @@ class RightLineBlendful:
                self.move.created, w_rl <= 1e-9)
     self.ref_present_prev, self.mode_on = present, False
     t_rl = self.move.update(y_r, t4, w_rl, switch_part, vx0, dt, self.move.created)
-    reseeded = False  # rev 7: the re-seed is removed (it depended on a_cmd); field kept for the log until the log move
     target = self.safety_bounds(t_rl, t_bound_line, t_bound_edge, w_e)  # T_RL <= T4 already holds the object bound and the bounds
     # --- correction (B4)
     d_rl, k0_rl, k_fit, d_clipped = self._correction(target, plan_x, plan_y, v, s_r)
@@ -1122,10 +1091,10 @@ class RightLineBlendful:
       'widening': widening if widening is not None else 0.0,
       'width_mem': wm.w if wm.armed else 0.0, 'width_age': wm.age, 'width_state': int(wm.armed) | (int(wm.stale) << 1) | (int(not wm.armed) << 2),
       'road_class': road, 'frame_dt': dt, 'plan_speed': vx0, 'target_lag': lag_L,
-      'yield_side': log_side(caps), 'yield_source': src, 'centre_source': centre_src, 'yield_moving': self.moving_t > 0.0,
+      'yield_side': log_side(caps), 'yield_source': src, 'centre_source': centre_src,
       't_raw': t_raw, 't_lim': t_lim, 't4': t4, 'y_edge_r': filt[3], 'c_ctr': c_ctr, 'y_r': y_r, 'y_l': y_l, 'beta': beta, 'jump_inno': np.array(inno),
-      'approach': float(np.interp(iL, X_IDXS, mv.a_lim)), 'gap_reset': float(np.interp(iL, X_IDXS, mv.g0)), 'start_follows_car': mv.followed,
-      'reseeded': reseeded, 'authority_limited': authority_limited,
+      'approach': float(np.interp(iL, X_IDXS, mv.a_lim)), 'gap_reset': float(np.interp(iL, X_IDXS, mv.g0)),
+      'authority_limited': authority_limited,
       'car_left': self.car_left, 'bound_left_in_window': bound_left_in_window,
       'delivered': delivered, 'trl_minus_centre': trl_minus_centre,
       'move_reset': sum(int(r_) << i for i, r_ in enumerate(reasons)), 'switch_part': float(np.interp(iL, X_IDXS, switch_part)),
@@ -1141,10 +1110,6 @@ class RightLineBlendful:
     tb = np.minimum(t, t_bound_line)
     return tb - w_e * np.maximum(0.0, tb - t_bound_edge)
 
-  @staticmethod
-  def ref_around(p: RightInputs) -> bool:
-    """The reference instance sees an obstacle: its going-around latch, or its going-around / away fade below 1 (C8)."""
-    return bool(p.ref_going_around or p.ref_yield_fade < 1.0)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -1164,7 +1129,6 @@ class BlendfulCorrection:
     self.cap_mem: dict[int, float] = {}  # per capped side: the toward-obstacle correction at its no-growth point; lives with the phase (C8)
     self.cap_active = False
     self.release_window = False
-    self.building = False
     self.hand_over = False  # owner 13 Nov 09:27: the whole correction is handed to the model's path (log)
     self.hand_over_c = 0.0  # delivered correction c (1/m) at the latch of the last hand-over (log)
     self.hand_over_time = 0.0  # s from the latch of the last hand-over until c reached 0 (log)
@@ -1203,7 +1167,7 @@ class BlendfulCorrection:
     self.right_idle = True
     self.result = RightResult(fading=True)
     self.cap_mem = {}
-    self.cap_active = self.release_window = self.building = self.hand_over = self.hand_over_counting = False
+    self.cap_active = self.release_window = self.hand_over = self.hand_over_counting = False
     self.k_up = 0.0
     self.c = self._limit(0.0, v, RELEASE)
     self.k0 = self.c / self.gain
@@ -1256,11 +1220,7 @@ class BlendfulCorrection:
       return self._release_invalid(v_lim)
     self.k_up = self.reference.update(mo, v_ego, active, model_curvature, enabled=True)
     k0_up = self.k_up / f
-    p.ref_going_around = self.reference.going_around
-    p.ref_yield_fade = self.reference.yield_fade
-    p.ref_departure = self.reference.yield_departure
     p.ref_lane_width = float(self.reference.lane_width.x)
-    p.building = self.building
     p.c_delivered, p.lat_action_t = self.c, float(lat_action_t)
     res = RightResult()
     if right_runs:
@@ -1313,7 +1273,6 @@ class BlendfulCorrection:
       c_target = 0.0
       self.cap_active = True
     c_new = self._limit(c_target, v_lim, release)
-    self.building = (c_target - c_new) > 1e-9  # still building toward the right
     self.c = c_new if np.isfinite(c_new) else 0.0
     if self.hand_over_counting:  # from the latch until c has reached 0 or the hand-over ended, whichever is first (then kept)
       self.hand_over_time += float(p.frame_dt) if 0.2 * DT_MDL <= p.frame_dt <= 5.0 * DT_MDL else DT_MDL  # the instance's clamped dt
@@ -1378,7 +1337,6 @@ def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
   builder.blendfulBoundActive = bool(lg['bound_active'])
   builder.blendfulJunctionEpisode = bool(lg['episode'])
   builder.blendfulDClipped = bool(lg['d_clipped'])
-  builder.blendfulYieldMoving = bool(lg['yield_moving'])
   builder.blendfulJunctionCues = int(lg['cues'])
   builder.blendfulJunctionEnded = int(lg['episode_ended'])
   builder.blendfulWidthMemoryState = int(lg['width_state'])
