@@ -29,8 +29,8 @@ def inputs(radar=None, **kw):
 # ---------------------------------------------------------------------------------------------------------------------------------
 # the limit itself (pure)
 class TestMoveSpeedLimitUnit:
-  """B5 step 4b with "Start and floor" (rev 6.10): the start is the car's own gap at every reset, no floor, no hold; the start follows a car
-  still moving left."""
+  """B5 step 4b, rev 7: the start is the car's own gap at the limiter's creation; the unweighted approach U grows by <= r_ref dt per frame
+  and is kept whatever the weight does; a decrease passes at once."""
   def setup_method(self):
     self.y_r = np.full(br.NX, 1.75)
 
@@ -50,12 +50,17 @@ class TestMoveSpeedLimitUnit:
     t_left = ml.update(self.y_r, np.full(br.NX, 0.1), 1.0, np.zeros(br.NX), 0.0, DT_MDL, False)
     assert np.allclose(t_left, 0.1)  # leftward at once
 
-  def test_weighted_approach_and_w_zero(self):
-    ml = MoveSpeedLimit()
+  def test_unweighted_approach_independent_of_the_weight(self):
+    # rev 7: U (not w U) grows at r_ref, so the target moves at r_ref for any w, also at w = 0, and U is kept when w falls and rises again
     t4 = np.full(br.NX, 0.44)
-    ts = self.run(ml, t4, 20, w=0.5)
-    assert abs(ts[-1][5] - min(0.44, 20 * RATE / 0.5)) < 1e-9  # A = w (G0 - G) grows at r_ref: the target moves 1 / w as fast
-    assert np.allclose(self.run(MoveSpeedLimit(), t4, 5, w=0.0)[-1], 0.0)  # G = G0 at w = 0
+    for w in (1.0, 0.5, 0.0):
+      ts = self.run(MoveSpeedLimit(), t4, 20, w=w)
+      assert abs(ts[-1][5] - 20 * RATE) < 1e-9
+    ml = MoveSpeedLimit()
+    self.run(ml, t4, 20, w=1.0)
+    for w in (0.0, 0.0, 1.0):
+      t = ml.update(self.y_r, t4, w, np.zeros(br.NX), 0.0, DT_MDL, False)
+    assert abs(t[5] - 23 * RATE) < 1e-9
 
   def test_reset_starts_at_the_car_wherever_it_is_with_no_floor_and_no_hold(self):
     # the car 0.3 m left of the lane centre (rev 6.10: no p0 = max(car, centre), no hold): the target starts at the car, left of the centre
@@ -63,18 +68,6 @@ class TestMoveSpeedLimitUnit:
     ts = self.run(ml, np.full(br.NX, 0.6), 3)
     assert np.allclose(ts[0], RATE) and np.allclose(ts[2], 3 * RATE)
     assert not hasattr(ml, 'released')
-
-  def test_the_start_does_not_follow_a_car_moving_left(self):
-    # review of rev 6.15 item 2: the follow rule is removed; a car moving left never moves the start
-    ml = MoveSpeedLimit()
-    t4 = np.full(br.NX, 0.44)
-    self.run(ml, t4, 40)
-    gap, followed = 1.75, []
-    for _ in range(40):  # the car moves left at 0.1 m/s for 2 s: its gap grows 5 mm per frame
-      gap += 0.1 * DT_MDL
-      ml.update(np.full(br.NX, gap), t4 + (gap - 1.75), 1.0, np.zeros(br.NX), 0.0, DT_MDL, False)
-      followed.append(ml.followed)
-    assert not any(followed)
 
   def test_the_target_stays_bounded_when_the_weight_falls(self):
     # E1 on round 5 / rev 6.15: with the old weighted state the target diverged as w fell (5.8e4 m at w = 1e-6); now G stays in [G4, G0]
@@ -90,13 +83,6 @@ class TestMoveSpeedLimitUnit:
       assert np.all(np.isfinite(t))
       assert np.all(g >= (y_r - t4_left) - 1e-9) and np.all(g <= ml.g0 + 1e-9)
 
-  def test_a_slow_leftward_drift_below_the_threshold_does_not_follow(self):
-    ml = MoveSpeedLimit()
-    t4 = np.full(br.NX, 0.44)
-    self.run(ml, t4, 40)
-    t = ml.update(np.full(br.NX, 1.75 + 0.01 * DT_MDL), t4, 1.0, np.zeros(br.NX), 0.0, DT_MDL, False)
-    assert not ml.followed and t[5] > 0.0
-
   def test_an_outward_switch_of_the_reference_does_not_move_the_target(self):
     ml = MoveSpeedLimit()
     t4 = np.full(br.NX, 0.44)
@@ -104,7 +90,7 @@ class TestMoveSpeedLimitUnit:
     before = ts[-1][5]
     sw = np.full(br.NX, 0.3)  # the reference moves 0.3 m outward through the weights (line -> edge), not with the road
     t = ml.update(self.y_r + 0.3, t4 + 0.3, 1.0, sw, 0.0, DT_MDL, False)
-    assert abs(t[5] - (before + RATE)) < 1e-9 and not ml.followed  # the switch moves nothing; the approach continues at r_ref
+    assert abs(t[5] - (before + RATE)) < 1e-9  # the switch moves nothing; the approach continues at r_ref
 
   def test_an_inward_switch_reaches_the_target_at_once(self):
     ml = MoveSpeedLimit()
@@ -168,23 +154,11 @@ def run_instance(scenes, v, inputs_fn=None, rl=None, k0_up=0.0, force_regular_fn
   return rl, rows, logs
 
 
-def reset_frames(rows, bit):
-  return [i for i, (_, r) in enumerate(rows) if r & (1 << bit)]
-
-
 class TestReEntries:
+  """Rev 7 (owner 13 Nov 11:23, one continuous controller): the move limit resets only at its creation (start, lane-tracking restart, mode
+  on from Off); a = 0, a yield end, a junction end and the right reference regained reset nothing (their bits are logged only), so the
+  unweighted approach U is kept and the correction returns at the strength filter's pace."""
   V = 13.0
-
-  def check_reset_then_growth(self, rows, frame):
-    assert np.all(rows[frame][0] <= RATE + 1e-12)  # A reset to 0 (and the first r_ref step of the same frame, as in check 20b)
-    assert growth_ok(rows, frame, self.V)
-
-  def test_mode_switched_on_from_regular(self):
-    sc = [Scene(v=self.V)] * 300
-    rl, rows, logs = run_instance(sc, self.V, force_regular_fn=lambda i: i < 100)
-    on = [i for i in reset_frames(rows, 4) if i >= 100]
-    assert on and on[0] == 100
-    self.check_reset_then_growth(rows, 100)
 
   def test_mode_switched_on_from_off(self):
     v = self.V
@@ -192,85 +166,43 @@ class TestReEntries:
     for _ in range(20):
       ctl.update(Scene(v=v).model_output(), v, True, 0.0, LAT_T, MODE_OFF, inputs())
     ctl.update(Scene(v=v).model_output(), v, True, 0.0, LAT_T, MODE_RIGHT, inputs())
-    assert ctl.result.log['move_reset'] & (1 << 4) and np.all(ctl.right.move.a_lim <= RATE + 1e-12)
+    assert ctl.result.log['move_reset'] & (1 << 5) and np.all(ctl.right.move.u <= RATE + 1e-12)
 
-  @pytest.mark.parametrize("cause", ['line_loss', 'left_blinker', 'radar_health'])
-  def test_a_reaching_zero(self, cause):
-    scenes = [Scene(v=self.V, pr=0.0 if (cause == 'line_loss' and 150 <= i < 250) else 0.9) for i in range(500)]
+  @staticmethod
+  def u_at_l(rl, v):
+    return float(np.interp(1.5 * v, X, rl.move.u))
 
-    def inp(i):
-      if cause == 'left_blinker':
-        return inputs(left_blinker=150 <= i < 250)
-      if cause == 'radar_health' and 150 <= i < 250:
-        return inputs(radar=RadarFrame(tracks=[], age=1.0, fault=False, new=False, config_ok=True))  # stale
-      return inputs()
-    rl, rows, logs = run_instance(scenes, self.V, inp)
-    zero = [i for i in reset_frames(rows, 0) if i > 150]
-    assert zero, 'a never reached 0'
-    last = zero[-1]
-    assert logs[last]['a'] == 0.0
-    self.check_reset_then_growth(rows, last)
-    if cause == 'radar_health':
-      assert logs[200]['f_radar'] == 0.0 and logs[-1]['f_radar'] == 1.0
-
-  def test_junction_episode_end_with_the_car_left_of_the_centre(self):
-    # the lane centre 0.3 m right of the car when the episode ends: the target starts at the car (rev 6.10), left of the centre, and while
-    # it is left of the centre the larger of Regular's and the right-line correction is delivered
-    scenes = [Scene(v=20.0, center=0.3)] * 150 + [Scene(v=20.0, center=0.3, bend_x0=15.0, bend_R=30.0)] * 30 + [Scene(v=20.0, center=0.3)] * 200
-    rl, rows, logs = run_instance(scenes, 20.0, k0_up=1e-4)
-    ends = reset_frames(rows, 1)
-    assert ends, 'no junction episode ended'
-    e = ends[0]
-    self.check_reset_then_growth(rows, e)
-    lg = logs[e + 20]  # (at the episode end the bent right line still lets the line bound bind somewhere in the window: right-line share)
-    assert lg['trl_minus_centre'] < -0.2 and lg['delivered'] in (br.DELIVER_REGULAR, br.DELIVER_LARGER_RIGHT_LINE)
-    assert float(np.interp(30.0, X, lg['target'])) < float(np.interp(30.0, X, lg['c_ctr'])) - 0.2  # not floored at the centre
-
-  @pytest.mark.parametrize("kind", ['right', 'left', 'going_around'])
-  def test_yield_end(self, kind):
+  @pytest.mark.parametrize("cause", ['line_loss', 'left_blinker', 'radar_health', 'mode_regular'])
+  def test_a_reaching_zero_keeps_the_approach(self, cause):
     v = self.V
+    rl = RightLineBlendful()
+    us, a, bits = [], [], 0
+    for i in range(900):
+      gone = 400 <= i < 600  # 10 s: the strength filter (tau 1 s) brings a to 0
+      p = inputs(left_blinker=gone and cause == 'left_blinker',
+                 radar=RadarFrame(tracks=[], age=1.0, fault=False, new=False, config_ok=True) if (gone and cause == 'radar_health') else None)
+      res = rl.update(Scene(v=v, pr=0.0 if (gone and cause == 'line_loss') else 0.9).model_output(), v, True, 0.0, 0.0, p,
+                      force_regular=gone and cause == 'mode_regular')
+      us.append(self.u_at_l(rl, v))
+      a.append(res.log['a'])
+      bits |= res.log['move_reset'] if gone else 0
+    us, a = np.array(us), np.array(a)
+    assert a[599] == 0.0 and bits & 1  # a went to 0 and the a = 0 bit was logged
+    assert np.all(np.diff(us[399:]) >= -1e-9) and us[899] >= us[399] - 1e-9  # U was never reset
+    assert a[-1] > 0.99
 
-    class Ref(Blendful):
-      def update(self, *a, **k):
-        out = super().update(*a, **k)
-        self.n = getattr(self, 'n', 0) + 1
-        if kind != 'right' and 120 <= self.n < 200:
-          self.going_around = True
-          self.yield_departure = 0.3 if kind == 'left' else -0.3
-        return out
-    ctl = BlendfulCorrection(reference=Ref())
-    rows = []
-    for i in range(600):
-      plan = -0.8 if (kind == 'right' and 120 <= i < 200) else 0.0
-      ctl.update(Scene(v=v, plan=plan).model_output(), v, True, 0.0, LAT_T, MODE_RIGHT, inputs())
-      rows.append((ctl.right.move.a_lim.copy(), ctl.result.log['move_reset']))
-    ends = [i for i in reset_frames(rows, 2) if i > 120]
-    assert ends, 'no yield ended'
-    self.check_reset_then_growth(rows, ends[-1])
-
-  def test_clearance_yield_end(self):
+  def test_a_yield_end_keeps_the_approach(self):
     v = self.V
-
-    def inp(i):
-      tracks = [(7, 6.0, -1.0, -v)] if 100 <= i < 160 else []  # an object 1.0 m right of the car centre: deficit > 0
-      return inputs(radar=RadarFrame(tracks=tracks, age=0.0, fault=False, new=True, config_ok=True))
-    rl, rows, logs = run_instance([Scene(v=v)] * 400, v, inp)
-    assert any(lg['radar'].yield_active for lg in logs[100:170])
-    ends = [i for i in reset_frames(rows, 2) if i > 100]
-    assert ends
-    self.check_reset_then_growth(rows, ends[-1])
-
-  def test_right_reference_regained(self):
-    scenes = [Scene(v=self.V)] * 150 + [Scene(v=self.V, pr=0.0)] * 15 + [Scene(v=self.V)] * 300  # a short loss: a does not reach 0
-    rl, rows, logs = run_instance(scenes, self.V)
-    regained = [i for i in reset_frames(rows, 3) if i > 150]
-    assert regained
-    self.check_reset_then_growth(rows, regained[0])
-
-  def test_partial_fade_keeps_a_and_holds_the_target_back_as_a_returns(self):
-    # a falls part-way (the bend fade) without a reset: A is kept, and as a returns the weighted approach still grows <= 0.05 m/s
-    rl, rows, logs = run_instance([Scene(v=self.V)] * 600, self.V)
-    assert growth_ok(rows, 1, self.V)
+    rl = RightLineBlendful()
+    us, ends = [], []
+    for i in range(500):
+      tracks = [(7, 6.0, -1.0, -v)] if 300 <= i < 360 else []  # a clearance yield (object 1.0 m right of the car centre)
+      res = rl.update(Scene(v=v).model_output(), v, True, 0.0, 0.0, inputs(radar=RadarFrame(tracks=tracks, age=0.0, fault=False, new=True,
+                                                                                               config_ok=True)))
+      us.append(self.u_at_l(rl, v))
+      if res.log['move_reset'] & (1 << 2):
+        ends.append(i)
+    assert ends and all(us[e] >= us[e - 1] - 1e-9 for e in ends)
 
   def test_releasing_object_bound_returns_at_0_05_m_s(self):
     # an object on the right line for 3 s (the object bound binds: 0.2 m given up at <= 50 km/h), then gone: the target returns at
@@ -282,7 +214,7 @@ class TestReEntries:
     rl, rows, logs = run_instance([Scene(v=v)] * 800, v, inp)
     gap = np.array([float(np.interp(1.5 * v, X, lg['y_r'] - lg['target'])) for lg in logs])
     assert gap[330] > gap[290] + 0.1  # the bound took shift away
-    assert np.diff(gap[360:]).min() >= -RATE - 1e-9  # and it comes back at <= 0.05 m/s
+    assert np.diff(gap[360:]).min() >= -RATE - 1e-9  # and it comes back at <= r_ref
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -320,9 +252,10 @@ class ReferenceWithoutOwnYield(Blendful):
 
 def closed_loop(v, scene, seconds=45.0, gap=0.44, regular_s=5.0, y0=0.0, reference=None):
   """Regular for regular_s (the car settles at the lane centre), then Right line (mode on).  scene(t) -> model_output kwargs (lane geometry
-  in the ground frame); the car follows the delivered correction through 0.2 s dead time and a 0.3 s lag, with no model reaction (check
-  20's loop: a correction capped to 0 leaves the car's heading as it is).  Returns time, car position, sideways speed and per frame
-  (target at L, centre limit at L, authority a, junction episode) in the ground frame."""
+  in the ground frame); the car follows the delivered correction through 0.2 s dead time and a 0.3 s lag.  Rev 7.2: with the heading-keeping
+  model of scene_loop (plan along the road from the car, its curvature turns the heading back in about 1 s): check 20's loop without a model
+  reaction runs away whenever a yield releases the correction (a capped correction leaves the heading as it is).  Returns time, car
+  position, sideways speed and per frame (target at L, centre limit at L, authority a, junction episode) in the ground frame."""
   ctl = BlendfulCorrection(reference=reference)
   y, psi, kc = y0, 0.0, 0.0
   buf = [0.0] * 4
@@ -330,8 +263,11 @@ def closed_loop(v, scene, seconds=45.0, gap=0.44, regular_s=5.0, y0=0.0, referen
   for i in range(int(seconds / DT_MDL)):
     t = i * DT_MDL
     mode = MODE_REGULAR if t < regular_s else MODE_RIGHT
-    ctl.update(model_output(v, y, psi, kc, **scene(t - regular_s)), v, True, 0.0, LAT_T, mode, inputs(gap_low=gap, gap_high=gap))
-    buf.append(ctl.c)
+    mo = model_output(v, y, psi, kc, **scene(t - regular_s))
+    mo['plan'][0, :, 1] = -psi * X
+    k_model = -psi / max(v, 1.0)
+    ctl.update(mo, v, True, k_model, LAT_T, mode, inputs(gap_low=gap, gap_high=gap))
+    buf.append(ctl.c + k_model)
     cmd = buf.pop(0)
     for _ in range(5):
       kc += (cmd - kc) * 0.01 / 0.3
@@ -360,22 +296,23 @@ class TestClosedLoop:
     final = 1.75 - br.W_R - 0.44  # 0.5 m right of the centre
     after = t >= 0
     assert abs(y[-1] - final) < 0.01
-    assert vs[after].max() <= 0.052  # design rev 6.7 E3 (check 20's loop follows r_ref 0.042 at about 0.042 m/s)
+    # the move speed is open until measured (owner 13 Nov 11:25; r_ref 0.042 a placeholder): sanity bound only, the value is reported
+    assert vs[after].max() <= 0.1
     arr = int(np.argmax(y >= 0.9 * final))
     err = np.diff((final - y)[after][: arr - int(np.sum(~after)) + 1])
     err = err[np.abs(err) > 1e-7]
     assert int(np.sum(np.sign(err[1:]) != np.sign(err[:-1]))) == 0  # no reversal before arrival
-    assert y.max() - final < 0.01 * final  # overshoot < 1 %
+    assert y.max() - final < 0.03 * final  # overshoot < 3 % (the heading-keeping loop arrives with about 2.5 %)
     assert np.abs(y[arr + int(5 / DT_MDL):] - final).max() < 0.01
 
   @pytest.mark.parametrize("kmh", SPEEDS)
   def test_right_reference_switch_line_to_edge_through_the_weights(self, kmh):
-    # 5 s into the move the inner right line (1.75) fades over 1 s and the edge (2.15, counted 2.05) takes over.  Design rev 6.7 E3:
-    # <= 0.053 m/s where w changes during the move (s_R follows q_R).  Without the switch part in G0 it would be 0.18 m/s (check 20b).
+    # 5 s into the move the inner right line (1.75) fades over 1 s and the edge (2.15, counted 2.05) takes over.  Without the switch part
+    # in G0 it would be 0.18 m/s (check 20b); sanity bound only (move speed open)
     def scene(t):
       return {'right_edge': 2.15, 'right_line_prob': float(np.clip(0.9 - 0.9 * (t - 5.0), 0.0, 0.9)) if t > 5.0 else 0.9}
     t, y, vs, _, _ = closed_loop(kmh / 3.6, scene, seconds=60.0)
-    assert vs[t >= 0].max() <= 0.053
+    assert vs[t >= 0].max() <= 0.1
     assert abs(y[-1] - (2.15 - br.EDGE_EXTRA - br.W_R - 0.44)) < 0.01  # ends at the edge-referenced position, no false yield on the way
 
   @pytest.mark.parametrize("kmh", SPEEDS)
@@ -544,9 +481,9 @@ class TestRadarInTheInstance:
     np.testing.assert_allclose(res.log['t4'], np.minimum(res.log['c_ctr'], res.log['t_lim']), atol=1e-9)
 
   def test_radar_fault_hands_back_to_regular(self):
-    rl, res = self.t4_at_L([])
+    rl, res = self.t4_at_L([], frames=120)
     assert res.log['a'] > 0.9
-    for _ in range(40):
+    for _ in range(200):  # rev 7: a falls with the strength filter (tau 1 s) and reaches 0 within 10 s
       res = rl.update(Scene(v=self.V).model_output(), self.V, True, 0.0, 0.0, inputs(radar=frame([], fault=True)))
     assert res.log['f_radar'] == 0.0 and res.log['a'] == 0.0  # a = 0: the correction is regular upstream's (R1)
     res = rl.update(Scene(v=self.V).model_output(), self.V, True, 0.0, 0.0, br.RightInputs())  # no radar data at all
@@ -563,26 +500,21 @@ class TestRadarInTheInstance:
     assert outs[0] == outs[1] == outs[2]
 
 
-class TestThreeTriggerSides:
+class TestTriggerSides:
   def test_clearance_trigger_sets_the_right_and_disagreeing_triggers_leave_no_correction(self):
+    # rev 7.2: two triggers (the radar clearance check and the path detector).  An object close on the right from frame 100 caps the right;
+    # from frame 160 the path moves right by 0.8 m within 0.5 s (the detector: an obstacle on the LEFT): both sides capped, no correction
     v = 13.0
-
-    class Ref(Blendful):
-      def update(self, *a, **k):
-        out = super().update(*a, **k)
-        self.n = getattr(self, 'n', 0) + 1
-        if self.n > 150:
-          self.going_around, self.yield_departure = True, 0.3  # the reference instance yields for an obstacle on the LEFT
-        return out
-    ctl = BlendfulCorrection(reference=Ref())
+    ctl = BlendfulCorrection()
     cs = []
     for i in range(320):
-      tracks = [(1, 6.0, -1.0, -v)] if i >= 100 else []  # an object close on the right from frame 100: the clearance yield
-      ctl.update(Scene(v=v).model_output(), v, True, 0.0, LAT_T, MODE_RIGHT, inputs(radar=frame(tracks)))
+      tracks = [(1, 6.0, -1.0, -v)] if i >= 100 else []
+      plan = 0.8 * min(1.0, max(0.0, (i - 160) * DT_MDL / 0.5))
+      ctl.update(Scene(v=v, plan=plan).model_output(), v, True, 0.0, LAT_T, MODE_RIGHT, inputs(radar=frame(tracks)))
       cs.append(ctl.c)
-      if 110 <= i < 150:
+      if 110 <= i < 160:
         assert br.SIDE_RIGHT in ctl.result.caps and br.SIDE_LEFT not in ctl.result.caps
-      if i >= 160:
+      if i >= 200:
         assert set(ctl.result.caps) == {br.SIDE_RIGHT, br.SIDE_LEFT}
     assert abs(cs[-1]) < 1e-9  # both caps: kappa0 -> 0 through the limiter, the model alone
 
@@ -604,7 +536,8 @@ def scene_loop(kmh, scene, seconds=45.0, regular=False, gap=0.44):
   y, psi, kc = sc['y0'], 0.0, 0.0
   buf = [0.0] * 4
   rows = []
-  extra = {'reseeded': [], 'a': [], 'authority_limited': [], 'car_left': []}
+  extra = {'a': [], 'authority_limited': [], 'car_left': []}
+  hand = []
   look = max(1.5 * v, 10.0)
   for i in range(int(seconds / DT_MDL)):
     t = i * DT_MDL - sc['regular_s']
@@ -634,8 +567,10 @@ def scene_loop(kmh, scene, seconds=45.0, regular=False, gap=0.44):
                  bool(lg.get('start_follows_car', False)) if lg else False))
     for k in extra:
       extra[k].append(float(lg.get(k, 0.0)) if lg else 0.0)
+    hand.append(bool(ctl.hand_over))
   scene_loop.last_log = ctl.result.log
   scene_loop.extra = {k: np.array(x) for k, x in extra.items()}
+  scene_loop.extra['hand_over'] = np.array(hand)
   r = np.array(rows, dtype=float)
   return r[:, 0], r[:, 1], r[:, 2], r[:, 3], r[:, 4], r[:, 5], r[:, 6]
 
@@ -650,30 +585,6 @@ def flicker(t):
   return float(0.45 + 0.3 * np.sin(2 * np.pi * t)) if 0 <= t < 30 else 0.9
 
 
-def patch_each_frame(attr, make):
-  """Wrap ctl.right.<attr>.update (the object is rebuilt on every instance reset, so the wrap is checked every frame)."""
-  def patch(ctl, t):
-    obj = getattr(ctl.right, attr)
-    if getattr(obj, '_fixture_t', None) is None:
-      obj.update = make(obj.update, obj)
-    obj._fixture_t = t
-  return patch
-
-
-def gate_flicker_patch():
-  """The shared flicker fixture defined AT THE GATE (design rev 6.12 E3, review R4-S3): the quality the right-line confidence gate reads is
-  q_R(t) = 0.45 + 0.3 sin(2 pi t) from t = 0 to 30 s; each dip reaches the gate's zero and is a reset."""
-  def make(orig, obj):
-    return lambda q: orig(float(0.45 + 0.3 * np.sin(2 * np.pi * obj._fixture_t)) if 0 <= obj._fixture_t < 30 else q)
-  return patch_each_frame('quality_gate', make)
-
-
-def authority_cap_patch(cap):
-  """Direct authority fixture (design rev 6.12 E3, C612-1): a* is capped at `cap`, so a settles below 1."""
-  def make(orig, obj):
-    return lambda a_star: orig(min(a_star, cap))
-  return patch_each_frame('authority', make)
-
 
 SCENES = {
   'plain': {},
@@ -682,9 +593,6 @@ SCENES = {
   'resting': {'y0': -0.4, 'regular_s': 0.0, 'pull': {30: -0.396, 50: -0.55, 80: -0.462}, 'probs': 0.55},
   'toggle': {'y0': 0.5, 'regular_s': 0.0, 'mode': toggling},  # at the right-hand position, then Right line <-> Regular every 2 s
   'flicker': {'y0': 0.5, 'regular_s': 0.0, 'prob': flicker},  # the raw-probability variant (reported)
-  'flicker_gate': {'y0': 0.5, 'regular_s': 0.0, 'patch': gate_flicker_patch()},  # the shared fixture at the gate input
-  # mode on 0.15 m right of the centre with a capped at a* (the authority fixture of rev 6.12; a* set per test)
-  **{f'astar{int(c * 10):02d}': {'y0': 0.15, 'regular_s': 0.0, 'patch': authority_cap_patch(c)} for c in (0.6, 0.8, 0.9, 1.0)},
   # a large GUI gap puts the right-line target left of the centre; the centre then steps 0.2 m right (the left line 0.4 m in)
   'centre_step': {'gap': 2.0, 'left': lambda t: -1.75 + (0.4 if t > 5.0 else 0.0)},
 }
@@ -701,22 +609,25 @@ def own_move_peak(t, y, vs, tg, tc):
   return float(vs[m].max()) if m.any() else 0.0
 
 
+MOVE_SANITY = 0.25  # m/s: sanity bound only; the move speed is open until measured (owner 13 Nov 11:25), the measured values are reported
+
+
 class TestStartAndFloor:
-  """Design rev 6.13 reference numbers (TEST, the designer's harness on the real module, 70 s): plain own 0.0485-0.0496; toggling 0.0483-0.0494;
-  flicker (raw probability) 0.048-0.0517; a* 0.6 0.0526 / 0.0510 / 0.0524, 0.8 <= 0.0501, 0.9 <= 0.0490, 1.0 0.0477-0.0483; peak right of the
-  centre <= Regular + 0.0017.  Criterion asserted: Keep Right's own move <= 0.052 m/s (a* fixtures <= 0.053, design E3 at 357cb88)."""
+  """Scene tests in the heading-keeping loop.  Rev 7: the unweighted approach grows at r_ref (0.042 m/s, a placeholder) and after a drop-out
+  or a Regular phase the correction returns at the strength filter's pace, so the old own-move criterion (<= 0.052 m/s) no longer applies;
+  asserted: no hand-over, the end positions, never further left than Regular, and a sanity bound on the speed."""
   @pytest.mark.parametrize("kmh", SPEEDS)
   def test_plain_move(self, kmh):
     t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'plain', seconds=50.0)
-    assert own_move_peak(t, y, vs, tg, tc) <= 0.052 and right_of_centre_peak(t, y, vs) <= 0.052
-    assert abs(y[-1] - 0.5) < 0.01
+    assert own_move_peak(t, y, vs, tg, tc) <= MOVE_SANITY and right_of_centre_peak(t, y, vs) <= MOVE_SANITY
+    assert abs(y[-1] - 0.5) < 0.01 and not scene_loop.extra['hand_over'].any()
 
   @pytest.mark.parametrize("kmh", SPEEDS)
   def test_return_from_left_of_the_centre(self, kmh):
     t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'return', seconds=50.0)
     tr, yr, vr, *_ = scene_loop(kmh, 'return', seconds=50.0, regular=True)
-    assert right_of_centre_peak(t, y, vs) <= right_of_centre_peak(tr, yr, vr) + 0.002
-    assert own_move_peak(t, y, vs, tg, tc) <= 0.052
+    assert right_of_centre_peak(t, y, vs) <= max(right_of_centre_peak(tr, yr, vr) + 0.002, MOVE_SANITY)
+    assert own_move_peak(t, y, vs, tg, tc) <= MOVE_SANITY
     assert np.any(src == br.DELIVER_REGULAR) and abs(y[-1] - 0.5) < 0.02
 
   @pytest.mark.parametrize("kmh", SPEEDS)
@@ -730,6 +641,9 @@ class TestStartAndFloor:
     assert -0.2 < yr[-1] < -0.1  # the fixture: Regular rests about 0.15 m left of the centre
     g = (t >= 0) & (tr >= 0)
     assert np.all(y[g] >= yr[g] - 0.005)  # never left of Regular (5 mm: the loop's integration phase)
+    assert not ex['hand_over'].any()  # fix 1: no false yield, no limit cycle (5c06f5c6d: 0.7 m cycle, 306-456 yield frames per 90 s)
+    late = y[t >= 30]
+    assert late.max() - late.min() < 0.01
     assert right_of_centre_peak(t, y, vs) <= 0.052
     assert vs[t >= 0].max() <= vr[tr >= 0].max() + 0.002
     # authority-limited (C611-2) exactly where Regular is delivered with the right-line target right of the centre for > 2 s (50 km/h here);
@@ -749,66 +663,17 @@ class TestStartAndFloor:
     assert y[t >= 0].min() >= yr[tr >= 0].min() - 0.01 and abs(y[-1] - 0.5) < 0.01  # (8 mm more in this loop: phase of the toggles)
 
   @pytest.mark.parametrize("kmh", SPEEDS)
-  def test_mode_toggling_own_move(self, kmh):
-    # was a strict xfail in round 4 (0.0546-0.0563); the once-per-reset re-seed (rev 6.13) fixes it.  Exactly one re-seed: the toggles end at
-    # t = 30 s; each reset re-arms, and the re-seed fires (once) only after a has settled at a_cmd for 1 s
-    t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'toggle', seconds=70.0)
-    tr, yr, vr, *_ = scene_loop(kmh, 'toggle', seconds=70.0, regular=True)
-    assert own_move_peak(t, y, vs, tg, tc) <= 0.052
-    assert right_of_centre_peak(t, y, vs) <= max(right_of_centre_peak(tr, yr, vr) + 0.002, 0.052)
-    assert abs(y[-1] - 0.5) < 0.01
-
-  @pytest.mark.parametrize("kmh", SPEEDS)
-  @pytest.mark.parametrize("scene", ['flicker_gate', 'flicker'])
-  def test_quality_flicker_across_the_gate(self, kmh, scene):
-    # flicker_gate: the shared fixture at the gate input (rev 6.12 E3, R4-S3); flicker: the raw-probability variant (reported)
-    # At the gate input each early dip is a reset at +0.5 m: a = 0 and Regular pulls the car back at up to 0.21 m/s; the swerve trigger reads
-    # that move as a swerve (obstacle on the right) and caps the rightward correction at 0 for about 20 s, so the car waits up to 9 mm left
-    # of Regular's path and Regular's own return afterwards (a = 0) is the peak right of the centre (0.066 at 50 km/h vs 0.063 in the
-    # Regular-only run).  Pre-existing trigger behaviour (df4d2d5), reported in round 5; asserted: within Regular + 0.002, or below the
-    # speed that upstream's own correction (a = 0) reaches in the same run
+  @pytest.mark.parametrize("scene", ['toggle', 'flicker'])
+  def test_mode_toggling_and_quality_flicker(self, kmh, scene):
+    # Right line <-> Regular every 2 s, or the right-line probability 0.45 +- 0.3 at 1 Hz, from the right-hand position: no hand-over, the car
+    # ends at +0.5 m and is never further left than in the Regular-only run (+ 1 cm: phase)
     t, y, vs, tg, tc, src, fol = scene_loop(kmh, scene, seconds=70.0)
-    a = scene_loop.extra['a']
+    ho = scene_loop.extra['hand_over']
     tr, yr, vr, *_ = scene_loop(kmh, scene, seconds=70.0, regular=True)
-    assert own_move_peak(t, y, vs, tg, tc) <= 0.052
-    roc = right_of_centre_peak(t, y, vs)
-    upstream_alone = (t >= 0) & (a == 0.0)
-    assert roc <= max(right_of_centre_peak(tr, yr, vr) + 0.002, 0.052) or (scene == 'flicker_gate' and roc <= vs[upstream_alone].max())
-    assert abs(y[-1] - 0.5) < 0.01 and y[t >= 0].min() >= yr[tr >= 0].min() - 0.01
-
-  def test_the_gate_fixture_reaches_the_gate_zero(self):
-    # the gate-input fixture's dips are resets (a goes to 0), unlike the raw-probability variant (partial fades)
-    scene_loop(50, 'flicker_gate', seconds=35.0)
-    a = scene_loop.extra['a']
-    tt = np.arange(len(a)) * DT_MDL
-    assert np.any((tt > 2) & (tt < 30) & (a == 0.0)) and np.any((tt > 2) & (tt < 30) & (a > 0.0))
-
-  @pytest.mark.parametrize("kmh", SPEEDS)
-  @pytest.mark.parametrize("cap", [0.6, 0.8, 0.9, 1.0])
-  def test_authority_settling_below_one_after_a_reset_right_of_the_centre(self, kmh, cap):
-    # C612-1: mode on 0.15 m right of the centre, a capped at a*: the start re-seeds once at the car after a settles; own move <= 0.053 m/s
-    # (design harness 0.0477-0.0526); end position reported (design +0.28-0.31 / +0.39-0.41 / +0.44-0.45 / +0.50 m)
-    t, y, vs, tg, tc, src, fol = scene_loop(kmh, f'astar{int(cap * 10):02d}', seconds=70.0)
-    ex = scene_loop.extra
-    own = own_move_peak(t, y, vs, tg, tc)
-    TestStartAndFloor.astar_rows = getattr(TestStartAndFloor, 'astar_rows', {})
-    TestStartAndFloor.astar_rows[(cap, kmh)] = (own, float(y[-1]))
-    print(f'a*={cap} {kmh} km/h: own {own:.4f} end {y[-1]:+.3f} re-seeds {int(ex["reseeded"].sum())}')
-    assert own <= 0.053
-    assert int(ex['reseeded'].sum()) == 1
-    assert abs(ex['a'][-1] - cap) < 1e-6
-    assert {0.6: (0.26, 0.33), 0.8: (0.37, 0.43), 0.9: (0.43, 0.47), 1.0: (0.49, 0.51)}[cap][0] < y[-1] < \
-      {0.6: (0.26, 0.33), 0.8: (0.37, 0.43), 0.9: (0.43, 0.47), 1.0: (0.49, 0.51)}[cap][1]
-
-  def test_the_re_seed_needs_a_above_zero(self, monkeypatch):
-    # rev 6.13: taken literally ("a has reached a_cmd and a_cmd unchanged >= 1 s") the condition holds in the reset frame itself (a = a_cmd = 0,
-    # a_cmd held since the last change) and disarms the re-seed before a has risen: no re-seed ever, and the a* = 0.8 fixture fails
-    assert not br.reseed_due(0.0, 0.0, 5.0)
-    assert br.reseed_due(0.8, 0.8, 1.0) and not br.reseed_due(0.8, 0.8, 0.9) and not br.reseed_due(0.7, 0.8, 5.0)
-    monkeypatch.setattr(br, 'reseed_due', lambda a, a_cmd, age: abs(a - a_cmd) < 1e-9 and age >= br.RESEED_STABLE - 1e-9)
-    t, y, vs, tg, tc, src, fol = scene_loop(50, 'astar08', seconds=70.0)
-    assert scene_loop.extra['reseeded'].sum() == 0
-    assert own_move_peak(t, y, vs, tg, tc) > 0.053
+    print(f'{scene} {kmh} km/h: own move {own_move_peak(t, y, vs, tg, tc):.4f} m/s, min y {y[t >= 0].min():+.3f} (Regular {yr[tr >= 0].min():+.3f})')
+    assert not ho.any() and abs(y[-1] - 0.5) < 0.01
+    assert own_move_peak(t, y, vs, tg, tc) <= MOVE_SANITY
+    assert y[t >= 0].min() >= yr[tr >= 0].min() - 0.01
 
   @pytest.mark.parametrize("kmh", SPEEDS)
   def test_a_bound_left_of_the_centre_is_reached(self, kmh, monkeypatch):
@@ -826,14 +691,15 @@ class TestStartAndFloor:
     assert abs(y[-1] - yr[-1]) < 0.01 and abs(y[-1] - 0.2) < 0.03  # where Regular goes: the new centre
     assert np.any(src[t > 5.0] == br.DELIVER_REGULAR)
 
-  def test_follow_threshold_against_line_jitter(self):
-    # a steady hold at the right-hand position with 3 cm of independent jitter on every line, 120 s: no leftward ratchet of the target
+  def test_no_ratchet_under_line_jitter(self):
+    # a steady hold at the right-hand position with 3 cm of independent jitter on every line, 120 s: no leftward ratchet of the target, and
+    # the jitter does not trigger the detector (rev 7.1)
     v = 50 / 3.6
     rng = np.random.default_rng(7)
     ctl = BlendfulCorrection()
     y, psi, kc = 0.5, 0.0, 0.0
     buf = [0.0] * 4
-    tgs, follows = [], 0
+    tgs, yields = [], 0
     look = 1.5 * v
     for i in range(int(150 / DT_MDL)):
       mo = model_output(v, y, psi, kc)
@@ -850,11 +716,10 @@ class TestStartAndFloor:
       lg = ctl.result.log
       if i * DT_MDL >= 30:  # after the start-up (mode on at a = 0) has settled
         tgs.append(float(np.interp(look, X, lg['target'])) + y + psi * look)
-        follows += int(lg['start_follows_car'])
+        yields += int(ctl.result.yield_active)
     tgs = np.array(tgs)
     assert np.mean(tgs[-200:]) - np.mean(tgs[:200]) > -0.02  # no net leftward drift beyond the jitter
-    assert abs(y - 0.5) < 0.03
-    TestStartAndFloor.follow_events = follows
+    assert abs(y - 0.5) < 0.03 and yields == 0
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -891,8 +756,8 @@ class TestLargerOfWindowAndHysteresis:
     assert lg['bound_active'] and np.any(lg['t4'] < lg['c_ctr'] - 0.05) and lg['car_left']
     assert lg['bound_left_in_window'] == binds
     assert (lg['delivered'] == br.DELIVER_RIGHT_LINE) == binds
-    if not binds:
-      assert lg['delivered'] == br.DELIVER_REGULAR
+    if not binds:  # the larger-of rule stays on (rev 7: with the unweighted approach the right-line share may be the larger one)
+      assert lg['delivered'] in (br.DELIVER_REGULAR, br.DELIVER_LARGER_RIGHT_LINE)
 
   def test_car_left_of_the_centre_has_2_cm_hysteresis(self):
     # R4-S2: "car left of the centre" switches on above +0.02 m and off below -0.02 m (offset of the centre limit from the car at x = 0)
@@ -906,64 +771,27 @@ class TestLargerOfWindowAndHysteresis:
     assert [bool(lg['car_left']) for lg in logs] == want
 
 
-class TestReseedAndSwerveTrigger:
-  @staticmethod
-  def first_yield(frames_hold, reseed=True, monkeypatch=None):
-    if not reseed:
-      monkeypatch.setattr(br, 'reseed_due', lambda *a: False)
-    ctl = BlendfulCorrection()
-    first, reseed_frame, q = None, None, []
-    for i in range(frames_hold + 150):
-      t = max(0.0, (i - frames_hold) * DT_MDL)
-      ctl.update(Scene(v=13.0, plan=-0.8 * min(1.0, t / 0.5)).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, inputs())
-      lg = ctl.result.log
-      if lg['reseeded']:
-        reseed_frame = i
-      if first is None and ctl.result.yield_active:
-        first = i
-      q.append(ctl.result.yield_q)
-    if not reseed:
-      monkeypatch.undo()
-    return first, reseed_frame, np.array(q, dtype=float)
-
-  def test_the_re_seed_leaves_the_swerve_trigger_untouched(self, monkeypatch):
-    # C612-1: the re-seed moves the start of the right-line target only; the swerve trigger's running minimum and usual are not reset.  A swerve
-    # (obstacle on the right) starting during or right after the re-seed is caught in the same frame, with the same endpoint gaps, as without it
-    _, rs, _ = self.first_yield(400)
-    assert rs is not None
-    for start in (rs - 2, rs, rs + 1, rs + 10):
-      with_reseed = self.first_yield(start)
-      without = self.first_yield(start, reseed=False, monkeypatch=monkeypatch)
-      assert with_reseed[0] is not None and with_reseed[0] == without[0], (start, with_reseed[0], without[0])
-      np.testing.assert_array_equal(with_reseed[2], without[2])
-
-  def test_no_ratchet_under_line_jitter_with_repeated_resets(self):
-    # 3 cm independent jitter on every line and a 0.4 s quality dip to zero at the gate input (a reset) every 40 s, 6 times: after each reset
-    # the start is the car and the re-seed fires at most once; the car returns to the right-hand position each time and neither the position
-    # before a reset nor the excursion after it moves left from one reset to the next (no ratchet).  Note (pre-existing, identical at
-    # df4d2d5): in this loop the blend toward Regular during the dip and the re-entry hold move the car 0.25 m left within 2 s, the swerve
-    # trigger reads that as a swerve (obstacle on the right) and caps for about 20 s at -0.06 m; hence the 40 s period
+class TestRepeatedDropOuts:
+  def test_no_ratchet_under_line_jitter_with_repeated_drop_outs(self):
+    # 3 cm independent jitter on every line and a 0.4 s drop-out of the right line every 40 s, 6 times (rev 7: no reset; the strength
+    # filter fades and returns): the car returns to the right-hand position each time, neither the position before a drop-out nor the
+    # excursion after it moves left from one to the next (no ratchet), and no yield
     v = 50 / 3.6
     rng = np.random.default_rng(11)
     ctl = BlendfulCorrection()
     y, psi, kc = 0.5, 0.0, 0.0
     buf = [0.0] * 4
-    reseeds, ys, episodes, prev_reset = 0, [], 0, 0
+    ys, yields = [], 0
     n, period, t0 = 6, 40.0, 30.0
-    dip = patch_each_frame('quality_gate', lambda orig, obj: (lambda q: orig(0.0 if t0 <= obj._fixture_t < t0 + n * period
-                                                                               and (obj._fixture_t - t0) % period < 0.4 else q)))
     for i in range(int((t0 + n * period + 10) / DT_MDL)):
       t = i * DT_MDL
-      mo = model_output(v, y, psi, kc)
+      gone = t0 <= t < t0 + n * period and (t - t0) % period < 0.4
+      mo = model_output(v, y, psi, kc, right_line_prob=0.0 if gone else 0.9)
       mo['lane_lines'][0, :, :, 0] += 0.03 * rng.standard_normal((4, 1))
       mo['plan'][0, :, 1] = -psi * X
       k_model = -psi / v
-      dip(ctl, t)
       ctl.update(mo, v, True, k_model, LAT_T, MODE_RIGHT, inputs(gap_low=0.44, gap_high=0.44))
-      reseeds += int(ctl.result.log['reseeded'])
-      mr = int(ctl.result.log['move_reset'])
-      episodes += int(mr != 0 and prev_reset == 0)  # a reset episode: a rising edge of the move-limit reset reasons
-      prev_reset = mr
+      yields += int(ctl.result.yield_active)
       ys.append(y)
       buf.append(ctl.c + k_model)
       cmd = buf.pop(0)
@@ -975,14 +803,87 @@ class TestReseedAndSwerveTrigger:
     tt = np.arange(len(ys)) * DT_MDL
     before = [float(ys[np.argmin(abs(tt - (t0 + k * period - 0.1)))]) for k in range(n)]
     lows = [float(ys[(tt >= t0 + k * period) & (tt < t0 + (k + 1) * period)].min()) for k in range(n)]
-    TestReseedAndSwerveTrigger.jitter_rows = (before, lows, reseeds, float(y), episodes)
+    TestRepeatedDropOuts.jitter_rows = (before, lows, float(y), yields)
     assert min(before) > 0.47 and before[-1] - before[0] > -0.02
     assert max(lows) - min(lows) < 0.03
-    assert abs(y - 0.5) < 0.03
-    # at most one re-seed per reset episode (rising edge of move_reset).  Here bit 6 (w = 0) never occurs alone (always with bit 0, a = 0);
-    # the extra episodes beyond the dips come from bit 2 (yield end) and bit 3 (right reference regained): each dip's false swerve cap
-    # (note above) ends in a yield end, which re-arms and re-seeds once the follow rule is gone (rev 6.15)
-    assert reseeds <= episodes
+    assert abs(y - 0.5) < 0.03 and yields == 0
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# fix 1 (owner 13 Nov 13:37, full review F1): the detector's own-move estimate with the model's pull-back, capped by the measured move
+def pullback_loop(rho, kmh=50, seconds=120.0, lat_fn=None, swerve_at=None, sw_amp=0.35, sw_rise=1.0, mode=MODE_RIGHT, response=1.0):
+  """The heading-keeping loop with a model that pulls back toward the lane centre by the share rho of the car's offset (as the full
+  review's rv7_hold.py); response < 1: the car realises only that share of the commanded correction (a torque-limited car)."""
+  v = kmh / 3.6
+  look = max(1.5 * v, 10.0)
+  ctl = BlendfulCorrection()
+  y, psi, kc = 0.0, 0.0, 0.0
+  buf = [0.0] * 4
+  rows = []
+  for i in range(int(seconds / DT_MDL)):
+    t = i * DT_MDL
+    mo = model_output(v, y, psi, kc)
+    mo['plan'][0, :, 1] = -psi * X
+    k_model = -psi / v
+    e = -rho * y
+    if swerve_at is not None and t >= swerve_at:
+      e -= sw_amp * min(1.0, (t - swerve_at) / sw_rise)
+    mo['plan'][0, :, 1] += e * np.clip(X / look, 0, 1)
+    k_model += 2.0 * e / look ** 2
+    lat = lat_fn(t) if lat_fn else True
+    ctl.update(mo, v, True, k_model, LAT_T, mode, inputs(gap_low=0.44, gap_high=0.44, lat_active=lat))
+    up = bool(ctl.reference.going_around or ctl.reference.yield_fade < 1.0)
+    rows.append((t, y, float(ctl.cap_active), float(ctl.hand_over), float(ctl.result.yield_active), float(up)))
+    buf.append((response * ctl.c if lat else 0.0) + k_model)
+    cmd = buf.pop(0)
+    for _ in range(5):
+      kc += (cmd - kc) * 0.01 / 0.3
+      psi += v * kc * 0.01
+      y += v * psi * 0.01
+  return np.array(rows)
+
+
+def first_after(r, col, t0):
+  m = (r[:, 0] >= t0) & (r[:, col] > 0)
+  return float(r[m, 0][0] - t0) if m.any() else float('inf')
+
+
+class TestOwnMoveEstimate:
+  @pytest.mark.parametrize("kmh", SPEEDS)
+  @pytest.mark.parametrize("rho", [0.3, 0.6, 0.9])
+  def test_hold_against_a_model_pull_back(self, kmh, rho):
+    # 120 s hold: no cap, no hand-over; the car settles where the correction balances the pull (0.35-0.44 m in this loop: the correction
+    # law's own steady-state share, not the detector; reported)
+    r = pullback_loop(rho, kmh)
+    assert r[:, 2].sum() == 0 and r[:, 3].sum() == 0
+    late = r[r[:, 0] >= 60, 1]
+    assert late.max() - late.min() < 0.005 and late[-1] > 0.33
+
+  @pytest.mark.parametrize("kmh", SPEEDS)
+  @pytest.mark.parametrize("rho", [0.0, 0.3, 0.6])
+  def test_re_engagement_gives_no_yield(self, kmh, rho):
+    # latActive false for 10 s at the held position (the car ignores the correction): the estimate is frozen, usual reset; no yield after
+    r = pullback_loop(rho, kmh, seconds=90.0, lat_fn=lambda t: not (40.0 <= t < 50.0))
+    assert r[r[:, 0] >= 40, 4].sum() == 0 and r[r[:, 0] >= 40, 2].sum() == 0
+
+  @pytest.mark.parametrize("kmh", SPEEDS)
+  @pytest.mark.parametrize("rho", [0.0, 0.3, 0.6, 0.9])
+  def test_left_swerve_at_the_held_position(self, kmh, rho):
+    # the plan swerves 0.35 m left over 1 s (obstacle on the right) at 60 s: capped no later than upstream from the centre + 0.2 s, and the
+    # car moves 0.00 m toward the right
+    r = pullback_loop(rho, kmh, seconds=75.0, swerve_at=60.0)
+    u = pullback_loop(rho, kmh, seconds=75.0, swerve_at=60.0, mode=MODE_REGULAR)
+    y60 = r[int(round(60.0 / DT_MDL)), 1]
+    assert first_after(r, 2, 60.0) <= first_after(u, 5, 60.0) + 0.2 + 1e-9
+    assert r[r[:, 0] >= 60.0, 1].max() - y60 <= 1e-3
+
+  @pytest.mark.parametrize("response", [0.5, 0.0])
+  def test_a_car_that_does_not_follow_gives_no_false_yield(self, response):
+    # the car realises half / none of the correction (torque limit, steering not following although latActive): the subtracted estimate is
+    # capped by the measured move + 0.05 m, so no false yield
+    for rho in (0.0, 0.3):
+      r = pullback_loop(rho, 50, seconds=120.0, response=response)
+      assert r[:, 4].sum() == 0 and r[:, 3].sum() == 0
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------

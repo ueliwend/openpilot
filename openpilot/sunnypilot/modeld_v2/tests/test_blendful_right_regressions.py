@@ -28,24 +28,26 @@ LAT_T = 0.275
 SWERVE_RELEASE = 5.0  # m/s^3: the cap-release rate (controlsd's limit)
 
 
-def narrowed_lane_with_left_quality_flicker(q_centre: float, frames: int = 900, v: float = 20.0):
-  """3.5 m lane for 15 s (a width memory forms), then the left line steps 0.9 m right (a 2.6 m lane, the right line stays) and from 20 s on
+def narrowed_lane_with_left_quality_flicker(q_centre: float, frames: int = 1500, v: float = 20.0):
+  """3.5 m lane for 15 s (a width memory forms), then the left line steps 0.9 m right (a 2.6 m lane, the right line stays) and from 50 s on
+  (rev 7.1: the single detector reads the 0.45 m step of the lane centre as a path departure and caps for about 20 s, as upstream's test
+  does; the flicker starts after that)
   the left line's probability oscillates around q_centre (+-0.25 at 1 Hz; after upstream's 0.5 s probability filter q_L swings about
   +-0.07 around it).  Returns the final target at x = L per frame from 22.5 s on, and the delivered correction of a BlendfulCorrection
   driven with the same scenes."""
   rl, ctl = RightLineBlendful(), BlendfulCorrection()
   targets, cs, q_ls = [], [], []
   for i in range(frames):
-    t = max(i - 400, 0) * DT_MDL
+    t = max(i - 1000, 0) * DT_MDL
     narrowed = i >= 300
     sc = Scene(v=v, width=3.5 - (0.9 if narrowed else 0.0), center=0.45 if narrowed else 0.0, pr=0.9, std=0.1,
-               pl=0.9 if i < 400 else q_centre + 0.25 * np.sin(2 * np.pi * t))
+               pl=0.9 if i < 1000 else q_centre + 0.25 * np.sin(2 * np.pi * t))
     lg = rl.update(sc.model_output(), v, True, 0.0, 0.0, RightInputs()).log
     ctl.update(sc.model_output(), v, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
     targets.append(float(np.interp(1.5 * v, X, lg['target'])))
     q_ls.append(lg['q_L'])
     cs.append(ctl.c)
-  return np.array(targets[450:]), np.array(cs[450:]), np.array(q_ls[450:])
+  return np.array(targets[1050:]), np.array(cs[1050:]), np.array(q_ls[1050:])
 
 
 class TestTargetUnderQualityFlicker:
@@ -68,68 +70,9 @@ class TestTargetUnderQualityFlicker:
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
-def reference_with_forced_yield(start: int, departure: float):
-  """Today's Blendful as the reference instance, forced into its going-around yield from frame `start` on with the given own departure
-  offset - usual (m; < 0: its plan end moved left, i.e. the obstacle is on the right).  Stands for the cases the design keeps the reference
-  trigger for: upstream sees the obstacle while our endpoint-gap trigger stays below 0.1 m."""
-  class ForcedYield(Blendful):
-    frame = 0
-
-    def update(self, *args, **kwargs):
-      out = super().update(*args, **kwargs)
-      ForcedYield.frame += 1
-      if ForcedYield.frame > start:
-        self.going_around = True
-        self.yield_departure = departure
-      return out
-  return ForcedYield()
+# rev 7.2 (owner 13 Nov 12:52): the reference instance's own test is no longer a trigger for the mode; its side tests are removed
 
 
-def run_forced_reference_yield(ref_departure: float, own_plan_wobble: float, v: float = 13.0, frames: int = 320):
-  """Right line with the car pulled right; from frame 195 the plan wobbles by own_plan_wobble (m at 10 m; > 0 = right), so the endpoint
-  gap has a small departure (< 0.1 m) of that sign when the reference instance starts the yield at frame 200."""
-  ctl = BlendfulCorrection(reference=reference_with_forced_yield(200, ref_departure))
-  rows = []
-  for i in range(frames):
-    sc = Scene(v=v, plan=0.0 if i < 195 else own_plan_wobble)
-    ctl.update(sc.model_output(), v, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
-    rows.append((ctl.c, ctl.result.yield_active, ctl.release_window, ctl.result.log['away_car']))
-  return rows
-
-
-class TestObstacleSideFromTheTriggeringInstance:
-  @pytest.mark.parametrize("own_plan_wobble", [0.03, -0.03])
-  def test_b1_reference_trigger_supplies_the_side_right_obstacle(self, own_plan_wobble):
-    # the reference instance sees an obstacle on the RIGHT (its plan end moved 0.3 m left); our own departure is small, of either sign.
-    # Round 2 took the side from our departure's sign and kept 0.245 m/s^2 toward the obstacle for the whole yield.
-    rows = run_forced_reference_yield(-0.3, own_plan_wobble)
-    assert rows[199][0] > 1e-4  # pulled right before
-    first = next(i for i, r in enumerate(rows) if r[1])
-    assert max(abs(r[3]) for r in rows[first - 5:first + 1]) < 0.1  # our own trigger stays quiet: only the reference instance yields
-    for i in range(first, len(rows)):
-      assert rows[i][0] <= max(rows[i - 1][0], 0.0) + 1e-12  # no growth toward the right obstacle
-      if not rows[i][2] and i > first + 5:
-        assert rows[i][0] <= 1e-6  # the hard rule: no correction toward the obstacle outside the cap-release window
-    c = np.array([r[0] for r in rows])
-    assert np.abs(np.diff(c)).max() * 13.0 ** 2 / DT_MDL <= SWERVE_RELEASE + 1e-6
-
-  def test_b1_reference_trigger_supplies_the_side_left_obstacle(self):
-    # the reference instance sees an obstacle on the LEFT (its plan end moved right): the right-line part may stay, nothing pushes left
-    rows = run_forced_reference_yield(+0.3, -0.03)
-    first = next(i for i, r in enumerate(rows) if r[1])
-    assert all(r[0] >= -1e-9 for r in rows[first:])
-    assert rows[-1][0] > 1e-4  # the correction to the right, away from the left obstacle, is kept
-
-  def test_b1_side_unknown_caps_both_directions(self):
-    # the reference instance yields with a departure below 0.1 m: until a side is known nothing may grow in either direction
-    rows = run_forced_reference_yield(-0.05, +0.03)  # our own small departure has the sign that round 2 took for an obstacle on the left
-    first = next(i for i, r in enumerate(rows) if r[1])
-    for i in range(first, len(rows)):
-      assert abs(rows[i][0]) <= abs(rows[i - 1][0]) + 1e-12
-    assert abs(rows[-1][0]) <= 1e-6
-
-
-# ---------------------------------------------------------------------------------------------------------------------------------
 class TestHandBackWindowCap:
   @pytest.mark.parametrize("switch_frame", [206, 210, 215, 220])
   def test_b2_cap_holds_after_a_switch_to_regular_inside_a_yield(self, switch_frame):

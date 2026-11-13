@@ -26,6 +26,7 @@ def RightInputs(**kw):
   return br.RightInputs(**kw)
 
 X = np.array(ModelConstants.X_IDXS)
+A_STEP = DT_MDL / (DT_MDL + br.STRENGTH_TAU) + 1e-3  # rev 7: the largest frame step of the strength filter (plus the end snap)
 LAT_T = 0.275
 W_R = br.W_R
 
@@ -360,13 +361,14 @@ class TestCorrectionLaw:
     assert all(r.k0 == k0_up for r in res)  # a = 0: exactly upstream's correction (blend law kappa0 = a RL + (1 - a) up)
 
   def test_blend_is_continuous_in_a(self):
+    # rev 7: a is a first-order low-pass (tau 1 s) of a*: no step larger than the filter's (plus the 1e-3 end snap), monotone toward a*
     rl, res = run_rl([Scene(pl=1.0, pr=1.0)] * 400, k0_up=0.0)
     a = np.array([r.log['a'] for r in res])
-    assert np.max(np.abs(np.diff(a))) <= br.A_IN * DT_MDL + 1e-9  # in at <= 0.5 / s
+    assert np.max(np.abs(np.diff(a))) <= A_STEP
     assert np.all(np.diff(a) >= -1e-12) and a[-1] == 1.0
-    rl2, res2 = run_rl([Scene(pl=1.0, pr=0.0)] * 40, k0_up=0.003, rl=rl)  # right line vanishes: a out at <= 1 / s
+    rl2, res2 = run_rl([Scene(pl=1.0, pr=0.0)] * 200, k0_up=0.003, rl=rl)  # right line vanishes: a falls with the same filter
     a2 = np.array([r.log['a'] for r in res2])
-    assert np.max(np.abs(np.diff(np.concatenate([[a[-1]], a2])))) <= br.A_OUT * DT_MDL + 1e-9
+    assert np.max(np.abs(np.diff(np.concatenate([[a[-1]], a2])))) <= A_STEP and np.all(np.diff(a2) <= 1e-12)
     assert a2[-1] == 0.0 and res2[-1].k0 == 0.003
 
   @pytest.mark.parametrize("left", [1.0, 0.0])
@@ -380,7 +382,7 @@ class TestCorrectionLaw:
       if a_prev is not None and i >= 200:
         worst_a, worst_s = max(worst_a, abs(res.log['a'] - a_prev)), max(worst_s, abs(res.log['s_r'] - s_prev))
       a_prev, s_prev = res.log['a'], res.log['s_r']
-    assert worst_a <= br.A_OUT * DT_MDL + 1e-9
+    assert worst_a <= A_STEP
     assert worst_s < 0.02
 
   def test_in_between_cases_have_expected_authority(self):
@@ -965,7 +967,7 @@ class TestInsideAnEpisode:
     a = np.array([r[5] for r in rows])
     ep = np.array([r[2] for r in rows])
     assert a[ep].min() < 0.3 or ep.sum() < 20  # authority went down inside the episode ...
-    assert np.max(np.diff(a)) <= br.A_IN * DT_MDL + 1e-9  # ... and never rises faster than 0.5 /s
+    assert np.max(np.diff(a)) <= A_STEP  # ... and rises with the strength filter (rev 7)
 
 
 class TestRoadClass:
@@ -1007,10 +1009,10 @@ class TestRoadClass:
 
   def test_it_resets_no_estimator(self):
     rl, _ = frames_of([Scene(v=15.0)] * 50)
-    state = (rl.gap.rp, rl.gap.ps, rl.width_mem.w)
+    state = (rl.detector.usual, rl.detector.offset, rl.width_mem.w)
     rl.road.cls = br.ROAD_SHARED
     rl.road.update(15.0, 0.9, 0.9, 3.5)
-    assert (rl.gap.rp, rl.gap.ps, rl.width_mem.w) == state
+    assert (rl.detector.usual, rl.detector.offset, rl.width_mem.w) == state
 
 
 class TestJumps:
@@ -1085,14 +1087,6 @@ class TestYieldRules:
       ctl.update(Scene(v=13.0, pr=0.0, plan=-sw).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
       q.append((ctl.result.yield_q, ctl.result.log['yield_source'], ctl.result.yield_active))
     assert q[-1][1] == 2 and q[-1][2] and max(x[0] for x in q) > 0.2 and not any(x[2] for x in q[:150])
-
-  def test_upstream_away_fade_counts_as_a_trigger(self):
-    rl = RightLineBlendful()
-    res = rl.update(Scene(v=13.0).model_output(), 13.0, True, 0.0, 0.0, RightInputs(ref_yield_fade=0.5))
-    assert RightLineBlendful.ref_around(RightInputs(ref_yield_fade=0.5)) and not RightLineBlendful.ref_around(RightInputs())
-    for _ in range(5):
-      res = rl.update(Scene(v=13.0).model_output(), 13.0, True, 0.0, 0.0, RightInputs(ref_yield_fade=0.5))
-    assert res.yield_active and res.no_growth
 
   def test_obstacle_side_is_latched_at_the_start_of_the_yield(self):
     ctl = BlendfulCorrection()
