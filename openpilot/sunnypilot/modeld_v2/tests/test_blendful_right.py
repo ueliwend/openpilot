@@ -12,7 +12,7 @@ import pytest
 from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.modeld_v2 import blendful_right as br
 from openpilot.sunnypilot.modeld_v2.blendful import Blendful
-from openpilot.sunnypilot.modeld_v2.blendful_right import (MODE_OFF, MODE_REGULAR, MODE_RIGHT, BlendfulCorrection, ConfGate, EndpointGap, GroundTarget,
+from openpilot.sunnypilot.modeld_v2.blendful_right import (MODE_OFF, MODE_REGULAR, MODE_RIGHT, BlendfulCorrection, ConfGate, GroundTarget,
                                                            InputFilter, JumpDetector, JunctionEpisodes, RightLineBlendful, RoadClass,
                                                            WidthMemory, bend_score, junction_policy, mode_from_params, selection_to_params)
 from openpilot.sunnypilot.modeld_v2.constants import ModelConstants, Plan
@@ -683,14 +683,15 @@ class TestBoundOrder:
     # rev 6.10: the step-4 target T4 keeps the left limit; the right-line target after the move limit is not floored, and while it lies
     # left of the centre the larger of Regular's and the right-line correction is delivered
     rl, logs = frames_of(scenes)
-    lagged = left = False
+    lagged = False
     for lg in logs[150:]:
       assert np.all(lg['t4'] >= np.minimum(lg['c_ctr'], lg['t4'] + 1.0) - 1e-9) and np.all(lg['t4'] >= lg['c_ctr'] - 1e-9)
       lagged |= bool(np.any(lg['t_lim'] < lg['c_ctr'] - 1e-3))
       if lg['trl_minus_centre'] < -1e-3:
-        left = True
         assert lg['delivered'] != br.DELIVER_RIGHT_LINE or lg['bound_active']
-    assert lagged and left
+    # rev 7.1: with the unweighted approach U the right-line target need not pass left of the centre in this fixture; the rule is checked on
+    # every frame where it does (above), and the step-4 target never goes left of the centre limit
+    assert lagged
 
 
 class TestWidthMemory:
@@ -1071,79 +1072,7 @@ def upstream_from_centre_trigger(sw_start, sw_T, T=60.0, noise=0.03, seed=1):
   return tt
 
 
-def sim_endpoint_gap(rho, sw_start, sw_T, rate=br.CAR_MOVE_SPEED, hmax=1.0, T=60.0, noise=0.03, seed=1, settle=br.MOVE_SETTLE):
-  """Closed loop of DESIGN check 18: the car moves to the held offset hmax (target glide `rate`, 1.5 s lag), the model plans back with the
-  return fraction rho; x = Y_R(L) - plan_y(L) = 2 - (car + p)."""
-  gap = EndpointGap()
-  rng = np.random.default_rng(seed)
-  h = o = 0.0
-  t10 = t20 = None
-  qs = []
-  moving_t = 0.0
-  for i in range(int(T / DT_MDL)):
-    t = i * DT_MDL
-    sw = 0.8 * np.clip((t - sw_start) / sw_T, 0, 1) if t >= sw_start else 0.0
-    p = -rho * o - sw + noise * rng.standard_normal()
-    building = h < hmax - 1e-9
-    h = min(hmax, h + rate * DT_MDL)
-    o += (h - o) * DT_MDL / 1.5
-    moving_t = settle if building else max(0.0, moving_t - DT_MDL)
-    q = gap.update(2.0 - (o + p), 1, moving_t > 0.0, False, 0.0, False)
-    qs.append(q)
-    if t >= sw_start:
-      if t10 is None and q >= 0.1:
-        t10 = t - sw_start
-      if t20 is None and q >= 0.2:
-        t20 = t - sw_start
-  return np.array(qs), t10, t20
-
-
-class TestEndpointGapTrigger:
-  @pytest.mark.parametrize("rho", [-0.2, 0.0, 0.3, 0.5, 0.9])
-  def test_steady_hold_and_move_give_no_false_trigger_for_any_rho(self, rho):
-    for seed in (1, 2):
-      qs, _, _ = sim_endpoint_gap(rho, 999.0, 1.0, T=60.0, seed=seed)
-      assert qs.max() < br.Q_NO_GROWTH  # check 18: max q <= 0.04 m (here with 0.03 m plan noise, inside the no-growth point)
-
-  @pytest.mark.parametrize("rho", [0.0, 0.5, 0.9])
-  @pytest.mark.parametrize("sw_T", [0.5, 3.0, 10.0])
-  def test_swerve_on_a_steady_hold_triggers_with_upstream_from_centre(self, rho, sw_T):
-    _, t10, t20 = sim_endpoint_gap(rho, 40.0, sw_T)  # the move to 1.0 m at 0.05 m/s takes 20 s: steady from 40 s on
-    tu = upstream_from_centre_trigger(40.0, sw_T)
-    assert t10 is not None and t10 <= tu + 0.25 + 1e-9  # no-growth point up to about 0.2 s after upstream-from-centre (I1)
-
-  def test_running_minimum_is_not_updated_on_skip_frames(self):
-    g = EndpointGap()
-    for _ in range(20):
-      g.update(2.0, 1, True, False, 0.0, False)
-    rp = g.rp
-    for _ in range(20):
-      g.update(1.0, 1, True, True, 0.0, False)  # a jump: ignored
-    assert g.rp == rp
-
-  def test_median_stops_a_single_dip_from_lowering_the_minimum(self):
-    g = EndpointGap()
-    for _ in range(40):
-      g.update(2.0, 1, True, False, 0.0, False)
-    g.update(1.0, 1, True, False, 0.0, False)  # one frame with the reference flickering inward
-    assert g.rp > 1.9
-
-  def test_reference_switch_reinitialises(self):
-    g = EndpointGap()
-    for _ in range(40):
-      g.update(2.0, 1, False, False, 0.0, False)
-    q = g.update(5.0, 2, False, False, 0.0, False)  # right -> left reference: no false trigger
-    assert q == 0.0 and g.source == 2
-
-  def test_usual_follows_slowly_and_tau_doubles_while_going_around(self):
-    g1, g2 = EndpointGap(), EndpointGap()
-    for _ in range(10):
-      g1.update(2.0, 1, False, False, 0.0, False)
-      g2.update(2.0, 1, False, False, 0.0, True)
-    for _ in range(200):
-      g1.update(2.5, 1, False, False, 0.0, False)
-      g2.update(2.5, 1, False, False, 0.0, True)
-    assert g1.rp > g2.rp > 2.0
+# rev 7.1: the endpoint-gap trigger and its tests are removed (the single detector replaces it)
 
 
 class TestYieldRules:

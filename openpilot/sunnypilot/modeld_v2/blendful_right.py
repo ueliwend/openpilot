@@ -15,7 +15,6 @@ steers alone; Regular is unchanged.  Appendix J of the design (hold / latch / ra
 Signs: model frame [forward, right, down], y > 0 is right; curvature > 0 is a right turn.
 """
 import time
-from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -78,6 +77,7 @@ FILTER_ROTATION_SCALE = "design"
 Q_NO_GROWTH, Q_CAP_START, Q_CAP_FULL, Q_RELEASE = 0.1, 0.15, 0.2, 0.1
 GAP_SMOOTH_TAU, GAP_MEDIAN_S = 0.25, 0.5  # s, endpoint gap smoothing and the median window before the running minimum
 USUAL_TAU, USUAL_TAU_AROUND = 10.0, 20.0  # s
+SWERVE_YIELD = (0.2, 0.45)  # m, upstream Blendful's YIELD (blendful.py)
 MOVE_LAG_EPS, MOVE_SETTLE = 0.03, 3.0  # m, s: a move to the right is on while the target still glides or the correction builds, plus settle time (EST)
 # jumps (B5 table, C6)
 JUMP_LINE, JUMP_EDGE, JUMP_FRAMES, JUMP_HOLD, JUMP_WEIGHT = 0.6, 1.2, 2, 2.0, 0.5  # m, m, frames, s, candidate weight
@@ -302,7 +302,7 @@ def strength_from_confidence(q: float) -> float:
 
 class Authority:
   """rev 7 (owner 13 Nov 11:48 / 11:55): a = first-order low-pass of a* (tau 1 s), updated every frame; no dead band, dwell, hold or
-  rate limits.  Ends below 1e-6 of 0 or 1 snap there (a = 0 is regular upstream exactly; the filter alone would never reach it)."""
+  rate limits.  Ends within 1e-3 of 0 or 1 snap there (reviewer note 4) (a = 0 is regular upstream exactly; the filter alone would never reach it)."""
   def __init__(self):
     self.a = 0.0
     self.a_cmd = 0.0  # = a* of the last frame (log / no-growth cap)
@@ -310,7 +310,7 @@ class Authority:
   def update(self, a_star: float, dt: float = DT_MDL) -> float:
     self.a_cmd = a_star
     self.a += (a_star - self.a) * dt / (dt + STRENGTH_TAU)
-    if abs(self.a - a_star) < 1e-6 and a_star in (0.0, 1.0):
+    if abs(self.a - a_star) < 1e-3 and a_star in (0.0, 1.0):
       self.a = a_star
     return self.a
 
@@ -547,48 +547,72 @@ class JunctionEpisodes:
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
-class EndpointGap:
-  """Model-independent yield trigger (B6, C7, R5-4).  x = Y_ref(L) - plan_y(L): the plan endpoint's gap to a reference (right reference, else
-  left reference, else the plan alone: x = -plan_y); x grows when the plan moves left, shrinks when the car moves right.  Smoothed 0.25 s.
-  The plan-alone source is kept because B6 / C8 calls for it ("the left reference or the plan alone when the right reference is weak").  It
-  is not own-motion compensated: a move of the car to the right raises x by rho times the move, so it can only look like a left swerve
-  (review N1).  With that source q_R and q_L are < 0.3, a* is 0 and a false trigger can only fade or cap, never push toward an obstacle.
-  Reference R_P: during a move to the right the running minimum of the 0.5 s median of x since the move started (not updated on jump frames
-  or frames with a candidate weight change > 0.1); otherwise x low-passed 10 s (20 s while going around), like upstream's usual.
-  q = |x - R_P| - 0.25 |k_m| L^2 / 2; departure = x - R_P (> 0: the model moves left of its usual place: obstacle on the right)."""
+DETECT_WINDOW = (1.4, 1.6)  # s of travel: the detector's path offset is the mean over this stretch (owner 13 Nov 12:13)
+OWN_MODEL_TAU = 1.0  # s: the model's heading return in the own-move estimate (EST; the A8 test loop's model)
+OWN_DRIFT_TAU = 30.0  # s: high-pass of the own-move estimate (bounds a drift of the integrated estimate; slower than usual's 10 s)
+OWN_PULLBACK = 0.35  # rho_hat: assumed share of our own move the model's path pulls back; (1 - rho_hat) y_own is subtracted (rev 7.1)
+
+
+class SwerveDetector:
+  """Rev 7.1 single obstacle detector (owner 13 Nov 12:08 / 12:13): upstream Blendful's swerve test (blendful.py) with two changes.
+  (a) offset = mean of (plan_y - lane centre) over the plan points from 1.4 s to 1.6 s of travel (upstream: the point at 1.5 s);
+  (b) the sideways move our own delivered correction causes is estimated and subtracted from the offset before usual and swerve are formed:
+      c_d = c through a first-order lag lat_action_t (actuator delay), psi' = v^2 c_d / v - psi / OWN_MODEL_TAU (heading, with the model's
+      heading return), y' = v psi; y_own = y high-passed with 30 s (bounds drift; usual's 10 s low-pass then acts on the subtracted
+      offset, so offset - usual removes the 10 s high-pass of our move exactly when the estimate is right); k = 1 - rho_hat;
+      offset = raw - k y_own.
+  Then upstream: usual = 10 s low-pass (20 s while going around), swerve = |offset - usual| - 0.25 |k| L^2 / 2,
+  away = swerve - |(-centre_now - k y_own) - usual| (the car-departure term uses the car's position without our own move as well, otherwise
+  our move would count twice), latch on away > 0.2 (2 s after a turn), off at swerve < 0.1 or inside a curve.
+  departure = offset - usual (> 0: the path moved right of its usual place: obstacle on the left)."""
   def __init__(self):
     self.reset()
 
   def reset(self):
-    self.source: int | None = None
-    self.ps: float | None = None
-    self.hist: deque = deque()
-    self.rp = 0.0
-    self.moving = False
-    self.q = 0.0
+    self.usual: float | None = None
+    self.going_around = False
+    self.since_turning = 0.0
+    self.c_d = 0.0
+    self.psi = 0.0
+    self.y = 0.0
+    self.y_lp = 0.0
+    self.y_own = 0.0
+    self.offset = 0.0
+    self.swerve = 0.0
+    self.away = 0.0
     self.departure = 0.0
 
-  def update(self, x: float, source: int, moving: bool, skip: bool, allowance: float, going_around: bool, dt: float = DT_MDL) -> float:
-    n_med = max(1, int(round(GAP_MEDIAN_S / dt)))
-    if source != self.source or self.ps is None:
-      self.source, self.ps, self.rp, self.moving = source, x, x, False
-      self.hist = deque([x], maxlen=n_med)
-    else:
-      self.ps += (x - self.ps) * dt / (dt + GAP_SMOOTH_TAU)
-      self.hist.append(self.ps)
-    med = float(np.median(self.hist))
-    if moving:
-      if not self.moving:
-        self.rp = med
-      elif not skip:
-        self.rp = min(self.rp, med)
-    elif not skip:
-      tau = USUAL_TAU_AROUND if going_around else USUAL_TAU
-      self.rp += (self.ps - self.rp) * dt / (dt + tau)
-    self.moving = moving
-    self.departure = float(self.ps - self.rp)
-    self.q = float(abs(self.departure) - allowance)
-    return self.q
+  def own_move(self, c: float, v: float, lat_action_t: float, dt: float) -> float:
+    self.c_d += (c - self.c_d) * dt / (dt + max(lat_action_t, 1e-3))
+    self.psi += (v * self.c_d - self.psi / OWN_MODEL_TAU) * dt
+    self.y += v * self.psi * dt
+    self.y_lp += (self.y - self.y_lp) * dt / (dt + OWN_DRIFT_TAU)
+    self.y_own = self.y - self.y_lp
+    return self.y_own
+
+  def update(self, plan_x: np.ndarray, plan_y: np.ndarray, centre: np.ndarray, v: float, look: float, model_curvature: float,
+             lane_curvature: float, c: float, lat_action_t: float, dt: float) -> float:
+    xs = np.linspace(DETECT_WINDOW[0], DETECT_WINDOW[1], 5) * look / 1.5
+    raw = float(np.mean(np.interp(xs, plan_x, plan_y) - np.interp(xs, X_IDXS, centre)))
+    k_own = (1.0 - OWN_PULLBACK) * self.own_move(c, v, lat_action_t, dt)
+    self.offset = raw - k_own
+    if self.usual is None:
+      self.usual = self.offset
+    allow = 0.25 * abs(model_curvature) * look ** 2 / 2
+    self.departure = float(self.offset - self.usual)
+    self.swerve = float(abs(self.departure) - allow)
+    self.away = float(self.swerve - abs(-float(centre[0]) - k_own - self.usual))
+    inside_curve = abs(lane_curvature) * look ** 2 / 2 > 0.1 and self.departure * lane_curvature > 0
+    self.since_turning = 0.0 if allow * 4 > 0.5 else self.since_turning + dt
+    if inside_curve:
+      self.going_around = False
+    elif self.away > SWERVE_YIELD[0] and self.since_turning > 2.0:
+      self.going_around = True
+    elif self.swerve < SWERVE_YIELD[0] / 2:
+      self.going_around = False
+    tau = USUAL_TAU_AROUND if self.going_around else USUAL_TAU
+    self.usual += (self.offset - self.usual) * dt / (dt + tau)
+    return self.swerve
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -734,6 +758,8 @@ class RightInputs:
   ref_departure: float = 0.0  # the reference instance's offset - usual, m (> 0: its plan end moved right, i.e. an obstacle on the left)
   ref_lane_width: float = LANE_WIDTH_DEFAULT  # the reference instance's filtered lane width (left limit with one reference)
   building: bool = False  # last frame's final limiter was still building the correction toward the right
+  c_delivered: float = 0.0  # last frame's delivered correction c, 1/m (rev 7.1: the detector's own-move estimate)
+  lat_action_t: float = 0.275  # actuator delay, s (rev 7.1: the detector's own-move estimate)
   radar: RadarFrame | None = None  # the newest radarTracks message (B6a); None = no radar data: f_radar = 0, Right line = Regular
 
 
@@ -802,9 +828,8 @@ class RightLineBlendful:
 
   def reset_yields(self):
     """Yield state: endpoint-gap trigger, both latches, the aggregator and the move flag (also while the instance fades, review S2)."""
-    self.gap = EndpointGap()
-    self.gap_rebase = 0.0  # cumulative switch part of the right reference at L, left out of the endpoint gap
-    self.yield_latch = Timed(off_time=1.0)
+    self.detector = SwerveDetector()
+    self.gap_rebase = 0.0  # cumulative switch part of the right reference at L (log)
     self.ref_yield_latch = Timed(off_time=1.0)
     self.yields = YieldAggregator()
     self.moving_t = 0.0
@@ -908,7 +933,7 @@ class RightLineBlendful:
     inno = tuple(float(np.interp(iL, X_IDXS, self.filters[i].innovation)) for i in (2, 3))
     jump_on = self.jumps.update(inno, w_at, (qf[2] > 0.5, qf[3] > 0.5), dt)
     f_jump_t = 0.0 if jump_on else 1.0
-    cand_changed = self.w_prev is not None and max(abs(w_at[0] - self.w_prev[0]), abs(w_at[1] - self.w_prev[1])) > CAND_CHANGE
+    # rev 7.1: the candidate-change skip belonged to the removed endpoint gap
     self.w_prev = w_at
     # --- left limit T_C': the centre between the references (unclipped width with two references, upstream's filtered width with one);
     # the formula changes with confidence hysteresis (S4)
@@ -975,31 +1000,27 @@ class RightLineBlendful:
     # --- yields (B6, C7, C8): the endpoint-gap trigger on the right reference, else the left one, else the plan alone, the reference
     # instance, and the radar clearance trigger, each with its own side
     if q_R >= 0.3:
-      src, ref_L = 1, float(np.interp(look, X_IDXS, y_r))
+      src = 1
     elif q_L >= 0.3:
-      src, ref_L = 2, float(np.interp(look, X_IDXS, y_l))
+      src = 2
     else:
-      src, ref_L = 0, 0.0
+      src = 0
     # the switch part of the change of Y_R (B5 amendment 1: candidate weights, filter re-initialisation steps): not road
     sw = (w_r - self.w_r_prev) * cands_r if self.w_r_prev is not None else np.zeros_like(cands_r)
     switch_part = sw.sum(axis=0) + w_r[0] * self.filters[2].step + w_r[1] * self.filters[3].step
     self.w_r_prev = w_r.copy()
     if src == 1:  # the endpoint gap on the right reference leaves the switch part out as well, so a line -> edge switch is no departure
       self.gap_rebase += float(np.interp(look, X_IDXS, switch_part))
-    x_gap = ref_L - float(np.interp(look, plan_x, plan_y)) - (self.gap_rebase if src == 1 else 0.0)
-    allow = 0.25 * abs(model_curvature) * look ** 2 / 2
-    if fading:  # lane change or v < 5 m/s: the gap state and the latches would compare the old lane with the new one (S2)
+    if fading:  # lane change or v < 5 m/s: the detector state and the latches would compare the old lane with the new one (S2)
       self.reset_yields()
       q_y, no_growth, yield_active, caps = 0.0, False, False, {}
       car_trig = False
     else:
-      move_now = (not self.no_growth_prev) and (lag_L > MOVE_LAG_EPS or self.authority.a < self.authority.a_cmd - 1e-6 or p.building
-                                                or self.move.limiting)
-      self.moving_t = MOVE_SETTLE if move_now else max(0.0, self.moving_t - dt)
-      skip = (not f_jump_t) or cand_changed
-      q_y = self.gap.update(x_gap, src, self.moving_t > 0.0, bool(skip), allow, self.ref_around(p), dt)
-      dep = self.gap.departure
-      car_trig = self.yield_latch.update(q_y > Q_CAP_FULL if not self.yield_latch.state else q_y >= Q_RELEASE)
+      # rev 7.1: the single detector (upstream's swerve test over 1.4-1.6 s with our own estimated move subtracted) replaces the endpoint gap
+      lane_k = 2.0 * float(np.polyfit(X_IDXS[win_ref], c_ctr[win_ref], 2)[0])
+      q_y = self.detector.update(plan_x, plan_y, c_ctr, v, look, model_curvature, lane_k, p.c_delivered, p.lat_action_t, dt)
+      dep = -self.detector.departure  # > 0: the path moved left of its usual place (obstacle on the right), as the side rule below reads it
+      car_trig = self.detector.going_around
       ref_trig = self.ref_yield_latch.update(self.ref_around(p))
       # each trigger supplies its own side (B1): the endpoint gap from its departure (> 0: the plan moved left, obstacle on the right), the
       # reference instance from its own offset - usual (> 0: its plan end moved right, obstacle on the left), the radar check the right
@@ -1007,7 +1028,7 @@ class RightLineBlendful:
       side_ref = (SIDE_LEFT if p.ref_departure > 0 else SIDE_RIGHT) if abs(p.ref_departure) > SIDE_KNOWN else 0
       q_rc = clearance_q(rc.deficit, Q_NO_GROWTH, Q_CAP_START, Q_CAP_FULL)
       no_growth, yield_active, caps = self.yields.update([
-        TriggerReport('endpoint_gap', bool(q_y >= Q_NO_GROWTH or car_trig), bool(car_trig), q_y, side_gap),
+        TriggerReport('swerve', bool(q_y >= Q_NO_GROWTH or car_trig), bool(car_trig), q_y, side_gap),
         TriggerReport('reference', bool(ref_trig), bool(ref_trig), Q_CAP_FULL, side_ref),
         TriggerReport('radar_clearance', bool(rc.yield_active), bool(rc.yield_active), q_rc, SIDE_RIGHT),
       ])
@@ -1085,7 +1106,8 @@ class RightLineBlendful:
     log = {
       'applied': a > 0.0, 'gap': g, 'gap_now': gap_now, 'q_R': q_R, 'q_L': q_L, 'a': a, 'a_star': a_star,
       'f_bend': f_bend_t, 'f_yl': f_yl, 'f_yr': f_yr, 'f_jump': f_jump_t, 'f_plaus': f_plaus_t, 'f_blink': self.f_blink, 'f_radar': f_radar,
-      'away_car': q_y, 's_r': s_r, 'w_c': w_c, 'right_only': right_only,
+      'away_car': q_y, 'det_offset': self.detector.offset, 'det_usual': self.detector.usual or 0.0, 'det_own': self.detector.y_own,
+      'det_away': self.detector.away, 'a_star_q': qa, 's_r': s_r, 'w_c': w_c, 'right_only': right_only,
       'curve_accel': abs(model_curvature) * v ** 2, 'yield_active': yield_active, 'bound_active': bound_active,
       'k_rl': k0_rl, 'weights': (wts.w_rl, wts.w_up), 'l_c': profile_length(max(v, 1.0)), 'd': d_rl, 'd_clipped': d_clipped, 'filter_ms': t_filter,
       'filtered': np.concatenate([[np.interp(xq, X_IDXS, f) for xq in (0.0, 0.5 * look, look, 1.5 * look)] for f in filt]),
@@ -1240,6 +1262,7 @@ class BlendfulCorrection:
     p.ref_departure = self.reference.yield_departure
     p.ref_lane_width = float(self.reference.lane_width.x)
     p.building = self.building
+    p.c_delivered, p.lat_action_t = self.c, float(lat_action_t)
     res = RightResult()
     if right_runs:
       if self.right_idle:  # the instance was not running (Regular with a = 0): its filters are stale

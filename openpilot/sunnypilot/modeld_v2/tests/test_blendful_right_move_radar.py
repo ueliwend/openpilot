@@ -1104,8 +1104,12 @@ class TestHandOverToTheModelPath:
     # side +1: a rightward correction (gap 0.44 m: the right-hand position); side -1: a leftward one (gap 2.0 m puts the target left of
     # the centre, car held 0.3 m right of the centre: Regular and the right-line correction pull left)
     y0, gap = (0.0, 0.44) if side > 0 else (0.3, 2.0)
-    for _ in range(int(30 / DT_MDL)):  # open loop: the car held at y0
+    # open loop: the car held at y0.  rev 7.1: the detector's own-move estimate assumes the car follows our correction; held in place it would
+    # read our growing correction as a swerve (safe side: a yield), so the estimate's share is 0 while the correction is built here
+    own, br.OWN_PULLBACK = br.OWN_PULLBACK, 1.0
+    for _ in range(int(30 / DT_MDL)):
       ctl.update(model_output(v, y0, 0.0, 0.0), v, True, 0.0, LAT_T, MODE_RIGHT, inputs(gap_low=gap, gap_high=gap))
+    br.OWN_PULLBACK = own
     c_built = ctl.c
     assert side * c_built > 1e-5
     orig = ctl.right.update
