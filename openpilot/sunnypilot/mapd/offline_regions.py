@@ -5,8 +5,8 @@ A download of a location (nation or US state) fetches every tile of the location
 latitude rising, then longitude rising (download.go:199-200 at v1.12.0). The bounding boxes are vendored from the
 same version (they are embedded in the binary), so this module knows which tiles a request touches and in which order.
 
-Binary-specific knowledge lives here and in offline_update.py only (tile grid, order, folder and download-file layout,
-tile URL, request format); the selection, storage, status and UI modules use it through the functions below.
+Binary-specific knowledge lives here and in tile_fetch.py / offline_swap.py only (tile grid, order, folder layout, tile
+URL, archive format); the selection, storage, status and UI modules use it through the functions below.
 Locations are named by an id: the nation code ("CH") or "US:<state code>" for a US state ("US:CA").
 """
 import json
@@ -64,11 +64,6 @@ def tile_key(tile: Tile) -> str:
 def tile_dir(root: str, sub: str, tile: Tile) -> str:
   """`<root>/<sub>/<lat>/<lon>`: the tile folder (sub = "offline") or its moved-aside copy."""
   return os.path.join(root, sub, str(tile[0]), str(tile[1]))
-
-
-def tile_archive(root: str, tile: Tile) -> str:
-  """The binary's download file for a tile: `<root>/tmp/offline/<lat>/<lon>.tar.gz` (download.go:201-203)."""
-  return os.path.join(root, "tmp", "offline", str(tile[0]), f"{tile[1]}.tar.gz")
 
 
 def tile_url(tile: Tile) -> str:

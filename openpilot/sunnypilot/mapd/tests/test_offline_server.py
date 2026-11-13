@@ -1,4 +1,5 @@
-"""TileServer (HEAD sizes, probe with its HTTP status) and check(), with a stand-in for requests (no network)."""
+"""TileServer HEAD sizes for the screen's estimates, with a stand-in for requests (no network). E9's probe() / check() are
+gone with E11 (map_downloader checks each tile while it streams: test_tile_fetch.py)."""
 import sys
 import types
 
@@ -42,30 +43,5 @@ def test_head(requests_stub):
     assert s.head((44, 6)) == expected, reply
 
 
-def test_probe_keeps_the_http_status(requests_stub):
-  s = srv.TileServer()
-  for reply, expected in ((Reply(206, b"\x1f\x8b\x08"), (srv.GZIP, 206)), (Reply(200, b"\x1f\x8b"), (srv.GZIP, 200)),
-                          (Reply(200, b"<html>"), (srv.NOT_GZIP, 200)), (Reply(200, b""), (srv.NOT_GZIP, 200)),
-                          (Reply(404), (srv.NO_DATA, 404)), (Reply(403), (srv.SERVER_ERROR, 403)), (Reply(500), (srv.SERVER_ERROR, 500)),
-                          (TimeoutError("slow"), (srv.NO_ANSWER, None))):
-    requests_stub["get"] = reply
-    assert s.probe((44, 6)) == expected, reply
-
-
-def test_check_stops_at_the_first_head_without_answer_and_probes_past_404s():
-  asked = []
-
-  class Server:
-    def head(self, t):
-      asked.append(("head", t))
-      return {(1, 1): 0, (2, 2): srv.NO_ANSWER_SIZE}.get(t, 100)
-
-    def probe(self, t):
-      asked.append(("probe", t))
-      return (srv.NO_DATA, 404) if t == (3, 3) else (srv.GZIP, 200)
-  r = srv.check(Server(), [(0, 0), (1, 1), (3, 3), (4, 4)], [(1, 1), (2, 2), (5, 5)], set())
-  assert r["answer"] == srv.NO_ANSWER and asked == [("head", (1, 1)), ("head", (2, 2))]
-  asked.clear()
-  r = srv.check(Server(), [(0, 0), (1, 1), (3, 3), (4, 4)], [(1, 1)], {(0, 0)})
-  assert asked == [("head", (1, 1)), ("probe", (3, 3)), ("probe", (4, 4))]
-  assert r == {"sizes": {(1, 1): 0}, "answer": srv.GZIP, "code": 200, "no_data": [(3, 3)]}
+def test_probe_and_check_are_gone():
+  assert not hasattr(srv.TileServer, "probe") and not hasattr(srv, "check")

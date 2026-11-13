@@ -13,7 +13,7 @@ file exists from the first start on, nothing else has to be kept in step, and DE
 
 An unreadable value (e.g. a bad remote write) is never migrated again from the one-entry mirror. It is replaced by the
 last valid list in memory, or after a restart by the list of the last status (`OsmLocationStatus` "order", written by
-mapd_manager whenever the list changes); only if neither exists, by the mirror (better one entry than none).
+map_downloader whenever the list changes); only if neither exists, by the mirror (better one entry than none).
 
 Mirror: the old keys (`OsmLocationName/Title`, `OsmStateName/Title`, `OsmLocal`) stay for upstream code and are written
 only here, from the first entry of the list (`OsmLocal` = the list is not empty). A remote write to them is overwritten.
@@ -105,7 +105,7 @@ class Selection:
     return list(selection)
 
   def _recover(self) -> list[dict]:
-    """The list of the last status (written by mapd_manager after every change), else the mirror."""
+    """The list of the last status (written by map_downloader after every change), else the mirror."""
     status = self.params.get(STATUS_KEY)
     order = status.get("order") if isinstance(status, dict) else None
     if isinstance(order, list):

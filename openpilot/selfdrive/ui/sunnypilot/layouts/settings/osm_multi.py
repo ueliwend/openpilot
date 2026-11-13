@@ -1,9 +1,9 @@
-"""Settings > OSM with several countries at once (Inster port, E9).
+"""Settings > OSM with several countries at once (Inster port, E9; E11 map updates).
 
 Upstream's OSMLayout (osm.py) stays unchanged, so its edits merge cleanly; this subclass only swaps the rows below
 "Downloaded Maps" for the multi-country rows (osm_locations.py) and refreshes them. settings.py imports it in place of
 OSMLayout (one line). Upstream's single-country picker and "Database Update" rows are still created by
-OSMLayout._initialize_items but no longer shown; mapd_manager writes the old keys only as a mirror (offline_selection.py).
+OSMLayout._initialize_items but no longer shown; map_downloader writes the old keys only as a mirror (offline_selection.py).
 """
 from openpilot.common.hardware.hw import Paths
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings import osm_locations_model as model
@@ -20,7 +20,7 @@ class OSMLayoutMulti(OSMLayout):
     self.items = [self._mapd_version, self._delete_maps_btn, *self._locations.items]
 
   def calculate_size(self):
-    """As upstream, but also counts the old copies moved aside and the download files of a running update, and uses the
+    """As upstream, but also counts staged tiles, the tile in work and replaced copies not yet removed, and uses the
     screen's units (MB / GB of 10^6 / 10^9 bytes; upstream divides by 1024^2), so it matches the per-country sizes."""
     self._delete_maps_btn.action_item.set_value(model.size_text(model.map_size(Paths.mapd_root())))  # same units as every row
 
@@ -33,4 +33,4 @@ class OSMLayoutMulti(OSMLayout):
     if downloading:
       device._reset_interactive_timeout()
       self._update_map_size()
-    self._delete_maps_btn.action_item.set_enabled(not downloading)
+    self._delete_maps_btn.action_item.set_enabled(True)  # E11: map_downloader cancels a running download for DELETE ALL

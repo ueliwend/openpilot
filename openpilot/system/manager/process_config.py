@@ -1,6 +1,7 @@
 import os
 import operator
 import platform
+import sys
 
 from opendbc.car.structs import car
 from openpilot.cereal import custom
@@ -10,6 +11,7 @@ from openpilot.system.manager.process import PythonProcess, NativeProcess, Daemo
 from openpilot.common.hardware.hw import Paths
 
 from openpilot.sunnypilot.mapd.mapd_manager import MAPD_PATH
+from openpilot.sunnypilot.mapd import offline_swap  # Inster (E11): staged maps go live before mapd starts
 
 from openpilot.sunnypilot.models.helpers import get_active_model_runner
 from openpilot.sunnypilot.sunnylink.utils import sunnylink_need_register, sunnylink_ready, use_sunnylink_uploader
@@ -95,7 +97,7 @@ def is_stock_model(started, params, CP: car.CarParams) -> bool:
   return bool(get_active_model_runner(params, not started) == custom.ModelManagerSP.Runner.stock)
 
 def mapd_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return bool(os.path.exists(Paths.mapd_root())) and not params.get_bool("MapdRestartRequest")  # Inster: mapd_priority.py
+  return bool(os.path.exists(Paths.mapd_root()))
 
 def uploader_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
   if not params.get_bool("OnroadUploads"):
@@ -181,8 +183,9 @@ procs += [
   PythonProcess("backup_manager", "openpilot.sunnypilot.sunnylink.backups.manager", and_(only_offroad, sunnylink_ready_shim)),
 
   # mapd
-  NativeProcess("mapd", Paths.mapd_root(), ["bash", "-c", f"{MAPD_PATH} > /dev/null 2>&1"], mapd_ready),
+  NativeProcess("mapd", Paths.mapd_root(), offline_swap.launch_command(sys.executable, offline_swap.__file__, MAPD_PATH, Paths.mapd_root()), mapd_ready),
   PythonProcess("mapd_manager", "openpilot.sunnypilot.mapd.mapd_manager", always_run),
+  PythonProcess("map_downloader", "openpilot.sunnypilot.mapd.map_downloader", always_run),  # Inster (E11)
 
   # locationd
   NativeProcess("locationd_llk", "openpilot/sunnypilot/selfdrive/locationd", ["./locationd"], only_onroad),

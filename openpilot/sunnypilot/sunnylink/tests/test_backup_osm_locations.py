@@ -40,6 +40,6 @@ class TestBackupOsmLocations(OpenpilotTestCase):
               "GithubUsername": base64.b64encode(b"planted").decode(),
               "OsmDownloadRequest": base64.b64encode(b"all").decode()}  # not a backup key: never written by a restore
     self.backup_manager._apply_config(config)
-    assert self.params.get("OsmSelectedLocations") == [{"kind": "nation", "code": "AT"}]  # mapd_manager validates it on read
+    assert self.params.get("OsmSelectedLocations") == [{"kind": "nation", "code": "AT"}]  # map_downloader validates it on read
     assert self.params.get("GithubUsername") == "device-user"
     assert self.params.get("OsmDownloadRequest") is None

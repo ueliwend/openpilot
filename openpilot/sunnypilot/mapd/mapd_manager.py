@@ -20,42 +20,11 @@ from openpilot.sunnypilot.mapd.live_map_data.osm_map_data import OsmMapData
 from openpilot.common.hardware.hw import Paths
 from openpilot.sunnypilot.mapd import MAPD_PATH
 from openpilot.sunnypilot.mapd.mapd_installer import VERSION, update_installed_version
-from openpilot.sunnypilot.mapd.offline_maps import REQUEST_KEY, OfflineMaps
-from openpilot.sunnypilot.mapd.offline_server import TileServer
-from openpilot.sunnypilot.mapd.mapd_priority import MapdPriority
-from openpilot.sunnypilot.mapd.offline_update import DRAINING, PREV, RUNNING, TMP, OfflineMapUpdater, ParamsLink
 
 # PFEIFER - MAPD {{
 params = Params()
 mem_params = Params("/dev/shm/params") if platform.system() != "Darwin" else params
 # }} PFEIFER - MAPD
-_offline_updater: OfflineMapUpdater | None = None
-_offline_maps: OfflineMaps | None = None
-_mapd_priority: MapdPriority | None = None
-
-
-def offline_updater() -> OfflineMapUpdater:
-  """Inster: runs map downloads so that a re-download cannot corrupt the stored maps (offline_update.py)."""
-  global _offline_updater
-  if _offline_updater is None:
-    _offline_updater = OfflineMapUpdater(Paths.mapd_root(), ParamsLink(params, mem_params, request_refresh_osm_location_data))
-  return _offline_updater
-
-
-def offline_maps() -> OfflineMaps:
-  """Inster: several map locations at once: selection, requests, deletes, gates, status (offline_maps.py)."""
-  global _offline_maps
-  if _offline_maps is None:
-    _offline_maps = OfflineMaps(params, Paths.mapd_root(), offline_updater(), TileServer())
-  return _offline_maps
-
-
-def mapd_priority() -> MapdPriority:
-  """Inster: the mapd binary at low CPU / I/O priority while one of our downloads runs (mapd_priority.py)."""
-  global _mapd_priority
-  if _mapd_priority is None:
-    _mapd_priority = MapdPriority(params)
-  return _mapd_priority
 
 
 def get_files_for_cleanup() -> list[str]:
@@ -88,15 +57,18 @@ def cleanup_old_osm_data(files_to_remove: list[str]) -> None:
 
 def clear_downloaded_maps() -> None:
   """Deletes downloaded OSM map data and resets params."""
-  for sub in ("offline", PREV, TMP):  # Inster: also the moved-aside old copies, their journal and download files
+  # Inster (E11): called by map_downloader after it moved every map folder aside under its lock; also the staging folder,
+  # the manifest, the hash lists and E9's leftovers
+  for sub in ("offline", "offline_next", "offline_hashes", "offline_manifest.json", "offline_sizes.json", "offline_prev", "tmp"):
     path = f"{Paths.mapd_root()}/{sub}"
-    if os.path.exists(path):
+    if os.path.isdir(path):
       shutil.rmtree(path, ignore_errors=True)
+    elif os.path.exists(path):
+      os.remove(path)
 
   for param in ("OsmDownloadedDate", "OsmLocal", "OsmLocationName", "OsmLocationTitle",
                 "OsmStateName", "OsmStateTitle"):
     params.remove(param)
-  offline_maps().cleared()  # Inster: size cache, multi-location keys; the country list becomes empty
 
   cloudlog.info("mapd: downloaded maps cleared")
 
@@ -143,21 +115,18 @@ def filter_nations_and_states(nations: list[str], states: list[str] | None = Non
   return nations, states or []
 
 
-def clear_maps_if_requested() -> None:
-  """Mapd_ClearCache: DELETE ALL on the screen, or a remote write through sunnylink (sunnypilot #1971). Inster: waits while
-  mapd downloads for us; entries not yet sent and queued per-country deletes are dropped (offline_maps.ready_for_clear)."""
-  if params.get("Mapd_ClearCache") and offline_maps().ready_for_clear():
-    clear_downloaded_maps()
-    params.remove("Mapd_ClearCache")
+def guard_download_request() -> None:
+  """Inster (E11): the mapd binary never downloads (it would stop serving map data until done); map_downloader does it.
+  A non-empty request in the memory params (left by older software, or written by anything else) is emptied and logged."""
+  request = mem_params.get("OSMDownloadLocations")
+  if isinstance(request, dict) and (request.get("nations") or request.get("states")) or (request and not isinstance(request, dict)):
+    cloudlog.warning(f"mapd: download request for the mapd binary removed (map_downloader downloads maps): {request}")
+    mem_params.remove("OSMDownloadLocations")
 
 
 def update_osm_db() -> None:
-  # Inster: requests (OsmDownloadRequest, OsmDbUpdatesCheck = all) go through offline_maps, which sends them offroad, one
-  # location at a time, after its gates and after moving the old tiles aside (offline_update.py)
-  if params.get_bool("OsmDbUpdatesCheck") or params.get(REQUEST_KEY):
-    cleanup_old_osm_data(get_files_for_cleanup())
-  offline_maps().step()
-  mapd_priority().step(offline_updater().state in (RUNNING, DRAINING))  # Inster: low priority only while ours runs
+  # Inster (E11): requests (OsmDbUpdatesCheck, OsmDownloadRequest) are map_downloader's (map_downloader.py)
+  guard_download_request()
 
   if not mem_params.get("OSMDownloadBounds"):
     mem_params.put("OSMDownloadBounds", "", block=True)
@@ -186,8 +155,7 @@ def main_thread():
     show_alert = bool(get_files_for_cleanup() and params.get_bool("OsmLocal"))
     set_offroad_alert("Offroad_OSMUpdateRequired", show_alert, "This alert will be cleared when new maps are downloaded.")
 
-    clear_maps_if_requested()  # Inster: helper (offline_maps)
-
+    # Inster (E11): Mapd_ClearCache is handled by map_downloader (clear_downloaded_maps after its lock step)
     update_osm_db()
     live_map_sp.tick()
     rk.keep_time()

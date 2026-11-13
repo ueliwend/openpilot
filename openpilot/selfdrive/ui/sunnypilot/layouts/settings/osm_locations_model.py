@@ -1,9 +1,12 @@
-"""Texts and decisions of the offline maps screen (Inster port, E9), without any widget, so they are testable offline.
+"""Texts and decisions of the offline maps screen (Inster port, E9; E11 map updates), without any widget, so they are testable
+offline.
 
-The screen reads `OsmLocationStatus` (written by mapd_manager from the tiles on disk) and writes only requests:
-`OsmDownloadRequest` (ids or "all"; a new id is added to the selection by mapd_manager) and `OsmDeleteLocation`
-(ids or "OTHER"). The download confirmation measures what it can on the device (tiles on disk, drive folders, free
-space) and asks the tile server for the sizes it does not know yet.
+The screen reads `OsmLocationStatus` (written by map_downloader when it changes; version 2 since E11, version 1 from E9 is
+still shown until the first version 2 arrives) and the memory param `OsmDownloaderLive` (heartbeat, byte progress), and
+writes only requests: `OsmDownloadRequest` (ids or "all", also the per-country UPDATE; a new id is added to the selection by
+map_downloader), `OsmDeleteLocation` (ids or "OTHER") and the toggle `OsmAutoUpdate`. The download confirmation measures
+what it can on the device (tiles on disk, drive folders, free space) and asks the tile server for the sizes it does not
+know yet.
 
 Characters: the raylib UI loads a fixed glyph set (system/ui/lib/application.py `_load_fonts`: ASCII 32-126,
 EXTRA_FONT_CHARS and the characters of the translation files); any other character is drawn as "?". Every text here
@@ -15,13 +18,22 @@ from dataclasses import dataclass
 
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.sunnypilot.mapd.offline_regions import entry_tiles, location_title, locations, parse_entry_id, tile_stats, union_tiles
-from openpilot.sunnypilot.mapd.offline_server import NO_ANSWER_SIZE, SizeCache
+from openpilot.sunnypilot.mapd.offline_server import NO_ANSWER_SIZE, KnownSizes
 from openpilot.sunnypilot.mapd.offline_storage import MIN_DRIVE_BUFFER_HOURS, Plan, TileEstimate, estimate_tiles, plan_download
 
 REQUEST_KEY = "OsmDownloadRequest"
 DELETE_KEY = "OsmDeleteLocation"
 STATUS_KEY = "OsmLocationStatus"
+LIVE_KEY = "OsmDownloaderLive"
+AUTO_KEY = "OsmAutoUpdate"
 OTHER = "OTHER"
+STALE_SECONDS = 45.0  # heartbeat age that means the downloader stopped (30 s read timeout + margin; DESIGN 2: 30 s)
+NO_HEARTBEAT_SECONDS = 180.0  # no heartbeat at all this long after boot: stopped (it waits up to 60 s, then writes each second)
+AUTO_TITLE = "Update maps automatically"
+AUTO_DESCRIPTION = "Checks the maps of the selected countries once a week and downloads tiles the map server has rebuilt, one at " + \
+                   "a time at the lowest priority, also while driving (Wi-Fi or an unmetered SIM, at most 1 MB/s while driving). " + \
+                   "If the server rebuilds its maps every week, that is about 3 GB a week for six countries. New maps take effect " + \
+                   "at the next start."
 DATE_UNKNOWN_BEFORE = datetime.datetime(2020, 1, 1).timestamp()  # an unset clock writes 1970 times
 NEEDS_DOWNLOAD = ("not_downloaded", "partial", "failed")
 SEP = " | "
@@ -86,7 +98,41 @@ def busy(status: dict | None) -> bool:
   return bool(run_of(status).get("active"))
 
 
+def kept_text(entry: dict) -> str:
+  kept = [k for k in entry.get("kept_smaller") or [] if isinstance(k, dict)]
+  if not kept:
+    return ""
+  pct = max(int(k.get("pct", 0)) for k in kept)
+  return tr("{} tile kept - new map {}% smaller").format(len(kept), pct) if len(kept) == 1 else \
+    tr("{} tiles kept - new maps up to {}% smaller").format(len(kept), pct)
+
+
 def entry_value(entry: dict, run: dict) -> str:
+  if entry.get("tiles_due") is None and "date_oldest" not in entry:
+    return entry_value_v1(entry, run)
+  state = entry.get("state")
+  size = size_text(entry.get("bytes", 0))
+  dates = day_range_text(entry.get("date_oldest", 0), entry.get("date_newest", 0))
+  if state == "downloading":
+    text = tr("downloading {}/{}").format(entry.get("tiles_done", 0), entry.get("tiles_expected", 0))
+  elif state == "queued":
+    text = tr("update queued") if entry.get("tiles_present") else tr("queued")
+    wait = wait_text(run)
+    if wait and run.get("waiting") != "start":
+      text += SEP + wait
+  elif state == "not_downloaded":
+    text = tr("not downloaded")
+  elif state == "staged":
+    text = tr("{} of {} updated").format(entry.get("tiles_staged", 0), entry.get("tiles_expected", 0)) + SEP + \
+      tr("applies at next start")
+  else:
+    text = size + SEP + dates
+  kept = kept_text(entry)
+  return text + SEP + kept if kept else text
+
+
+def entry_value_v1(entry: dict, run: dict) -> str:
+  """OsmLocationStatus version 1 (E9), shown until map_downloader's first version 2 (the first E11 start)."""
   state = entry.get("state")
   size, date = size_text(entry.get("bytes", 0)), day_text(entry.get("date", 0))
   if state == "downloading":
@@ -105,11 +151,25 @@ def entry_value(entry: dict, run: dict) -> str:
   return size + SEP + date
 
 
+def is_due(entry: dict) -> bool:
+  return entry.get("state") in ("queued", "downloading")
+
+
 def needs_download(status: dict | None) -> list[dict]:
+  """The "Not downloaded" row: countries with no tile on disk or staged and none due (version 1: E9's states)."""
+  if isinstance(status, dict) and status.get("version", 1) >= 2:
+    return [e for e in entries(status) if e.get("state") == "not_downloaded"]
   return [e for e in entries(status) if e.get("state") in NEEDS_DOWNLOAD]
 
 
 WAIT_TEXTS = {
+  "start": "starting",
+  "network": "waiting for Wi-Fi or SIM",
+  "hot": "paused: device hot",
+  "memory": "paused: low memory",
+  "server": "map server not reachable",
+  "storage": "not enough storage",
+  # version 1 (E9)
   "onroad": "waiting until the car is off",
   "mapd": "starting",
   "waiting for an unmetered network": "waiting for Wi-Fi or another unmetered network",
@@ -117,11 +177,24 @@ WAIT_TEXTS = {
   "map server not reachable": "map server not reachable",
   "map server too slow": "map server too slow",
 }
-SERVER_WAITS = ("map server not reachable", "map server error", "map server too slow")
+SERVER_WAITS = ("server", "server_error", "map server not reachable", "map server error", "map server too slow")
 
 
 def time_text(ts: float) -> str:
   return datetime.datetime.fromtimestamp(ts).strftime("%H:%M") if ts and ts >= DATE_UNKNOWN_BEFORE else ""
+
+
+def wait_text(run: dict) -> str:
+  waiting = str(run.get("waiting") or "")
+  if not waiting:
+    return ""
+  if run.get("server_error"):
+    text = tr("map server error (HTTP {})").format(run["server_error"])
+  else:
+    text = tr(WAIT_TEXTS.get(waiting, waiting))
+  if waiting.startswith(SERVER_WAITS) and time_text(run.get("retry_at", 0)):
+    text += SEP + tr("next try {}").format(time_text(run["retry_at"]))
+  return text
 
 
 def can_retry(status: dict | None) -> bool:
@@ -130,7 +203,55 @@ def can_retry(status: dict | None) -> bool:
   return bool(run.get("active")) and not run.get("current") and str(run.get("waiting", "")).startswith(SERVER_WAITS)
 
 
-def progress_text(status: dict | None) -> str:
+def downloader_stopped(status: dict | None, live: dict | None, monotonic_now: float) -> bool:
+  """map_downloader's heartbeat (memory param, CLOCK_MONOTONIC like time.monotonic in every process) is older than
+  STALE_SECONDS, or missing long after boot. Only with a version 2 status (E11 software)."""
+  if not isinstance(status, dict) or status.get("version", 1) < 2:
+    return False
+  beat = live.get("heartbeat") if isinstance(live, dict) else None
+  if not isinstance(beat, (int, float)):
+    return monotonic_now > NO_HEARTBEAT_SECONDS
+  return monotonic_now - beat > STALE_SECONDS
+
+
+def progress_text(status: dict | None, live: dict | None = None, stopped: bool = False) -> str:
+  run = run_of(status)
+  if stopped:
+    return tr("map downloads stopped - restart the device")
+  if isinstance(status, dict) and status.get("version", 1) < 2:
+    return progress_text_v1(status)
+  parts = []
+  if run.get("apply_failed"):
+    parts.append(tr("map update could not be applied"))
+  if run.get("active"):
+    location = run.get("current_location")
+    if run.get("current") and location:
+      entry = (status.get("entries") or {}).get(location, {})
+      parts.append(f"{entry.get('title', title_of(location))} {entry.get('tiles_done', 0)}/{entry.get('tiles_expected', 0)}")
+    elif run.get("current"):
+      parts.append(tr("map area {}").format(run["current"]))
+    else:
+      parts.append(wait_text(run) or tr("queued"))
+  if run.get("staged"):
+    parts.append(tr("{} staged for next start").format(run["staged"]))
+  if run.get("active") and run.get("current") and isinstance(live, dict) and live.get("cap"):
+    parts.append(tr("{:.1f} MB/s while driving").format(live["cap"] / 1e6))
+  return SEP.join(p for p in parts if p)
+
+
+def progress_fraction(status: dict | None, live: dict | None = None) -> float:
+  """The current tile's bytes (live) when known, else the current country's tiles."""
+  if isinstance(status, dict) and status.get("version", 1) < 2:
+    return queue_fraction(status)
+  if isinstance(live, dict) and live.get("tile") and live.get("total"):
+    return max(0.0, min(1.0, live.get("done", 0) / live["total"]))
+  run = run_of(status)
+  entry = (status.get("entries") or {}).get(run.get("current_location"), {}) if isinstance(status, dict) else {}
+  total = entry.get("tiles_expected", 0)
+  return max(0.0, min(1.0, entry.get("tiles_done", 0) / total)) if total else 0.0
+
+
+def progress_text_v1(status: dict | None) -> str:
   run = run_of(status)
   if not run.get("active"):
     return ""
@@ -152,6 +273,11 @@ def progress_text(status: dict | None) -> str:
   return text
 
 
+def show_progress(status: dict | None, stopped: bool) -> bool:
+  run = run_of(status)
+  return stopped or bool(run.get("active")) or bool(run.get("staged")) or bool(run.get("apply_failed"))
+
+
 def queue_fraction(status: dict | None) -> float:
   """Share of the whole run done: tiles of the finished countries plus the current country's, over all countries' tiles."""
   run = run_of(status)
@@ -163,13 +289,28 @@ def selected_ids(status: dict | None) -> list[str]:
   return [e["id"] for e in entries(status)]
 
 
-def storage_text(status: dict | None) -> str:
-  storage = status.get("storage") if isinstance(status, dict) else None
+def storage_text(status: dict | None, live: dict | None = None) -> str:
+  """Version 2: the figures come from the memory param (they change while driving); version 1 kept them in the status."""
+  storage = live.get("storage") if isinstance(live, dict) and isinstance(live.get("storage"), dict) else None
+  if storage is None and isinstance(status, dict) and status.get("version", 1) < 2:
+    storage = status.get("storage")
   if not storage:
     return ""
-  # the maps' own size is on upstream's "Downloaded Maps" row (osm_multi.py, same units): not repeated here
-  return tr("free {}").format(size_text(storage.get("available", 0))) + SEP + \
-    tr("drive buffer about {:.1f} h").format(storage.get("buffer_hours", 0.0))
+  if "buffer_hours_full" not in storage:  # version 1 (E9): the maps' size is on "Downloaded Maps"
+    return tr("free {}").format(size_text(storage.get("available", 0))) + SEP + \
+      tr("drive buffer about {:.1f} h").format(storage.get("buffer_hours", 0.0))
+  maps = tr("Maps {}").format(size_text(storage.get("maps", 0)))
+  if storage.get("staged"):
+    maps += " " + tr("(+{} staged)").format(size_text(storage["staged"]))
+  now, full = storage.get("buffer_hours", 0.0), storage.get("buffer_hours_full", 0.0)
+  buffer = tr("drive buffer about {} h").format(hours_text(now))
+  if full < now - 0.05:
+    buffer += " " + tr("({} h with full recording)").format(hours_text(full))
+  return maps + SEP + tr("free {}").format(size_text(storage.get("available", 0))) + SEP + buffer
+
+
+def hours_text(h: float) -> str:
+  return f"{h:.0f}" if h >= 10 else f"{h:.1f}"
 
 
 def other_text(status: dict | None) -> str:
@@ -184,6 +325,11 @@ def delete_text(entry: dict, running: bool = False) -> str:
   if running:
     text += " " + tr("A download is running: the files go when it ends.")
   return text
+
+
+def update_enabled(entry: dict) -> bool:
+  """Per-country UPDATE: off (QUEUED) while the country has tiles due."""
+  return not is_due(entry)
 
 
 def other_delete_text(status: dict | None) -> str:
@@ -209,7 +355,7 @@ def deleter_text(plan: Plan) -> str:
 @dataclass
 class BatchPlan:
   """What a download of several countries at once costs: per country, for the batch, and the storage check of the batch
-  together with the countries already queued (as mapd_manager checks it before each country)."""
+  together with the countries already queued (as map_downloader checks it before each tile)."""
   per: list  # (id, title, TileEstimate) for each new country (tiles shared with another one counted in both)
   total: TileEstimate  # the new countries together (shared tiles counted once)
   plan: Plan  # guard and deleter replay for the new countries and those already queued
@@ -229,7 +375,7 @@ def batch_text(titles: list[str], batch: "BatchPlan | None") -> str:
     text = tr("Not enough storage for {}").format(names)
     if batch.queued:
       text += " " + tr("(with {} already queued)").format(", ".join(batch.queued))
-    return text + ": " + tr("maps may use {} in all to keep {:.0f} h of drive recording.").format(
+    return text + ": " + tr("maps may use {} in all to keep {:.0f} h of full drive recording.").format(
       size_text(max(0, plan.budget.max_maps)), MIN_DRIVE_BUFFER_HOURS)
   t = batch.total
   if len(batch.per) == 1:
@@ -253,9 +399,9 @@ def download_text(titles: list[str], plan: Plan | None) -> str:
   return batch_text(titles, BatchPlan(per=[("", ", ".join(titles), plan.estimate)], total=plan.estimate, plan=plan, queued=[]))
 
 
-def _server_sizes(root: str, tiles, server) -> tuple[dict, dict, bool, SizeCache]:
-  """on-disk bytes and download sizes of the tiles (cache first, then HEAD; stops asking once the server does not answer)."""
-  cache = SizeCache(root)
+def _server_sizes(root: str, tiles, server) -> tuple[dict, dict, bool, KnownSizes]:
+  """on-disk bytes and download sizes of the tiles (the store first, then HEAD; stops asking once the server does not answer)."""
+  cache = KnownSizes(root)
   on_disk, unknown = {}, {}
   answered, reachable = False, True
   for t in sorted(tiles):
@@ -276,13 +422,19 @@ def _server_sizes(root: str, tiles, server) -> tuple[dict, dict, bool, SizeCache
   return on_disk, unknown, ok, cache
 
 
-def estimate(root: str, location_ids: list[str], server, log_root: str | None = None) -> Plan | None:
-  """Guard and deleter replay for downloading these locations now (runs in a thread: it may ask the server for sizes)."""
+def estimate(root: str, location_ids: list[str], server, log_root: str | None = None, rate_mb_min: float | None = None) -> Plan | None:
+  """Guard and deleter replay for downloading these locations now (runs in a thread: it may ask the server for sizes).
+  A tile on disk is staged next to its live copy until the next start, so it counts again (E11)."""
   on_disk, unknown, ok, cache = _server_sizes(root, union_tiles(location_ids), server)
-  return plan_download(root, estimate_tiles(on_disk, unknown, cache.ratio()), log_root=log_root) if ok else None
+  if not ok:
+    return None
+  est = estimate_tiles(on_disk, unknown, cache.ratio())
+  est.new += est.on_disk
+  return plan_download(root, est, log_root=log_root, rate_mb_min=rate_mb_min)
 
 
-def estimate_batch(root: str, new_ids: list[str], queued: list[str], server, log_root: str | None = None) -> BatchPlan | None:
+def estimate_batch(root: str, new_ids: list[str], queued: list[str], server, log_root: str | None = None,
+                   rate_mb_min: float | None = None) -> BatchPlan | None:
   """Per country and total sizes of the new countries, and the guard for them together with the queued ones."""
   on_disk, unknown, ok, cache = _server_sizes(root, union_tiles(new_ids) | union_tiles(queued), server)
   if not ok:
@@ -293,7 +445,7 @@ def estimate_batch(root: str, new_ids: list[str], queued: list[str], server, log
     tiles = set(tiles)
     return estimate_tiles({t: v for t, v in on_disk.items() if t in tiles}, {t: v for t, v in unknown.items() if t in tiles}, ratio)
   per = [(i, title_of(i), est(entry_tiles(i))) for i in new_ids]
-  plan = plan_download(root, est(union_tiles(new_ids) | union_tiles(queued)), log_root=log_root)
+  plan = plan_download(root, est(union_tiles(new_ids) | union_tiles(queued)), log_root=log_root, rate_mb_min=rate_mb_min)
   return BatchPlan(per=per, total=est(union_tiles(new_ids)), plan=plan, queued=[title_of(i) for i in queued if i not in new_ids])
 
 
@@ -307,9 +459,9 @@ def state_options() -> list[tuple[str, str]]:
 
 
 def map_size(root: str) -> int:
-  """Bytes of the downloaded maps, incl. the old copies moved aside and the download files of a running update."""
+  """Bytes of the downloaded maps: live, staged, in work and replaced copies not yet removed (and E9's leftovers)."""
   total = 0
-  for sub in ("offline", "offline_prev", "tmp"):
+  for sub in ("offline", "offline_next", "offline_hashes", "offline_prev", "tmp"):
     stack = [os.path.join(root, sub)]
     while stack:
       try:

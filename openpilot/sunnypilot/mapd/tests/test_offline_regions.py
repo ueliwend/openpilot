@@ -13,7 +13,7 @@ VENDORED_SHA256 = {
 
 
 def test_vendored_boxes_match_the_binary_version():
-  assert VERSION == BOXES_VERSION == "v1.12.0", "mapd changed: re-vendor the bounding boxes and re-check offline_update.py"
+  assert VERSION == BOXES_VERSION == "v1.12.0", "mapd changed: re-vendor the bounding boxes and re-check tile_fetch.py and offline_swap.py"
   for kind, name in BOX_FILES.items():
     with open(os.path.join(BOXES_DIR, name), "rb") as f:
       assert hashlib.sha256(f.read()).hexdigest() == VENDORED_SHA256[kind]

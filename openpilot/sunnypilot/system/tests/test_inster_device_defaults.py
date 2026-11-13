@@ -31,6 +31,8 @@ DEVICE_DEFAULTS = {
   "AutoLaneChangeBsmDelay": True, "GsmMetered": False, "GsmRoaming": True,
   # owner, 12 Nov 2026 (E10): only the road camera preview qcamera.ts is stored by default, not fcamera.hevc / ecamera.hevc
   "RecordRoadFull": False,
+  # owner, 13 Nov 2026 (E11, Q3 a): every map tile of the selected countries is checked once a week
+  "OsmAutoUpdate": True,
 }
 
 # a value different from each default (the owner's store must survive a start unchanged)

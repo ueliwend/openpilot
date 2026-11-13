@@ -10,7 +10,9 @@ the budget against the total capacity, in bytes measured on the device:
 - other: capacity - available - drives - maps (system, reserved blocks, anything else);
 - maps_after: maps now + the estimated size of the tiles not on disk yet (a tile on disk is replaced at its own size);
 - peak: extra space while a tile is replaced: 2 x the largest tile + its download file;
-- minimum drive buffer: 3 h of driving (owner, 11 Nov 2026) at 239.18 MB per driving minute (H3, EST).
+- minimum drive buffer: 3 h of driving (owner, 11 Nov 2026) at the current recording rate, but at least full road recording
+  (164.28 MB per minute: owner Q5 a, 13 Nov 2026, E11): about 29.6 GB stay free for drives (E10 rates, EST). The screen
+  shows the buffer at the current rate and with full recording (E9 divided by 239.18 MB/min: 16.7x too low since E10).
 
 When the download needs more than the free space above the floor (the shortfall D), the deleter frees it by deleting the
 oldest drive segments while the download runs (owner: always allowed). replay_deleter() replays the deleter's order on
@@ -27,9 +29,12 @@ from openpilot.common.hardware.hw import Paths
 from openpilot.system.loggerd import deleter
 from openpilot.system.loggerd.uploader import listdir_by_creation
 
-BYTES_PER_DRIVE_MINUTE = 239.18e6  # all cameras, H3 storage budget (EST)
 MIN_DRIVE_BUFFER_HOURS = 3.0  # owner, 11 Nov 2026 (DESIGN question 4)
-MIN_DRIVE_BUFFER_BYTES = int(MIN_DRIVE_BUFFER_HOURS * 60 * BYTES_PER_DRIVE_MINUTE)
+# Recorded MB per driving minute by the recording settings (E10, H3; EST): the road preview and logs always, the full road
+# cameras with RecordRoadFull, the cabin camera with RecordFront (loggerd reads both at its start, loggerd.h).
+PREVIEW_MB_PER_MIN, ROAD_FULL_MB_PER_MIN, FRONT_MB_PER_MIN = 14.28, 150.0, 74.9
+FULL_RECORDING_MB_PER_MIN = PREVIEW_MB_PER_MIN + ROAD_FULL_MB_PER_MIN  # 164.28: the guard is sized at least for this (owner Q5 a)
+MIN_DRIVE_BUFFER_BYTES = int(MIN_DRIVE_BUFFER_HOURS * 60 * FULL_RECORDING_MB_PER_MIN * 1e6)  # 29.6 GB with today's settings
 DEFAULT_UNPACK_RATIO = 4.0  # on-disk bytes per downloaded byte until measured (DESIGN section 3)
 UNKNOWN_TILE_DOWNLOAD_BYTES = 150_000_000  # a tile whose size the server did not tell (EST, high side)
 
@@ -73,7 +78,7 @@ def folder_bytes(path: str) -> tuple[int, float]:
 
 
 def maps_bytes(root: str) -> int:
-  """Everything mapd and the offline update keep under the mapd root (tiles, old copies, download files, caches)."""
+  """Everything under the mapd root: live tiles, staged tiles, work, old copies, manifests (E11: live + staged + work)."""
   return folder_bytes(root)[0]
 
 
@@ -90,18 +95,35 @@ class Budget:
   peak: int
   shortfall: int  # D: bytes the deleter must free while the download runs (0 = none)
   max_maps: int  # most map data the buffer allows
-  buffer_hours_after: float  # drive recording the disk can hold once the maps are in
+  buffer_hours_after: float  # drive recording the disk can hold once the maps are in, at the rate the guard is sized for
+  buffer_hours_now: float = 0.0  # the same at the current recording settings (the screen's figure)
+  buffer_hours_full: float = 0.0  # the same with full road recording
 
 
-def budget(disk: Disk, drives: int, maps_now: int, maps_after: int, peak: int) -> Budget:
+def recording_mb_per_min(params) -> float:
+  """MB per driving minute the current recording settings store (E10 figures, EST)."""
+  return PREVIEW_MB_PER_MIN + ROAD_FULL_MB_PER_MIN * params.get_bool("RecordRoadFull") + FRONT_MB_PER_MIN * params.get_bool("RecordFront")
+
+
+def guard_mb_per_min(rate_mb_min: float | None) -> float:
+  """The rate the guard is sized for: the current one, but at least full road recording (owner Q5 a, 13 Nov 2026), so
+  switching "Record Full-Resolution Road Cameras" on later still leaves 3 h before the deleter removes drives."""
+  return max(rate_mb_min or 0.0, FULL_RECORDING_MB_PER_MIN)
+
+
+def budget(disk: Disk, drives: int, maps_now: int, maps_after: int, peak: int, rate_mb_min: float | None = None) -> Budget:
+  """rate_mb_min: the current recording rate (recording_mb_per_min); None = full road recording."""
   floor = floor_bytes(disk.capacity)
   other = max(0, disk.capacity - disk.available - drives - maps_now)
-  ok = maps_after + peak + floor + other + MIN_DRIVE_BUFFER_BYTES <= disk.capacity
+  sized = guard_mb_per_min(rate_mb_min) * 1e6
+  buffer_bytes = int(MIN_DRIVE_BUFFER_HOURS * 60 * sized)
+  ok = maps_after + peak + floor + other + buffer_bytes <= disk.capacity
   shortfall = max(0, (maps_after + peak - maps_now) - (disk.available - floor))
-  max_maps = disk.capacity - floor - other - MIN_DRIVE_BUFFER_BYTES
-  buffer_hours = max(0.0, (disk.capacity - floor - other - maps_after) / BYTES_PER_DRIVE_MINUTE / 60)
+  max_maps = disk.capacity - floor - other - buffer_bytes
+  room = max(0.0, disk.capacity - floor - other - maps_after)
+  now_rate = (rate_mb_min or FULL_RECORDING_MB_PER_MIN) * 1e6
   return Budget(ok, disk.capacity, disk.available, floor, other, drives, maps_now, maps_after, peak, shortfall, max_maps,
-                buffer_hours)
+                room / sized / 60, room / now_rate / 60, room / sized / 60)
 
 
 def is_segment(name: str) -> bool:
@@ -236,10 +258,10 @@ class Plan:
 
 
 def plan_download(root: str, est: TileEstimate, disk: Disk | None = None, drives: int | None = None,
-                  log_root: str | None = None) -> Plan:
+                  log_root: str | None = None, rate_mb_min: float | None = None) -> Plan:
   """The guard and the deleter replay for downloading the tiles of `est` now (disk and drives measured if not given)."""
   disk = disk or disk_usage(root if os.path.isdir(root) else os.path.dirname(root))
   drives = drives_bytes(log_root) if drives is None else drives
   maps_now = maps_bytes(root)
-  b = budget(disk, drives, maps_now, maps_now + est.new, peak_bytes(est))
+  b = budget(disk, drives, maps_now, maps_now + est.new, peak_bytes(est), rate_mb_min)
   return Plan(b, est, replay_deleter(b.shortfall, log_root) if b.ok else DeleterReplay(needed=b.shortfall))

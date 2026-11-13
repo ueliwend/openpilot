@@ -270,21 +270,22 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     // mapd
     {"MapAdvisorySpeedLimit", {CLEAR_ON_ONROAD_TRANSITION, FLOAT}},
     {"Mapd_ClearCache", {CLEAR_ON_MANAGER_START, BOOL}},
-    {"MapdRestartRequest", {CLEAR_ON_MANAGER_START, BOOL}},  // Inster: mapd_manager asks the manager to restart the mapd binary (mapd_priority.py)
     {"MapdVersion", {PERSISTENT, STRING}},
     {"MapSpeedLimit", {CLEAR_ON_ONROAD_TRANSITION, FLOAT, "0.0"}},
     {"NextMapSpeedLimit", {CLEAR_ON_ONROAD_TRANSITION, JSON}},
     {"Offroad_OSMUpdateRequired", {CLEAR_ON_MANAGER_START, JSON}},
+    {"OsmAutoUpdate", {PERSISTENT | BACKUP, BOOL, "1"}},  // Inster (E11, owner 13 Nov 2026): weekly check of every map tile of the selected countries
     {"OsmDbUpdatesCheck", {CLEAR_ON_MANAGER_START, BOOL}},  // mapd database update happens with device ON, reset on boot
-    {"OsmDeleteLocation", {CLEAR_ON_MANAGER_START, STRING}},  // Inster: map locations to delete ("CH", "US:CA", "OTHER"), read by mapd_manager
-    {"OsmDownloadRequest", {CLEAR_ON_MANAGER_START, STRING}},  // Inster: "all" or map location ids to download, read by mapd_manager
+    {"OsmDeleteLocation", {CLEAR_ON_MANAGER_START, STRING}},  // Inster: map locations to delete ("CH", "US:CA", "OTHER"), read by map_downloader
+    {"OsmDownloadRequest", {CLEAR_ON_MANAGER_START, STRING}},  // Inster: "all" or map location ids to download, read by map_downloader
     {"OSMDownloadBounds", {PERSISTENT, STRING}},
     {"OsmDownloadedDate", {PERSISTENT, STRING, "0.0"}},
+    {"OsmDownloaderLive", {CLEAR_ON_MANAGER_START, JSON}},  // Inster (E11): map_downloader's heartbeat and byte progress, memory params only (/dev/shm)
     {"OSMDownloadLocations", {PERSISTENT, JSON}},
     {"OSMDownloadProgress", {CLEAR_ON_MANAGER_START, JSON}},
     {"OsmLocal", {PERSISTENT, BOOL}},
     {"OsmLocationName", {PERSISTENT, STRING}},
-    {"OsmLocationStatus", {PERSISTENT, JSON}},  // Inster: per map location state from the tiles on disk, written by mapd_manager only
+    {"OsmLocationStatus", {PERSISTENT, JSON}},  // Inster: per map location state (version 2: E11), written by map_downloader only, when it changes
     {"OsmLocationTitle", {PERSISTENT, STRING}},
     {"OsmLocationUrl", {PERSISTENT, STRING}},
     {"OsmSelectedLocations", {PERSISTENT | BACKUP, JSON}},  // Inster: the selected map locations (list), the only source of truth

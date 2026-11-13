@@ -1,11 +1,13 @@
-"""Storage guard and deleter replay (DESIGN.md rev 4 section 3; owner: the deleter may always act, 3 h drive buffer)."""
+"""Storage guard and deleter replay (DESIGN.md rev 4 section 3; owner: the deleter may always act, 3 h drive buffer).
+E11 (DESIGN rev 2 section 4.6, owner Q5 a): the buffer is sized at the current recording rate, but at least full road recording."""
 import os
 from pathlib import Path
 
 from openpilot.common.hardware.hw import Paths
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.sunnypilot.mapd import offline_storage as st
-from openpilot.sunnypilot.mapd.offline_server import SizeCache
+from openpilot.sunnypilot.mapd.offline_server import KnownSizes
+from openpilot.sunnypilot.mapd import offline_swap as sw
 from openpilot.system.loggerd import deleter
 
 GB = 1_000_000_000
@@ -13,8 +15,43 @@ DAY = 86400.0
 T0 = 1_762_000_000.0  # 1 Nov 2025
 
 
-def test_buffer_is_three_hours_at_the_measured_rate():
-  assert st.MIN_DRIVE_BUFFER_BYTES == int(3 * 60 * 239.18e6)
+def test_buffer_is_three_hours_of_full_recording():
+  assert st.MIN_DRIVE_BUFFER_BYTES == int(3 * 60 * 164.28e6)  # 29.6 GB kept free for drives (owner Q5 a, 13 Nov 2026)
+
+
+class Rec:
+  def __init__(self, road_full, front):
+    self.v = {"RecordRoadFull": road_full, "RecordFront": front}
+
+  def get_bool(self, k):
+    return self.v[k]
+
+
+def test_recording_rate_from_the_settings():
+  assert abs(st.recording_mb_per_min(Rec(False, False)) - 14.28) < 1e-9
+  assert abs(st.recording_mb_per_min(Rec(True, False)) - 164.28) < 1e-9
+  assert abs(st.recording_mb_per_min(Rec(True, True)) - 239.18) < 1e-9
+  assert st.guard_mb_per_min(14.28) == 164.28 and abs(st.guard_mb_per_min(239.18) - 239.18) < 1e-9
+
+
+def test_guard_sized_for_full_recording_while_preview_only():
+  cap = 95 * GB
+  disk = st.Disk(cap, 50 * GB)
+  preview = st.budget(disk, 30 * GB, 0, 0, 0, 14.28)
+  full = st.budget(disk, 30 * GB, 0, 0, 0, 164.28)
+  assert preview.max_maps == full.max_maps  # Q5 a: switching full recording on later still leaves 3 h
+  both = st.budget(disk, 30 * GB, 0, 0, 0, 239.18)
+  assert both.max_maps < full.max_maps
+
+
+def test_screen_figure_for_the_photo():
+  """The photo's "about 5.0 h" used 239.18 MB/min; at the 14.28 MB/min the device records it is ~84 h, 7 h with full recording."""
+  room = 5.0 * 60 * 239.18e6
+  cap = 100 * GB
+  floor = st.floor_bytes(cap)
+  b = st.budget(st.Disk(cap, cap), 0, 0, 0, 0, 14.28)
+  b = st.budget(st.Disk(cap, cap), 0, int(cap - floor - room), int(cap - floor - room), 0, 14.28)
+  assert round(b.buffer_hours_now) == 84 and round(b.buffer_hours_full, 1) == 7.3
 
 
 def test_budget_on_a_full_disk_passes_and_computes_the_shortfall():
@@ -48,20 +85,17 @@ def test_estimate_counts_unknown_and_no_data_tiles():
   assert st.peak_bytes(est) == 2 * est.largest + est.largest_download
 
 
-def test_size_cache_ratio_and_stale_404(tmp_path):
-  cache = SizeCache(str(tmp_path))
-  assert cache.ratio() == st.DEFAULT_UNPACK_RATIO
-  cache.set_download((44, 6), 100)
-  cache.set_disk((44, 6), 300)
-  cache.set_download((44, 8), 0)
-  assert cache.ratio() == 3.0 and cache.no_data((44, 8))
-  cache.set_disk((44, 8), 50)  # a tile on disk has data after all
-  assert not cache.no_data((44, 8))
-  cache.save()
-  assert SizeCache(str(tmp_path)).tiles == cache.tiles
-  with open(cache.path, "w") as f:
-    f.write("{bad")
-  assert SizeCache(str(tmp_path)).tiles == {}
+def test_known_sizes_from_the_store_and_e9_cache(tmp_path):
+  root = str(tmp_path)
+  sizes = KnownSizes(root)
+  assert sizes.ratio() == st.DEFAULT_UNPACK_RATIO and sizes.download((44, 6)) is None
+  m = sw.empty_manifest()
+  m["tiles"]["44/6"] = {"download_bytes": 100, "disk_bytes": 300}
+  m["no_data"]["44/8"] = {"checked_at": 1}
+  sw.write_json_atomic(sw.live_manifest_path(root), m)
+  sw.write_json_atomic(os.path.join(root, sw.SIZES_NAME), {"version": 1, "tiles": {"46/6": {"download": 50}}})
+  sizes = KnownSizes(root)
+  assert sizes.ratio() == 3.0 and sizes.no_data((44, 8)) and sizes.download((46, 6)) == 50 and sizes.download((44, 6)) == 100
 
 
 class TestDeleterReplay(OpenpilotTestCase):

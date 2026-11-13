@@ -23,7 +23,7 @@ SETTINGS_PY = UI / "sunnypilot/layouts/settings/settings.py"
 OSM_PY = UI / "sunnypilot/layouts/settings/osm.py"
 MODEL_PY = UI / "sunnypilot/layouts/settings/osm_locations_model.py"
 APPLICATION_PY = REPO / "system/ui/lib/application.py"
-MAPS_PY = REPO / "sunnypilot/mapd/offline_maps.py"
+MAPS_PY = REPO / "sunnypilot/mapd/map_downloader.py"  # its message reaches the screen
 NOV2 = datetime.datetime(2026, 11, 2, 12).timestamp()
 NOV3 = datetime.datetime(2026, 11, 3, 9).timestamp()
 GB = 1_000_000_000
@@ -97,7 +97,7 @@ class TestTexts(OpenpilotTestCase):
     ]
     refused = batch([("AT", "Austria", tiles()), ("DE", "Germany", tiles())], ok=False, queued=["France"])
     assert model.batch_text(["Austria", "Germany"], refused) == \
-      "Not enough storage for Austria, Germany (with France already queued): maps may use 30.0 GB in all to keep 3 h of drive recording."
+      "Not enough storage for Austria, Germany (with France already queued): maps may use 30.0 GB in all to keep 3 h of full drive recording."
 
   def test_update_all_confirmation(self):
     assert model.download_text(["Austria"], plan()) == "Download Austria? About 900 MB on the device, 450 MB to download."
@@ -168,7 +168,8 @@ class TestEstimate(OpenpilotTestCase):
     root, asked = self._root(), []
     p = model.estimate(root, ["CH"], types.SimpleNamespace(head=lambda t: asked.append(t) or 250), log_root=root)
     assert (44, 6) not in asked and len(asked) == 5
-    assert p.estimate.on_disk == 1000 and p.estimate.download == 1000 // 4 + 5 * 250 and p.estimate.new == 5 * 1000
+    assert p.estimate.on_disk == 1000 and p.estimate.download == 1000 // 4 + 5 * 250
+    assert p.estimate.new == 5 * 1000 + 1000  # E11: a tile on disk is staged next to its live copy until the next start
     asked.clear()
     assert model.estimate(root, ["CH"], types.SimpleNamespace(head=lambda t: asked.append(t) or NO_ANSWER_SIZE), log_root=root) is None
     assert len(asked) == 1  # stops asking once the server does not answer
@@ -276,8 +277,9 @@ class Action:
 
 
 class Item:
-  def __init__(self, title="", action_item=None, callback=None, **_):
+  def __init__(self, title="", action_item=None, callback=None, **kw):
     self.title, self.action_item, self.callback, self.visible = title, action_item or Action(), callback, True
+    self.kw = kw
 
   def set_visible(self, visible):
     self.visible = visible
@@ -290,6 +292,9 @@ class FakeParams(dict):
   def get(self, key, *a, **k):
     return super().get(key)
 
+  def get_bool(self, key, *a, **k):
+    return bool(super().get(key))
+
   def put(self, key, value, *a, **k):
     self[key] = value
 
@@ -297,6 +302,23 @@ class FakeParams(dict):
 class Node(types.SimpleNamespace):
   def __init__(self, ref, data):
     super().__init__(ref=ref, data=data)
+
+
+class TwoAction(Action):
+  """ValueTwoButtonsAction as far as the panel uses it: UPDATE (left, the action's own text) and DELETE (right)."""
+  def __init__(self, left_text, right_text, left_callback=None, right_callback=None, enabled=True):
+    super().__init__(left_text, enabled)
+    self.right_text, self.right_enabled = right_text, True
+    self.left_callback, self.right_callback = left_callback, right_callback
+
+  def set_left_enabled(self, enabled):
+    self.enabled = enabled
+
+  def set_right_enabled(self, enabled):
+    self.right_enabled = enabled
+
+  def set_right_text(self, text):
+    self.right_text = text
 
 
 class Dialog:
@@ -310,14 +332,16 @@ def load_panel():
   pushed = []
   stand_ins = {
     "openpilot.selfdrive.ui.ui_state": {"ui_state": ui_state},
-    "openpilot.selfdrive.ui.sunnypilot.layouts.settings.osm_widgets": {"CountryPickDialog": Dialog, "QueueProgressAction": Action},
+    "openpilot.selfdrive.ui.sunnypilot.layouts.settings.osm_widgets": {"CountryPickDialog": Dialog, "QueueProgressAction": Action,
+                                                                       "ValueTwoButtonsAction": TwoAction},
     "openpilot.system.ui.lib.application": {"gui_app": types.SimpleNamespace(push_widget=pushed.append)},
     "openpilot.system.ui.lib.multilang": {"tr": lambda s: s},
     "openpilot.system.ui.widgets": {"DialogResult": types.SimpleNamespace(CONFIRM=1, CANCEL=0)},
     "openpilot.system.ui.widgets.confirm_dialog": {"ConfirmDialog": Dialog},
     "openpilot.system.ui.widgets.list_view": {"text_item": lambda title, value: Item(title, Action(value)), "ListItem": Item},
     "openpilot.system.ui.sunnypilot.lib.utils": {"NoElideButtonAction": Action},
-    "openpilot.system.ui.sunnypilot.widgets.list_view": {"ListItemSP": Item},
+    "openpilot.system.ui.sunnypilot.widgets.list_view": {"ListItemSP": Item, "toggle_item_sp": lambda title, description, initial_state=False,
+                                                         param=None: Item(title, Action(), param=param, description=description, state=initial_state)},
     "openpilot.system.ui.sunnypilot.widgets.tree_dialog": {"TreeFolder": lambda folder, nodes: nodes, "TreeNode": Node},
   }
   modules = {}
@@ -346,13 +370,16 @@ RUNNING = {"active": True, "current": "DE", "index": 1, "count": 1, "tiles_done"
 class TestRows(OpenpilotTestCase):
   def setup_method(self):
     self.module, self.params, self.pushed = load_panel()
-    self.panel = self.module.OsmLocationsPanel(server=types.SimpleNamespace(head=lambda t: None))
+    self.mem = FakeParams()
+    self.mono = [100.0]
+    self.panel = self.module.OsmLocationsPanel(server=types.SimpleNamespace(head=lambda t: None), mem_params=self.mem,
+                                               monotonic=lambda: self.mono[0])
     self.scroller = Scroller()
     self.asked = []
     # the estimates run in a thread in the app; here at once, with fixed results
     patches = [
-      mock.patch.object(self.module.model, "estimate", lambda root, ids, server: self.asked.append(ids) or plan()),
-      mock.patch.object(self.module.model, "estimate_batch", lambda root, ids, queued, server: self.asked.append((ids, queued)) or
+      mock.patch.object(self.module.model, "estimate", lambda root, ids, server, **kw: self.asked.append(ids) or plan()),
+      mock.patch.object(self.module.model, "estimate_batch", lambda root, ids, queued, server, **kw: self.asked.append((ids, queued)) or
                         batch([(i, model.title_of(i), tiles()) for i in ids], queued=[model.title_of(q) for q in queued])),
       mock.patch.object(self.module.threading, "Thread", lambda target, daemon: types.SimpleNamespace(start=target)),
     ]
@@ -372,7 +399,7 @@ class TestRows(OpenpilotTestCase):
     """Every text the rows show now (titles, values, button texts) and every dialog text so far."""
     out = []
     for item in self.panel.items + self.panel.rows:
-      out += [str(item.title), str(item.action_item.text), str(item.action_item.value)]
+      out += [str(item.title), str(item.action_item.text), str(item.action_item.value), str(getattr(item.action_item, "right_text", ""))]
     out += [a for d in self.pushed for a in d.args if isinstance(a, str)]
     return out
 
@@ -380,9 +407,10 @@ class TestRows(OpenpilotTestCase):
     self.params[model.STATUS_KEY] = status(CH=entry("Switzerland", "ok"), AT=entry("Austria", "not_downloaded", tiles_present=0))
     assert self.panel.update(self.scroller) is False
     assert [r.title for r in self.scroller.added] == ["Switzerland", "Austria"]
-    assert self.scroller.added[0].action_item.value == "1.4 GB | 2 Nov" and self.scroller.added[0].action_item.text == "DELETE"
+    row = self.scroller.added[0]
+    assert row.action_item.value == "1.4 GB | 2 Nov" and (row.action_item.text, row.action_item.right_text) == ("UPDATE", "DELETE")
     assert self.panel._missing_btn.visible and self.panel._missing_btn.action_item.value == "Austria"
-    self.scroller.added[1].callback()
+    self.scroller.added[1].action_item.right_callback()
     assert "Delete the maps of Austria?" in self.pushed[-1].args[0]
     self.confirm_last()
     assert self.params[model.DELETE_KEY] == "AT"
@@ -424,18 +452,18 @@ class TestRows(OpenpilotTestCase):
     self.params[model.STATUS_KEY] = status(CH=entry("Switzerland", "ok"), AT=entry("Austria", "ok"), DE=entry("Germany", "downloading"),
                                            run=RUNNING)
     self.panel.update(self.scroller)
-    assert all(r.action_item.enabled for r in self.scroller.added)  # DELETE works during a download
-    assert not self.panel._update_all_btn.action_item.enabled  # Update all would fetch this run's countries again
-    self.scroller.added[1].callback()
-    assert self.pushed[-1].args[0].endswith("A download is running: the files go when it ends.")
+    assert all(r.action_item.right_enabled for r in self.scroller.added)  # DELETE works during a download
+    assert self.panel._update_all_btn.action_item.enabled  # E11: requests are queued (requests.json), never refused
+    self.scroller.added[1].action_item.right_callback()
+    assert self.pushed[-1].args[0].startswith("Delete the maps of Austria?")
     self.confirm_last()
     assert self.params[model.DELETE_KEY] == "AT"
     # mapd_manager took it: Austria left the list, its tiles wait for the download's end
     self.params[model.STATUS_KEY] = status(CH=entry("Switzerland", "ok"), DE=entry("Germany", "downloading"), run=RUNNING | {"deletes_pending": ["AT"]})
     self.panel.update(self.scroller)
     row = self.scroller.added[2]
-    assert (row.title, row.action_item.value, row.action_item.text, row.action_item.enabled) == ("Austria", "delete queued", "QUEUED", False)
-    row.callback()
+    assert (row.title, row.action_item.value, row.action_item.right_text, row.action_item.right_enabled) == ("Austria", "delete queued", "QUEUED", False)
+    row.action_item.right_callback()
     assert len(self.pushed) == 1  # a queued row asks nothing
     assert not not_drawable(self.texts())
 
@@ -468,7 +496,7 @@ class TestRows(OpenpilotTestCase):
     assert self.params[model.DELETE_KEY] == "OTHER"
 
   def test_storage_refusal_offers_no_download(self):
-    with mock.patch.object(self.module.model, "estimate_batch", lambda root, ids, queued, server: batch([("FR", "France", tiles())], ok=False)):
+    with mock.patch.object(self.module.model, "estimate_batch", lambda root, ids, queued, server, **kw: batch([("FR", "France", tiles())], ok=False)):
       self.panel._add()
       self.pick("FR")
     assert self.pushed[-1].args[0].startswith("Not enough storage") and self.pushed[-1].args[1] == "OK"
@@ -477,7 +505,7 @@ class TestRows(OpenpilotTestCase):
   def test_update_all_refused_by_storage_offers_no_download(self):
     self.params[model.STATUS_KEY] = status(CH=entry("Switzerland", "ok"))
     self.panel.update(self.scroller)
-    with mock.patch.object(self.module.model, "estimate", lambda root, ids, server: plan(ok=False)):
+    with mock.patch.object(self.module.model, "estimate", lambda root, ids, server, **kw: plan(ok=False)):
       self.panel._update_all_btn.callback()
     assert self.pushed[-1].args[0].startswith("Not enough storage") and self.pushed[-1].args[1] == "OK"
     assert model.REQUEST_KEY not in self.params
@@ -490,6 +518,124 @@ class TestRows(OpenpilotTestCase):
     self.panel._update_all_btn.callback()
     self.confirm_last()
     assert self.params[model.REQUEST_KEY] == "all"
+
+
+# ---- E11: status version 2 (map_downloader), per-country UPDATE, the toggle, the heartbeat
+NOV6, NOV13 = datetime.datetime(2026, 11, 6, 9).timestamp(), datetime.datetime(2026, 11, 13, 9).timestamp()
+
+
+def status2(**entries):
+  run = entries.pop("run", {"active": False, "staged": 0})
+  storage = entries.pop("storage", {"maps": int(1.2 * GB), "staged": int(0.6 * GB), "available": int(53.9 * GB), "buffer_hours": 83.7,
+                                    "buffer_hours_full": 7.3})
+  return {"version": 2, "order": list(entries), "entries": entries, "run": run, "other": {"tiles": 0, "bytes": 0}, "storage": storage,
+          "message": ""}
+
+
+def entry2(title, state, **kw):
+  return {"title": title, "state": state, "bytes": 512_000_000, "tiles_total": 6, "tiles_expected": 6, "tiles_present": 6, "tiles_staged": 0,
+          "tiles_due": 0, "tiles_done": 6, "date_oldest": NOV6, "date_newest": NOV13, "exclusive_bytes": 0, "shared_tiles": 0,
+          "shared_with": [], "kept_smaller": [], "staged": 0, "due": 0} | kw
+
+
+class TestE11Texts(OpenpilotTestCase):
+  def test_country_values(self):
+    run = {"active": True, "waiting": ""}
+    assert model.entry_value(entry2("Switzerland", "ok"), run) == "512 MB | 6-13 Nov"
+    assert model.entry_value(entry2("Switzerland", "queued", tiles_due=6, tiles_done=0), run) == "update queued"
+    assert model.entry_value(entry2("Germany", "queued", tiles_present=0, tiles_due=30), run) == "queued"
+    assert model.entry_value(entry2("Switzerland", "downloading", tiles_due=3, tiles_done=3), run) == "downloading 3/6"
+    assert model.entry_value(entry2("Switzerland", "staged", tiles_staged=4), run) == "4 of 6 updated | applies at next start"
+    assert model.entry_value(entry2("Austria", "not_downloaded", tiles_present=0), run) == "not downloaded"
+    kept = entry2("Germany", "ok", kept_smaller=[{"tile": "48/8", "pct": 35}])
+    assert model.entry_value(kept, run) == "512 MB | 6-13 Nov | 1 tile kept - new map 35% smaller"
+    waits = {"network": "waiting for Wi-Fi or SIM", "hot": "paused: device hot", "storage": "not enough storage",
+             "memory": "paused: low memory"}
+    for code, text in waits.items():
+      assert model.entry_value(entry2("Switzerland", "queued", tiles_due=1), {"active": True, "waiting": code}) == "update queued | " + text
+    retry = datetime.datetime(2026, 11, 13, 14, 5).timestamp()
+    assert model.entry_value(entry2("Switzerland", "queued", tiles_due=1), {"active": True, "waiting": "server", "retry_at": retry}) == \
+      "update queued | map server not reachable | next try 14:05"
+
+  def test_version_1_still_shown(self):
+    assert model.entry_value(entry("Austria", "ok"), {}) == "1.4 GB | 2 Nov"
+    assert model.storage_text(status()) == "free 81.0 GB | drive buffer about 5.3 h"
+    assert not model.downloader_stopped(status(), None, 1e6)  # E9 software has no heartbeat
+
+  def test_storage_line_with_staged_and_both_buffers(self):
+    """Version 2: the figures are in the memory param (they change while driving), not in the persistent status."""
+    s = status2()
+    live = {"heartbeat": 1.0, "storage": s.pop("storage")}
+    assert model.storage_text(s, live) == "Maps 1.2 GB (+600 MB staged) | free 53.9 GB | drive buffer about 84 h (7.3 h with full recording)"
+    live["storage"] = {"maps": GB, "staged": 0, "available": GB, "buffer_hours": 7.3, "buffer_hours_full": 7.3}
+    assert model.storage_text(s, live) == "Maps 1.0 GB | free 1.0 GB | drive buffer about 7.3 h"
+    assert model.storage_text(status2()) == ""  # version 2 without the memory param: nothing (never stale figures)
+
+  def test_progress_row(self):
+    s = status2(DE=entry2("Germany", "downloading", tiles_expected=30, tiles_done=12, tiles_due=18),
+                run={"active": True, "current": "48/8", "current_location": "DE", "staged": 5, "waiting": ""})
+    live = {"heartbeat": 99.0, "tile": "48/8", "done": 25, "total": 100, "cap": 1_000_000}
+    assert model.progress_text(s, live) == "Germany 12/30 | 5 staged for next start | 1.0 MB/s while driving"
+    assert model.progress_fraction(s, live) == 0.25
+    assert model.progress_text(s, dict(live, cap=None)) == "Germany 12/30 | 5 staged for next start"
+    s["run"] = {"active": True, "current": None, "waiting": "network", "staged": 0}
+    assert model.progress_text(s, live) == "waiting for Wi-Fi or SIM"
+    s["run"] = {"active": False, "staged": 3, "apply_failed": True}
+    assert model.progress_text(s, live) == "map update could not be applied | 3 staged for next start" and model.show_progress(s, False)
+    assert model.progress_text(s, live, stopped=True) == "map downloads stopped - restart the device"
+
+  def test_heartbeat(self):
+    s = status2()
+    assert not model.downloader_stopped(s, {"heartbeat": 100.0}, 140.0)
+    assert model.downloader_stopped(s, {"heartbeat": 100.0}, 100.0 + model.STALE_SECONDS + 1)
+    assert not model.downloader_stopped(s, None, 60.0) and model.downloader_stopped(s, None, model.NO_HEARTBEAT_SECONDS + 1)
+
+  def test_not_downloaded_only_without_tiles_and_nothing_due(self):
+    s = status2(CH=entry2("Switzerland", "ok"), AT=entry2("Austria", "not_downloaded", tiles_present=0),
+                DE=entry2("Germany", "queued", tiles_present=0, tiles_due=30))
+    assert [e["id"] for e in model.needs_download(s)] == ["AT"]
+
+  def test_every_e11_text_is_drawable(self):
+    out = [model.AUTO_TITLE, model.AUTO_DESCRIPTION]
+    for st in ("ok", "queued", "downloading", "staged", "not_downloaded"):
+      for e in (entry2("Germany", st), entry2("Germany", st, tiles_present=0, kept_smaller=[{"tile": "1/2", "pct": 30}] * 2)):
+        for w in list(model.WAIT_TEXTS) + ["server_error", ""]:
+          out.append(model.entry_value(e, {"active": True, "waiting": w, "server_error": 403 if w == "server_error" else None}))
+    s = status2(DE=entry2("Germany", "downloading"), run={"active": True, "current": "48/8", "current_location": "DE", "staged": 2,
+                                                          "apply_failed": True})
+    out += [model.progress_text(s, {"cap": 1e6}), model.progress_text(s, None, True), model.storage_text(s, {"storage": status2()["storage"]})]
+    assert not not_drawable(out), not_drawable(out)
+
+
+class TestE11Rows(TestRows):
+  def test_toggle_is_the_auto_update_setting(self):
+    assert self.panel._auto in self.panel.items and self.panel._auto.kw["param"] == "OsmAutoUpdate"
+    assert self.panel._auto.title == "Update maps automatically" and "next start" in self.panel._auto.kw["description"]
+
+  def test_per_country_update_writes_the_id_and_reads_queued_while_due(self):
+    self.params[model.STATUS_KEY] = status2(CH=entry2("Switzerland", "ok"), AT=entry2("Austria", "ok"))
+    self.panel.update(self.scroller)
+    row = self.scroller.added[1]
+    assert (row.action_item.text, row.action_item.enabled) == ("UPDATE", True)
+    row.action_item.left_callback()
+    assert self.params[model.REQUEST_KEY] == "AT" and not self.pushed  # no dialog: the request is queued at once
+    self.params[model.STATUS_KEY] = status2(CH=entry2("Switzerland", "ok"), AT=entry2("Austria", "queued", tiles_due=10),
+                                            run={"active": True, "waiting": "network", "staged": 0})
+    self.panel.update(self.scroller)
+    assert (row.action_item.text, row.action_item.enabled, row.action_item.right_enabled) == ("QUEUED", False, True)
+    assert row.action_item.value == "update queued | waiting for Wi-Fi or SIM"
+    assert self.panel._progress.visible and self.panel._progress.action_item.value == "waiting for Wi-Fi or SIM"
+    assert not not_drawable(self.texts())
+
+  def test_stopped_downloader_is_shown(self):
+    self.params[model.STATUS_KEY] = status2(CH=entry2("Switzerland", "ok"))
+    self.mem[model.LIVE_KEY] = {"heartbeat": 10.0}
+    self.mono[0] = 200.0
+    self.panel.update(self.scroller)
+    assert self.panel._progress.visible and self.panel._progress.action_item.value == "map downloads stopped - restart the device"
+    self.mem[model.LIVE_KEY] = {"heartbeat": 199.0}
+    self.panel.update(self.scroller)
+    assert not self.panel._progress.visible
 
 
 # ---- the widgets (osm_widgets.py) on stand-ins for raylib and the upstream widgets
@@ -527,6 +673,54 @@ class StubProgress:
     self.width, self.progress, self.text, self.show_progress, self.text_color, self._font = width, 0.0, "", False, "GRAY", None
 
 
+class StubButton:
+  def __init__(self, text, click_callback=None, button_style=None, **kw):
+    self.text, self.click_callback, self.style, self.enabled, self.rects = text, click_callback, button_style, True, []
+
+  def set_text(self, text):
+    self.text = text
+
+  def set_enabled(self, enabled):
+    self.enabled = enabled
+
+  def set_touch_valid_callback(self, cb):
+    pass
+
+  def render(self, rect):
+    self.rects.append((rect.x, rect.width))
+
+  def tap(self):
+    if self.enabled:
+      self.click_callback()
+
+
+class StubButtonActionSP:
+  """sunnypilot's ButtonActionSP as far as ValueTwoButtonsAction relies on it (its button, pressed flag, text, value)."""
+  def __init__(self, text, width=250, enabled=True):
+    self._text, self._enabled, self._value, self._font, self._value_color = text, enabled, "", None, "GRAY"
+    self._pressed = False
+
+    def pressed():
+      self._pressed = True
+    self._button = StubButton(text, click_callback=pressed)
+
+  text = property(lambda self: self._text)
+  value = property(lambda self: self._value)
+  enabled = property(lambda self: self._enabled)
+
+  def set_text(self, text):
+    self._text = text
+
+  def set_value(self, value):
+    self._value = value
+
+  def set_enabled(self, enabled):
+    self._enabled = enabled
+
+  def set_touch_valid_callback(self, cb):
+    pass
+
+
 def load_widgets():
   drawn = []
   rl = types.SimpleNamespace(Rectangle=Rect, Vector2=lambda x, y: (x, y), Color=lambda *c: c, WHITE="WHITE",
@@ -537,7 +731,15 @@ def load_widgets():
     "openpilot.system.ui.lib.text_measure": {"measure_text_cached": lambda font, text, size: types.SimpleNamespace(x=10 * len(text), y=40)},
     "openpilot.system.ui.sunnypilot.widgets.progress_bar": {"ProgressBarAction": StubProgress},
     "openpilot.system.ui.sunnypilot.widgets.tree_dialog": {"TreeItemWidget": StubTreeItem, "TreeOptionDialog": StubTreeDialog},
-    "openpilot.system.ui.widgets.button": {"ButtonStyle": types.SimpleNamespace(PRIMARY="PRIMARY", NORMAL="NORMAL")},
+    "openpilot.system.ui.widgets.button": {"ButtonStyle": types.SimpleNamespace(PRIMARY="PRIMARY", NORMAL="NORMAL", DANGER="DANGER"),
+                                           "Button": StubButton},
+    "openpilot.system.ui.lib.application": {"FontWeight": types.SimpleNamespace(NORMAL=0), "TextAlignment": types.SimpleNamespace(LEFT=0),
+                                            "TextAlignmentVertical": types.SimpleNamespace(MIDDLE=0)},
+    "openpilot.system.ui.sunnypilot.lib.styles": {"style": types.SimpleNamespace(ITEM_TEXT_FONT_SIZE=50)},
+    "openpilot.system.ui.sunnypilot.widgets.list_view": {"ButtonActionSP": StubButtonActionSP},
+    "openpilot.system.ui.widgets.label": {"gui_label": lambda rect, text, **kw: drawn.append(("label", text, rect.x, rect.width))},
+    "openpilot.system.ui.widgets.list_view": {"BUTTON_BORDER_RADIUS": 50, "BUTTON_FONT_SIZE": 35, "BUTTON_FONT_WEIGHT": 1, "BUTTON_HEIGHT": 100,
+                                              "BUTTON_WIDTH": 250, "TEXT_PADDING": 20, "_resolve_value": lambda v, d=None: v() if callable(v) else v},
   }
   modules = {}
   for name, attributes in stand_ins.items():
@@ -579,6 +781,28 @@ class TestWidgets(OpenpilotTestCase):
     bar.show_progress, bar.text = False, "checking the map server (2/9)"
     bar._render(Rect(500, 0, 1000, 100))
     assert [d[0] for d in drawn] == ["text"]  # waiting: text only, right-aligned like a value
+
+
+class TestValueTwoButtons(OpenpilotTestCase):
+  def test_update_and_delete_each_call_their_own_callback(self):
+    widgets, drawn = load_widgets()
+    calls = []
+    a = widgets.ValueTwoButtonsAction("UPDATE", "DELETE", left_callback=lambda: calls.append("update"), right_callback=lambda: calls.append("delete"))
+    a.set_value("512 MB | 6-13 Nov")
+    assert a._right_button.style == "DANGER" and a.get_width_hint() == 10 * len("512 MB | 6-13 Nov") + 2 * 250 + 20 + 20 + 1
+    a._button.tap()
+    assert a._render(Rect(0, 0, 1200, 100)) is False and calls == ["update"]  # the row's own callback is never used
+    a._right_button.tap()
+    a._render(Rect(0, 0, 1200, 100))
+    assert calls == ["update", "delete"]
+    assert a._right_button.rects[-1] == (950, 250) and a._button.rects[-1] == (680, 250)  # DELETE at the right edge, UPDATE left of it
+    assert drawn[-1] == ("label", "512 MB | 6-13 Nov", 0, 660)  # the value left of both
+    a.set_left_enabled(False)
+    a.set_text("QUEUED")
+    a._button.enabled = True
+    a._pressed = True
+    a._render(Rect(0, 0, 1200, 100))
+    assert calls == ["update", "delete"] and a._button.text == "QUEUED" and not a._button.enabled
 
 
 # ---- S4: upstream's osm.py unchanged; the screen is a subclass, imported by settings.py in its place
@@ -654,7 +878,7 @@ class TestUpstreamHook(OpenpilotTestCase):
     assert layout._locations.updates == 1 and layout._delete_maps_btn.action_item.enabled and device.resets == 0
     layout._locations.running = True
     layout._update_labels()
-    assert not layout._delete_maps_btn.action_item.enabled and device.resets == 1
+    assert layout._delete_maps_btn.action_item.enabled and device.resets == 1  # E11: DELETE ALL cancels a running download
     layout._delete_maps()
     assert "the list of countries" in layout.confirms[-1]
 
@@ -770,3 +994,56 @@ class TestUpstreamWidgetPins(OpenpilotTestCase):
                if hashlib.sha256(inspect.getsource(getattr(classes[c], m)).encode()).hexdigest() != digest]
     action = "Upstream Sync & Watch must review CountryPickDialog / QueueProgressAction (osm_widgets.py), then update PINNED_UPSTREAM_WIDGETS"
     assert not changed, f"upstream widgets changed in {', '.join(changed)}: {action}"
+
+
+# ---- E11: upstream widgets ValueTwoButtonsAction and the toggle row rely on (sunnypilot list_view.py, upstream list_view.py as
+# at openpilot inster 5c06f5c). A change: Upstream Sync & Watch must review ValueTwoButtonsAction (osm_widgets.py) and the
+# toggle row (osm_locations.py), then update PINNED_UPSTREAM_ROW_WIDGETS.
+SP_LIST_PY = REPO / "system/ui/sunnypilot/widgets/list_view.py"
+LIST_PY = REPO / "system/ui/widgets/list_view.py"
+PINNED_UPSTREAM_ROW_WIDGETS = {
+  'ButtonActionSP.__init__': 'da10ef2a9c4b4d9bfb573aa177f5c6b445c4c7730c57b99f7206e61f70ea39d2',
+  'ButtonActionSP.set_value': '6a282bd3d318ab81a7f461807bab702b23c4c62edffb64ac44acc36ee6247b95',
+  'ButtonActionSP._render': 'c70f48eb88294d9bc4bc34008ca28995fad921aa96d63a82197f9773441bdc26',
+  'toggle_item_sp': 'be354b03394ce7efa5d13ef04846e9df2041e998cbfc1e019c1bd01296719e90',
+  'ButtonAction.__init__': '8f12f464f976e7c7a5599936dc8d8272f892641b9e26238186f10590c777fff7',
+  'ButtonAction.text': 'db572b77f6c612e14efb7218f723ca4899ae83a2bee045e73f03e4bc7b6fe31f',
+  'ButtonAction.value': '83ebd33e7c830baa63825ccc6f26e8219ba82cf805ce9adb3ba3f3a68282daa6',
+  'ButtonAction.set_text': '8f3f057b2119ead6c77c8e362126f7e949469a67df921cb3913e8563a1e8fc77',
+}
+
+
+def upstream_row_widgets() -> dict:
+  import abc
+
+  class Anything(abc.ABCMeta):  # every imported name: a class whose attributes are itself (bases, styles, constants alike)
+    def __getattr__(cls, name):
+      return cls
+
+    def __call__(cls, *a, **k):
+      return cls
+  base = Anything("Base", (), {})
+  attrs = {"__getattr__": lambda name: base}
+  sp = load_upstream(SP_LIST_PY, ["pyray", "openpilot.common.params", "openpilot.system.ui.lib.application", "openpilot.system.ui.lib.text_measure",
+                                  "openpilot.system.ui.sunnypilot.widgets.toggle", "openpilot.system.ui.widgets", "openpilot.system.ui.widgets.button",
+                                  "openpilot.system.ui.widgets.label", "openpilot.system.ui.widgets.list_view",
+                                  "openpilot.system.ui.widgets.scroller_tici", "openpilot.system.ui.sunnypilot.lib.styles",
+                                  "openpilot.system.ui.sunnypilot.widgets.option_control"], attrs)
+  up = load_upstream(LIST_PY, ["pyray", "openpilot.system.ui.lib.application", "openpilot.system.ui.lib.text_measure",
+                               "openpilot.system.ui.lib.multilang", "openpilot.system.ui.widgets", "openpilot.system.ui.widgets.button",
+                               "openpilot.system.ui.widgets.toggle", "openpilot.system.ui.widgets.label", "openpilot.system.ui.widgets.html_render",
+                               "openpilot.system.ui.lib.wrap_text", "openpilot.system.ui.lib.scroll_panel"], attrs)
+  return {"ButtonActionSP.__init__": sp.ButtonActionSP.__init__, "ButtonActionSP.set_value": sp.ButtonActionSP.set_value,
+          "ButtonActionSP._render": sp.ButtonActionSP._render, "toggle_item_sp": sp.toggle_item_sp,
+          "ButtonAction.__init__": up.ButtonAction.__init__, "ButtonAction.text": up.ButtonAction.text.fget,
+          "ButtonAction.value": up.ButtonAction.value.fget, "ButtonAction.set_text": up.ButtonAction.set_text}
+
+
+class TestUpstreamRowWidgetPins(OpenpilotTestCase):
+  def test_upstream_row_widgets_unchanged(self):
+    import hashlib
+    import inspect
+    got = {k: hashlib.sha256(inspect.getsource(v).encode()).hexdigest() for k, v in upstream_row_widgets().items()}
+    changed = [k for k, d in PINNED_UPSTREAM_ROW_WIDGETS.items() if got.get(k) != d]
+    assert set(got) == set(PINNED_UPSTREAM_ROW_WIDGETS), sorted(set(got) ^ set(PINNED_UPSTREAM_ROW_WIDGETS))
+    assert not changed, f"upstream row widgets changed in {', '.join(changed)}: review ValueTwoButtonsAction / the toggle row, then re-pin"
