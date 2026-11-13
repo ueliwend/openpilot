@@ -570,7 +570,7 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   # hand-over to the model's path (owner 13 Nov 09:27): from the latch of Keep Right's own swerve trigger the whole correction goes to 0
   blendfulHandOver @94 :Bool;  # the hand-over is active this frame
   blendfulHandOverCorrection @95 :Float32;  # delivered correction c at the latch of the last hand-over, 1/m
-  blendfulHandOverTime @96 :Float32;  # s from the latch of the last hand-over until c reached 0 (counting while c != 0, then kept)
+  blendfulHandOverTime @96 :Float32;  # s from the latch of the last hand-over until c reached 0, or until the hand-over ended if earlier (then kept)
 
   enum TurnDirection {
     none @0;

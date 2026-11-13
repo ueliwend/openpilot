@@ -1311,9 +1311,9 @@ class BlendfulCorrection:
     c_new = self._limit(c_target, v_lim, release)
     self.building = (c_target - c_new) > 1e-9  # still building toward the right
     self.c = c_new if np.isfinite(c_new) else 0.0
-    if self.hand_over_counting:  # from the latch until c has reached 0 (kept afterwards: the duration of the last hand-over)
-      self.hand_over_time += p.frame_dt
-      self.hand_over_counting = self.c != 0.0
+    if self.hand_over_counting:  # from the latch until c has reached 0 or the hand-over ended, whichever is first (then kept)
+      self.hand_over_time += float(p.frame_dt) if 0.2 * DT_MDL <= p.frame_dt <= 5.0 * DT_MDL else DT_MDL  # the instance's clamped dt
+      self.hand_over_counting = self.hand_over and self.c != 0.0
     self.k0 = self.c / f
     return self.k0
 
