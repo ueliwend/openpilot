@@ -833,7 +833,7 @@ def pullback_loop(rho, kmh=50, seconds=120.0, lat_fn=None, swerve_at=None, sw_am
     lat = lat_fn(t) if lat_fn else True
     ctl.update(mo, v, True, k_model, LAT_T, mode, inputs(gap_low=0.44, gap_high=0.44, lat_active=lat))
     up = bool(ctl.reference.going_around or ctl.reference.yield_fade < 1.0)
-    rows.append((t, y, float(ctl.cap_active), float(ctl.hand_over), float(ctl.result.yield_active), float(up)))
+    rows.append((t, y, float(ctl.cap_active), float(ctl.hand_over), float(ctl.result.yield_active), float(up), v * psi))
     buf.append((response * ctl.c if lat else 0.0) + k_model)
     cmd = buf.pop(0)
     for _ in range(5):
@@ -865,6 +865,18 @@ class TestOwnMoveEstimate:
     # latActive false for 10 s at the held position (the car ignores the correction): the estimate is frozen, usual reset; no yield after
     r = pullback_loop(rho, kmh, seconds=90.0, lat_fn=lambda t: not (40.0 <= t < 50.0))
     assert r[r[:, 0] >= 40, 4].sum() == 0 and r[r[:, 0] >= 40, 2].sum() == 0
+
+  @pytest.mark.parametrize("kmh", SPEEDS)
+  @pytest.mark.parametrize("rho", [0.0, 0.3, 0.6, 0.9])
+  def test_re_engagement_after_a_long_gap_restarts_the_move(self, kmh, rho):
+    # review S1: latActive false for 60 s (the car ignores the correction, the model holds it near the centre), then true: the move limiter
+    # restarts at the car (U = 0), so no hand-over, no cap, and the car moves right no faster than in a first engagement
+    r = pullback_loop(rho, kmh, seconds=150.0, lat_fn=lambda t: not (40.0 <= t < 100.0))
+    first = pullback_loop(rho, kmh, seconds=40.0)
+    after = r[:, 0] >= 100.0
+    print(f're-engagement {kmh} km/h rho {rho}: peak sideways {r[after, 6].max():.4f} m/s (first engagement {first[:, 6].max():.4f})')
+    assert r[after, 3].sum() == 0 and r[after, 2].sum() == 0
+    assert r[after, 6].max() <= first[:, 6].max() + 0.005
 
   @pytest.mark.parametrize("kmh", SPEEDS)
   @pytest.mark.parametrize("rho", [0.0, 0.3, 0.6, 0.9])

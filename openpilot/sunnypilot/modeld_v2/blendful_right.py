@@ -529,6 +529,7 @@ DETECT_WINDOW = (1.4, 1.6)  # s of travel: the detector's path offset is the mea
 OWN_MODEL_TAU = 1.0  # s: the model's heading return in the own-move estimate (EST; the A8 test loop's model)
 OWN_DRIFT_TAU = 30.0  # s: high-pass of the own-move estimate (bounds a drift of the integrated estimate; slower than usual's 10 s)
 OWN_PULLBACK = 0.7  # rho_hat: the model pull-back assumed in the estimate and (1 - rho_hat) the subtracted share (fix 1: re-tuned, was 0.35)
+LAT_OFF_RESTART = 1.0  # s: latActive false longer than this, then true again, restarts the move limiter (fix 1 review S1)
 OWN_MEASURED_MARGIN = 0.05  # m: the subtracted own move never exceeds the car's measured move relative to the right reference + this (fix 1)
 
 
@@ -817,6 +818,7 @@ class RightLineBlendful:
     self.edge_q = FirstOrderFilter(np.zeros(2), 0.5, DT_MDL)
     self.ground = GroundTarget()
     self.move = MoveSpeedLimit()
+    self.lat_off_t = 0.0  # how long lateral control has been off (latActive false), s
     self.ref_present_prev = False
     self.car_left = False  # 'car left of the centre' with hysteresis (R4-S2)
     self.regular_right_t = 0.0  # how long Regular has been delivered while T_RL is right of the centre (C611-2)
@@ -1061,6 +1063,14 @@ class RightLineBlendful:
     s_r = 1.0 - (1.0 - l_q) * (1.0 - w_c * q_R)
     present = qa > 0.0
     w_rl = a * s_r * f_yr
+    # fix 1 review S1: lateral control back on after more than 1 s off is a creation of the move limiter (start at the car, U = 0, as at
+    # start-up), so the kept approach is not applied at once at re-engagement
+    if p.lat_active:
+      if self.lat_off_t > LAT_OFF_RESTART:
+        self.move = MoveSpeedLimit()
+      self.lat_off_t = 0.0
+    else:
+      self.lat_off_t += dt
     # rev 6.15: the limiter's creation (start, lane-tracking restart) and w = 0 are reset frames, each with its own log bit
     # rev 7 (one continuous controller): the only reset left is the limiter's creation (start, lane-tracking restart incl. a lane change);
     # the other bits (a = 0, junction end, yield end, reference regained, mode on, w = 0) are logged only and reset nothing
@@ -1365,6 +1375,7 @@ def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
   builder.blendfulRightOnly = bool(lg['right_only'])
   builder.blendfulYieldActive = bool(lg['yield_active'])
   builder.blendfulBoundActive = bool(lg['bound_active'])
+  builder.blendfulYieldMoving = False  # unused since fix 1 (the endpoint gap's move flag is gone); kept for logs of 1783b86c7 / 5c06f5c6d
   builder.blendfulJunctionEpisode = bool(lg['episode'])
   builder.blendfulDClipped = bool(lg['d_clipped'])
   builder.blendfulJunctionCues = int(lg['cues'])

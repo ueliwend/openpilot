@@ -570,7 +570,7 @@ struct BlendfulInster @0xa4f1eb3323f5f582 {
   blendfulDClipped @52 :Bool;  # the fitted amplitude was clipped at 1.0 m
   blendfulYieldSide @53 :Int8;  # capped obstacle side(s) while a no-growth phase runs: +1 right, -1 left, 2 both (side not yet known, or triggers disagree), 0 none
   blendfulYieldSource @54 :UInt8;  # reference of the endpoint-gap trigger: 0 plan alone, 1 right, 2 left
-  blendfulYieldMoving @55 :Bool;  # a move to the right is on (running minimum)
+  blendfulYieldMoving @55 :Bool;  # unused since fix 1 (always false); was: a move to the right is on (running minimum of the endpoint gap)
   blendfulCapMemory @56 :Float32;  # toward-obstacle correction held at the no-growth point (1/m)
   blendfulUpdateTime @57 :Float32;  # ms, the whole Blendful update of this frame (reference, right-line instance, cap, limiter); 0 when it did not run
   blendfulNonFinite @58 :Bool;  # a non-finite input or result this frame: released toward 0, instances reset
