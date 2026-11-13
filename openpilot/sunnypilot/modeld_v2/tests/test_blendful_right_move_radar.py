@@ -64,20 +64,31 @@ class TestMoveSpeedLimitUnit:
     assert np.allclose(ts[0], RATE) and np.allclose(ts[2], 3 * RATE)
     assert not hasattr(ml, 'released')
 
-  def test_the_start_follows_a_car_still_moving_left(self):
+  def test_the_start_does_not_follow_a_car_moving_left(self):
+    # review of rev 6.15 item 2: the follow rule is removed; a car moving left never moves the start
     ml = MoveSpeedLimit()
     t4 = np.full(br.NX, 0.44)
     self.run(ml, t4, 40)
     gap, followed = 1.75, []
     for _ in range(40):  # the car moves left at 0.1 m/s for 2 s: its gap grows 5 mm per frame
       gap += 0.1 * DT_MDL
-      t = ml.update(np.full(br.NX, gap), t4 + (gap - 1.75), 1.0, np.zeros(br.NX), 0.0, DT_MDL, False)
+      ml.update(np.full(br.NX, gap), t4 + (gap - 1.75), 1.0, np.zeros(br.NX), 0.0, DT_MDL, False)
       followed.append(ml.followed)
-    assert followed[-1] and np.allclose(t, 0.0)  # the start is at the car (after the 1 s speed filter has seen it)
-    assert not followed[0] and ml.sideways_speed < br.FOLLOW_SPEED
-    for _ in range(80):  # the car stopped: the filtered speed decays, the follow ends and the approach grows again
-      t = ml.update(np.full(br.NX, gap), t4 + (gap - 1.75), 1.0, np.zeros(br.NX), 0.0, DT_MDL, False)
-    assert not ml.followed and t[5] > 0.0
+    assert not any(followed)
+
+  def test_the_target_stays_bounded_when_the_weight_falls(self):
+    # E1 on round 5 / rev 6.15: with the old weighted state the target diverged as w fell (5.8e4 m at w = 1e-6); now G stays in [G4, G0]
+    ml = MoveSpeedLimit()
+    y_r = np.full(br.NX, 1.75)
+    ml.update(y_r, np.full(br.NX, 0.44), 1.0, np.zeros(br.NX), 0.0, DT_MDL, True)
+    for _ in range(20):
+      ml.update(y_r, np.full(br.NX, 0.44), 1.0, np.zeros(br.NX), 0.0, DT_MDL, False)
+    t4_left = np.full(br.NX, 0.30)  # a step-4 target left of the start
+    for w in (0.5, 0.1, 1e-3, 1e-6, 1e-6, 0.3, 1.0):
+      t = ml.update(y_r, t4_left, w, np.zeros(br.NX), 0.0, DT_MDL, False)
+      g = y_r - t
+      assert np.all(np.isfinite(t))
+      assert np.all(g >= (y_r - t4_left) - 1e-9) and np.all(g <= ml.g0 + 1e-9)
 
   def test_a_slow_leftward_drift_below_the_threshold_does_not_follow(self):
     ml = MoveSpeedLimit()
@@ -131,7 +142,8 @@ class TestMoveSpeedLimitUnit:
     ml.g0 = 1.75 - 0.01 * X
     ml.update(self.y_r, np.full(br.NX, 0.44), 1.0, np.zeros(br.NX), 20.0, DT_MDL, False)
     inside = X + 20.0 * DT_MDL <= X[-1]
-    np.testing.assert_allclose(ml.g0[inside], (1.75 - 0.01 * (X + 1.0))[inside], atol=1e-9)
+    # rev 6.15: a step-4 target left of the start moves the start with it (G0 >= G4 = 1.75 - 0.44)
+    np.testing.assert_allclose(ml.g0[inside], np.maximum(1.75 - 0.01 * (X + 1.0), 1.75 - 0.44)[inside], atol=1e-9)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -964,7 +976,9 @@ class TestReseedAndSwerveTrigger:
     assert min(before) > 0.47 and before[-1] - before[0] > -0.02
     assert max(lows) - min(lows) < 0.03
     assert abs(y - 0.5) < 0.03
-    assert reseeds <= n + 1  # at most one per reset (n dips + the start)
+    # at most one per reset; since rev 6.15 a frame with w = 0 is a reset too (a dip gives two reset episodes: the dip and the w = 0 frames
+    # of the re-entry), so the bound is 2 per dip plus the start
+    assert reseeds <= 2 * n + 2
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -1071,3 +1085,31 @@ class TestClearanceYieldHold:
     for _ in range(30):  # leaves the field of view, remembered, passes x < -3.3 m within about 0.4 s
       res = rcl.update(frame([]), v, v, 0.0, 0.5, 0.0, br.W_R, X, C, E, W0)
     assert not res.yield_active and not rcl.tracks
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# owner 13 Nov 09:27: once Keep Right's own swerve trigger has latched, hand the whole correction to the model's path
+class TestHandOverToTheModelPath:
+  def test_own_yield_releases_the_whole_correction_through_the_limiter(self):
+    v = 50 / 3.6
+    ctl = BlendfulCorrection()
+    for _ in range(int(30 / DT_MDL)):  # build a right-line correction on a straight road, car at the lane centre (open loop)
+      ctl.update(model_output(v, 0.0, 0.0, 0.0), v, True, 0.0, LAT_T, MODE_RIGHT, inputs(gap_low=0.44, gap_high=0.44))
+    c_built = ctl.c
+    assert c_built > 1e-5  # a rightward correction exists
+    orig = ctl.right.update
+
+    def latched(*a, **kw):
+      res = orig(*a, **kw)
+      res.own_yield, res.yield_active, res.no_growth = True, True, True
+      res.caps = {br.SIDE_RIGHT: 0.3}
+      return res
+    ctl.right.update = latched
+    cs = []
+    for _ in range(int(5 / DT_MDL)):
+      ctl.update(model_output(v, 0.0, 0.0, 0.0), v, True, 0.0, LAT_T, MODE_RIGHT, inputs(gap_low=0.44, gap_high=0.44))
+      cs.append(ctl.c)
+      assert ctl.hand_over
+    cs = np.array(cs)
+    assert np.all(np.diff(cs) <= 1e-15)  # only falls, through the limiter (no step beyond its rates)
+    assert abs(cs[-1]) < 1e-12  # the whole correction (Keep Right's extra and Regular's part) reaches 0: the model's own path

@@ -64,7 +64,7 @@ RESEED_LOOKAHEADS = 2.0  # points beyond 2 L take T_raw every frame (rev 6.4)
 # rate r_ref, the rate at which the approach to the right reference may grow (start value 0.042 m/s, rev 6.7; final value from the kit)
 REFERENCE_RATE = 0.042  # m/s, r_ref
 CAR_MOVE_SPEED = 0.05  # m/s, the decided move speed of the car (r_ref is set so that the car stays below it)
-FOLLOW_SPEED = -0.02  # m/s: while the car moves left faster than this (and is left of T_RL) the start follows it (rev 6.10, EST)
+FOLLOW_SPEED = -0.02  # m/s: no longer used (follow rule removed, review of rev 6.15 item 2); kept for the harness
 FOLLOW_SPEED_TAU = 1.0  # s, low-pass of the car's sideways speed for the follow rule (rev 6.11 item 4, EST)
 RESEED_STABLE = 1.0  # s: the re-seed fires once a has reached a_cmd and a_cmd has been unchanged this long (rev 6.12 B5 item 2, C612-1)
 CAR_LEFT_HYST = 0.02  # m, hysteresis of 'car left of the centre' for the larger-of rule (rev 6.12, R4-S2)
@@ -235,20 +235,23 @@ class MoveSpeedLimit:
   change of Y_R (amendment 1).  The weighted approach A = w (G0 - G), w = a s_R f_yieldR, grows by at most r_ref dt per frame, any
   decrease passes at once: A_lim = min(w (G0 - G4), A_prev + r_ref dt), G = max(G4, G0 - A_lim / w) (G = max(G4, G0) at w = 0).  The
   right-line target is T_RL = Y_R - G, **not floored at the centre limit** (rev 6.10; the left limit acts through the delivered correction,
-  RightLineBlendful).  Reset (A = 0): G0 := the car's own gap Y_R(0), wherever the car is; no hold.  While the car's sideways speed (from its
-  gap to the filtered right reference, switch part removed) is below FOLLOW_SPEED and the car is left of T_RL, the start follows the car
-  leftward (G0 := the car's gap, A := 0)."""
+  RightLineBlendful).  Reset (A = 0): G0 := the car's own gap Y_R(0), wherever the car is; no hold.  The rev 6.10 follow rule is removed (review
+  of rev 6.15 item 2: it fired ~970 times per hour on logged drives and its purpose only existed in the crude loop)."""
   def __init__(self):
     self.g0: np.ndarray | None = None
     self.a_lim = np.zeros(NX)
     self.limiting = False
-    self.followed = False  # the start followed the car this frame
+    self.followed = False  # always False: the follow rule is removed (review of rev 6.15 item 2); kept for the log field
     self.yr0_prev: float | None = None
-    self.sideways_speed = 0.0  # the car's sideways speed toward the right reference (> 0: moving right), m/s
+    self.sideways_speed = 0.0  # the car's sideways speed toward the right reference (> 0: moving right), m/s (log only)
+    self.u = np.zeros(NX)  # rev 6.15: unweighted approach U = G0 - G >= 0
+    self.w_prev = 0.0
+    self.created = True  # rev 6.15: the first update after creation (start, lane-tracking restart) is a logged reset
 
   def _start_at_the_car(self, yr0: float):
     self.g0 = np.full(NX, yr0)
     self.a_lim = np.zeros(NX)
+    self.u = np.zeros(NX)
 
   def update(self, y_r: np.ndarray, t4: np.ndarray, w: float, switch_part: np.ndarray, vx0: float, dt: float, reset: bool) -> np.ndarray:
     yr0 = float(y_r[0])
@@ -260,16 +263,13 @@ class MoveSpeedLimit:
       xs = X_IDXS + vx0 * dt
       self.g0 = np.interp(xs, X_IDXS, self.g0) + switch_part
       self.a_lim = np.interp(xs, X_IDXS, self.a_lim)
+      self.u = np.interp(xs, X_IDXS, self.u)
+    self.created = False
     if reset or self.g0 is None:
       self._start_at_the_car(yr0)
     g4 = y_r - t4
-    t_rl = self._target(y_r, g4, w, dt)
     self.followed = False
-    if self.sideways_speed < FOLLOW_SPEED and float(t_rl[0]) > 0.0:  # the car still moves left and is left of T_RL: follow it
-      self._start_at_the_car(yr0)
-      t_rl = self._target(y_r, g4, w, 0.0)
-      self.followed = True
-    return t_rl
+    return self._target(y_r, g4, w, dt)
 
   def reseed(self, y_r: np.ndarray, t4: np.ndarray, w: float) -> np.ndarray:
     """Re-seed the start at the car (rev 6.12 B5 item 2): G0 := the car's gap, A := 0; returns the new T_RL."""
@@ -277,15 +277,21 @@ class MoveSpeedLimit:
     return self._target(y_r, y_r - t4, w, 0.0)
 
   def _target(self, y_r: np.ndarray, g4: np.ndarray, w: float, dt: float) -> np.ndarray:
+    """rev 6.15 (E1 on round 5: the weighted state A could go negative and G = G0 - A / w diverged as w fell): state G0 (start) and the
+    unweighted approach U = G0 - G >= 0.  A step-4 target left of the start moves the start with it (G stays within [G4, G0]); a falling w
+    keeps U (G continuous); the weighted approach w U grows by <= r_ref dt, also when w rises; w = 0 is a reset frame."""
+    self.g0 = np.maximum(self.g0, g4)
+    u_want = self.g0 - g4
     if w > 1e-9:
-      want = w * (self.g0 - g4)
-      self.a_lim = np.minimum(want, self.a_lim + REFERENCE_RATE * dt)
-      self.limiting = bool(np.any(self.a_lim < want - 1e-9))
-      g = np.maximum(g4, self.g0 - self.a_lim / w)
+      u_cap = (min(w, self.w_prev) * self.u + REFERENCE_RATE * dt) / w
+      self.u = np.minimum(u_want, u_cap)
+      self.limiting = bool(np.any(self.u < u_want - 1e-9))
     else:
+      self.u = np.minimum(u_want, self.u)
       self.limiting = False
-      g = np.maximum(g4, self.g0)
-    return y_r - g
+    self.w_prev = w
+    self.a_lim = w * self.u
+    return y_r - (self.g0 - self.u)
 
 
 class Authority:
@@ -750,6 +756,7 @@ class RightResult:
   yield_q: float = 0.0  # largest q of the capped sides (log)
   yield_side: int = 0  # log_side(caps): 0 none, +1 right, -1 left, 2 both
   episode: bool = False
+  own_yield: bool = False  # Keep Right's own swerve trigger (endpoint gap) has latched its yield this frame (owner 13 Nov 09:27)
   log: dict = field(default_factory=dict)
 
 
@@ -993,6 +1000,7 @@ class RightLineBlendful:
     if fading:  # lane change or v < 5 m/s: the gap state and the latches would compare the old lane with the new one (S2)
       self.reset_yields()
       q_y, no_growth, yield_active, caps = 0.0, False, False, {}
+      car_trig = False
     else:
       move_now = (not self.no_growth_prev) and (lag_L > MOVE_LAG_EPS or self.authority.a < self.authority.a_cmd - 1e-6 or p.building
                                                 or self.move.limiting)
@@ -1041,9 +1049,11 @@ class RightLineBlendful:
     w_c = float(np.interp(abs(model_curvature) * v ** 2, [0.18, 0.53], [STRENGTH_RIGHT_ONLY, 1.0])) if self.strength_rising else STRENGTH_RIGHT_ONLY
     s_r = 1.0 - (1.0 - l_q) * (1.0 - w_c * q_R)
     present = qa > 0.0
-    reasons = (a <= 0.0, was_episode and not in_episode, yield_ended, present and not self.ref_present_prev, self.mode_on)
-    self.ref_present_prev, self.mode_on = present, False
     w_rl = a * s_r * f_yr
+    # rev 6.15: the limiter's creation (start, lane-tracking restart) and w = 0 are reset frames, each with its own log bit
+    reasons = (a <= 0.0, was_episode and not in_episode, yield_ended, present and not self.ref_present_prev, self.mode_on,
+               self.move.created, w_rl <= 0.0)
+    self.ref_present_prev, self.mode_on = present, False
     t_rl = self.move.update(y_r, t4, w_rl, switch_part, vx0, dt, any(reasons))
     # re-seed once per reset (rev 6.12 B5 item 2 with C612-1): armed at the reset; fires in the first frame in which a has reached a_cmd
     # and a_cmd has been unchanged for >= 1.0 s; if the car is left of T_RL the start is re-seeded at the car; after the switch rebase
@@ -1119,6 +1129,7 @@ class RightLineBlendful:
       'move_limiting': mv.limiting, 'rotation_scale': ROTATION_SCALES.index(self.rotation_scale), 'radar': rc,
     }
     return RightResult(k0=float(k0), fading=fading, yield_active=yield_active, no_growth=no_growth, caps=caps, yield_q=float(q_eff),
+                       own_yield=bool(car_trig and yield_active),
                        yield_side=log_side(caps), episode=in_episode, log=log)
 
   @staticmethod
@@ -1151,6 +1162,7 @@ class BlendfulCorrection:
     self.cap_active = False
     self.release_window = False
     self.building = False
+    self.hand_over = False  # owner 13 Nov 09:27: the whole correction is handed to the model's path (log)
     self.right_idle = True
     self.invalid = False  # this frame's inputs or computed correction were non-finite: released toward 0, instances reset (S3)
     self.update_ms = 0.0  # time of the whole last update (S5); fill_log consumes it
@@ -1282,6 +1294,14 @@ class BlendfulCorrection:
           self.cap_active = True
     else:
       self.cap_mem = {}
+    self.hand_over = bool(right_runs and res.own_yield)
+    if self.hand_over:
+      # owner 13 Nov 09:27 ("I thought hand directly to the normal path, not to blendful... otherwise it needs yo get detected twice..."):
+      # from the latch of Keep Right's own swerve trigger until that yield ends, the target of the WHOLE correction (Keep Right's extra and
+      # Regular's part, both directions) is 0 through the one final limiter: the car follows the model's own path, as upstream Blendful does
+      # in its own yield, without waiting for upstream's detector or the radar (review of rev 6.15, B6 text)
+      c_target = 0.0
+      self.cap_active = True
     c_new = self._limit(c_target, v_lim, release)
     self.building = (c_target - c_new) > 1e-9  # still building toward the right
     self.c = c_new if np.isfinite(c_new) else 0.0
