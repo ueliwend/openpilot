@@ -282,46 +282,37 @@ class MoveSpeedLimit:
     keeps U (G continuous); the weighted approach w U grows by <= r_ref dt, also when w rises; w = 0 is a reset frame."""
     self.g0 = np.maximum(self.g0, g4)
     u_want = self.g0 - g4
-    if w > 1e-9:
-      u_cap = (min(w, self.w_prev) * self.u + REFERENCE_RATE * dt) / w
-      self.u = np.minimum(u_want, u_cap)
-      self.limiting = bool(np.any(self.u < u_want - 1e-9))
-    else:
-      self.u = np.minimum(u_want, self.u)
-      self.limiting = False
+    # rev 7 (owner 13 Nov 11:15-12:19, one continuous controller): only the growth of the UNWEIGHTED approach U is limited (<= r_ref dt per
+    # frame, r_ref a placeholder until measured); U is kept while the weight w falls and when it rises again, so after a drop-out the
+    # correction returns at the strength filter's pace, not with a restarted slow move.  A decrease passes at once.
+    self.u = np.minimum(u_want, self.u + REFERENCE_RATE * dt)
+    self.limiting = bool(np.any(self.u < u_want - 1e-9))
     self.w_prev = w
     self.a_lim = w * self.u
     return y_r - (self.g0 - self.u)
 
 
+STRENGTH_TAU = 1.0  # s, rev 7 (owner 13 Nov 11:55): the strength a is a first-order low-pass of a* with this time constant
+STRENGTH_Q = (0.2, 0.7)  # rev 7 (owner 13 Nov 11:59): strength 0 at a right-line confidence <= 0.2, 1 at >= 0.7, linear in between
+
+
+def strength_from_confidence(q: float) -> float:
+  return float(np.clip((q - STRENGTH_Q[0]) / (STRENGTH_Q[1] - STRENGTH_Q[0]), 0.0, 1.0))
+
+
 class Authority:
-  """a follows a* with a dead band, a dwell, rate limits and a re-entry hold (B5, check 12)."""
+  """rev 7 (owner 13 Nov 11:48 / 11:55): a = first-order low-pass of a* (tau 1 s), updated every frame; no dead band, dwell, hold or
+  rate limits.  Ends below 1e-6 of 0 or 1 snap there (a = 0 is regular upstream exactly; the filter alone would never reach it)."""
   def __init__(self):
     self.a = 0.0
-    self.a_cmd = 0.0
-    self.hold = 0.0
-    self.dwell = A_DWELL
+    self.a_cmd = 0.0  # = a* of the last frame (log / no-growth cap)
 
-  def update(self, a_star: float) -> float:
-    dt = DT_MDL
-    self.dwell += dt
-    snap = a_star <= 1e-9 or a_star >= 1.0 - 1e-9  # the ends are reached exactly (a = 0 is regular upstream, a = 1 is full)
-    if (abs(a_star - self.a_cmd) > (1e-9 if snap else A_DEAD)) and self.dwell >= A_DWELL:
-      self.a_cmd, self.dwell = a_star, 0.0
-    if self.a_cmd < self.a - 1e-9:
-      self.hold = A_HOLD
-      self.a = max(self.a_cmd, self.a - A_OUT * dt)
-    else:
-      self.hold = max(0.0, self.hold - dt)
-      if self.hold <= 0.0:
-        self.a = min(self.a_cmd, self.a + A_IN * dt)
+  def update(self, a_star: float, dt: float = DT_MDL) -> float:
+    self.a_cmd = a_star
+    self.a += (a_star - self.a) * dt / (dt + STRENGTH_TAU)
+    if abs(self.a - a_star) < 1e-6 and a_star in (0.0, 1.0):
+      self.a = a_star
     return self.a
-
-
-def reseed_due(a: float, a_cmd: float, a_cmd_age: float) -> bool:
-  """Rev 6.13 B5 item 2: a has reached the commanded a_cmd (after the dead band and dwell) and a_cmd has been unchanged for >= 1.0 s,
-  evaluated only while a > 0 (taken literally the condition also holds in the reset frame, a = a_cmd = 0, and would disarm the re-seed)."""
-  return a > 0.0 and abs(a - a_cmd) < 1e-9 and a_cmd_age >= RESEED_STABLE - 1e-9
 
 
 class Timed:
@@ -1026,15 +1017,15 @@ class RightLineBlendful:
     f_yl = 0.0 if (yield_active and SIDE_RIGHT in caps) else 1.0
     f_yr = float(np.interp(caps[SIDE_LEFT], (0.2, 0.45), (1.0, 0.0))) if (yield_active and SIDE_LEFT in caps) else 1.0
     # --- authority (B5)
-    qa = self.quality_gate.update(q_R)
+    qa = strength_from_confidence(q_R)  # rev 7: replaces the confidence gate's on / off curve (ConfGate kept for the reference selection)
     a_star = float(qa)
     f_ep = 0.0 if jn_active else 1.0
     a_star *= f_bend_t * f_jump_t * f_plaus_t * self.f_blink * f_yl * f_ep * f_radar
     if force_regular or fading:
       a_star = 0.0
     if q_y >= Q_NO_GROWTH:
-      a_star = min(a_star, self.authority.a_cmd)
-    a = self.authority.update(a_star)
+      a_star = min(a_star, self.authority.a)  # no growth of the strength while a trigger asks for no growth
+    a = self.authority.update(a_star, dt)
     # --- step 4: limits from the current references, not rate-limited: the left limit, the object bound (B6a), the right safety bounds
     t_left = np.maximum(t_lim, c_ctr)
     t_obj = c_ctr if rc.right_blindspot else np.full(NX, rc.t_obj)  # rightBlindspot: no right-line shift
@@ -1051,22 +1042,13 @@ class RightLineBlendful:
     present = qa > 0.0
     w_rl = a * s_r * f_yr
     # rev 6.15: the limiter's creation (start, lane-tracking restart) and w = 0 are reset frames, each with its own log bit
+    # rev 7 (one continuous controller): the only reset left is the limiter's creation (start, lane-tracking restart incl. a lane change);
+    # the other bits (a = 0, junction end, yield end, reference regained, mode on, w = 0) are logged only and reset nothing
     reasons = (a <= 0.0, was_episode and not in_episode, yield_ended, present and not self.ref_present_prev, self.mode_on,
                self.move.created, w_rl <= 1e-9)
     self.ref_present_prev, self.mode_on = present, False
-    t_rl = self.move.update(y_r, t4, w_rl, switch_part, vx0, dt, any(reasons))
-    # re-seed once per reset (rev 6.12 B5 item 2 with C612-1): armed at the reset; fires in the first frame in which a has reached a_cmd
-    # and a_cmd has been unchanged for >= 1.0 s; if the car is left of T_RL the start is re-seeded at the car; after the switch rebase
-    # (inside move.update above); the swerve trigger (self.gap: running minimum, usual) is not touched
-    if any(reasons):
-      self.reseed_armed = True
-    reseeded = False
-    au = self.authority
-    if self.reseed_armed and reseed_due(a, au.a_cmd, au.dwell):
-      if float(t_rl[0]) > 0.0:
-        t_rl = self.move.reseed(y_r, t4, w_rl)
-        reseeded = True
-      self.reseed_armed = False
+    t_rl = self.move.update(y_r, t4, w_rl, switch_part, vx0, dt, self.move.created)
+    reseeded = False  # rev 7: the re-seed is removed (it depended on a_cmd); field kept for the log until the log move
     target = self.safety_bounds(t_rl, t_bound_line, t_bound_edge, w_e)  # T_RL <= T4 already holds the object bound and the bounds
     # --- correction (B4)
     d_rl, k0_rl, k_fit, d_clipped = self._correction(target, plan_x, plan_y, v, s_r)
