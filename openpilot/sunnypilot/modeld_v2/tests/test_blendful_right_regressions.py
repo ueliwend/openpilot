@@ -256,9 +256,9 @@ class TestUpdateTime:
       ctl.update(Scene(v=13.0, edges=True).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
     ms = ctl.update_ms
     assert ms > 0.0 and ms >= ctl.result.log['filter_ms']  # the whole update, not only the four filters
-    msg = custom.ModelDataV2SP.new_message()
+    msg = custom.BlendfulInster.new_message()
     fill_log(msg, ctl, MODE_RIGHT, 13.0)
     assert abs(msg.blendfulUpdateTime - ms) < 1e-4
-    msg = custom.ModelDataV2SP.new_message()
+    msg = custom.BlendfulInster.new_message()
     fill_log(msg, ctl, MODE_OFF, 13.0)  # a frame on which the class did not run: no stale value
     assert msg.blendfulUpdateTime == 0.0

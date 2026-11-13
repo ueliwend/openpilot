@@ -1365,7 +1365,7 @@ class TestLogging:
     from openpilot.cereal import custom
     ctl = BlendfulCorrection()
     drive(ctl, [Scene(v=13.0, widen=0.5, pl=1.0, pr=1.0)] * 60)
-    msg = custom.ModelDataV2SP.new_message()
+    msg = custom.BlendfulInster.new_message()
     br.fill_log(msg, ctl, MODE_RIGHT, 13.0)
     assert msg.blendfulMode == MODE_RIGHT
     assert abs(msg.blendfulKappa0 - ctl.k0) < 1e-6
@@ -1379,7 +1379,7 @@ class TestLogging:
     drive(ctl, [Scene(v=20.0, width=3.5)] * 150)
     rows = drive(ctl, [Scene(v=20.0, width=3.5, bend_x0=15.0, bend_R=30.0)] * 30)
     assert rows[-1][2]['episode']
-    msg = custom.ModelDataV2SP.new_message()
+    msg = custom.BlendfulInster.new_message()
     br.fill_log(msg, ctl, MODE_RIGHT, 20.0)
     lg = ctl.result.log
     assert msg.blendfulJunctionEpisode and msg.blendfulJunctionCues == lg['cues'] and msg.blendfulJunctionCues & 16
@@ -1398,7 +1398,7 @@ class TestLogging:
     from openpilot.cereal import custom
     ctl = BlendfulCorrection()
     drive(ctl, [Scene(v=13.0, pl=1.0, pr=1.0)] * 5, mode=MODE_OFF)
-    msg = custom.ModelDataV2SP.new_message()
+    msg = custom.BlendfulInster.new_message()
     br.fill_log(msg, ctl, MODE_OFF, 13.0)
     assert msg.blendfulMode == MODE_OFF and msg.blendfulAuthority == 0.0
 
@@ -1561,7 +1561,7 @@ class TestNonFiniteGuard:
     mo['lane_lines'][0, 1, 3, 0] = np.inf
     ctl.update(mo, 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
     assert ctl.invalid and not ctl.right.filters[2].initialized and ctl.reference.trust == 0.0 and ctl.right_idle
-    msg = custom.ModelDataV2SP.new_message()
+    msg = custom.BlendfulInster.new_message()
     br.fill_log(msg, ctl, MODE_RIGHT, 13.0)
     assert msg.blendfulNonFinite
     drive(ctl, [Scene(v=13.0, center=0.4)] * 5)

@@ -1349,8 +1349,7 @@ def apply_correction(mo: dict, k0: float, v_ego: float) -> dict:
 
 
 def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
-  """Additive modelDataV2SP fields (DESIGN D logging).  The first implementation's fields without a meaning since rev 5 are gone from the
-  schema (round 3; that implementation was never pushed or driven, so no log or reader depends on them)."""
+  """The A8 fields of the blendfulInster message (rev 7.1: their own message, published next to modelDataV2SP; DESIGN D logging)."""
   builder.blendfulMode = int(mode)
   builder.blendfulGainF = float(ctl.gain)
   builder.blendfulKappaUp = float(ctl.k_up)
@@ -1391,8 +1390,11 @@ def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
   # rev 6.5 final move-speed limit (B5 step 4b)
   builder.blendfulApproach = float(lg['approach'])
   builder.blendfulGapReset = float(lg['gap_reset'])
-  builder.blendfulStartFollowsCar = bool(lg['start_follows_car'])
-  builder.blendfulReseeded = bool(lg['reseeded'])
+  builder.blendfulStrengthFromConfidence = float(lg['a_star_q'])
+  builder.blendfulDetectorOffset = float(lg['det_offset'])
+  builder.blendfulDetectorUsual = float(lg['det_usual'])
+  builder.blendfulDetectorOwnMove = float(lg['det_own'])
+  builder.blendfulDetectorAway = float(lg['det_away'])
   builder.blendfulAuthorityLimited = bool(lg['authority_limited'])
   builder.blendfulDeliveredSource = int(lg['delivered'])
   builder.blendfulTargetMinusCentre = float(lg['trl_minus_centre'])

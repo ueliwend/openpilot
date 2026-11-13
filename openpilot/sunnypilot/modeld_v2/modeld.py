@@ -358,7 +358,7 @@ def main(demo=False):
   config_realtime_process(7, 54)
 
   # messaging
-  pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"] + (["chestnutGpuState"] if CHESTNUT else [])
+  pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP", "blendfulInster"] + (["chestnutGpuState"] if CHESTNUT else [])
   pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState",
                   "carControl", "controlsState", "lateralDelay", "radarTracks"])  # radarTracks: A8 right-side clearance check (B6a)
@@ -521,6 +521,7 @@ def main(demo=False):
       drivingdata_send = messaging.new_message('drivingModelData')
       posenet_send = messaging.new_message('cameraOdometry')
       mdv2sp_send = messaging.new_message('modelDataV2SP')
+      bi_send = messaging.new_message('blendfulInster')  # A8 log fields, their own message (rev 7.1)
 
       if not sm['carControl'].latActive:
         prev_action.desiredCurvature = sm['controlsState'].curvature
@@ -574,7 +575,7 @@ def main(demo=False):
       mdv2sp_send.modelDataV2SP.blendfulLeftProb = blendful.l_prob
       mdv2sp_send.modelDataV2SP.blendfulRightProb = blendful.r_prob
       mdv2sp_send.modelDataV2SP.blendfulLaneWidth = float(blendful.lane_width.x)
-      fill_log(mdv2sp_send.modelDataV2SP, blendful_ctl, blendful_mode, v_ego)
+      fill_log(bi_send.blendfulInster, blendful_ctl, blendful_mode, v_ego)
       drivingdata_send.drivingModelData.meta.laneChangeState = DH.lane_change_state
       drivingdata_send.drivingModelData.meta.laneChangeDirection = DH.lane_change_direction
 
@@ -583,6 +584,7 @@ def main(demo=False):
       pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)
       pm.send('modelDataV2SP', mdv2sp_send)
+      pm.send('blendfulInster', bi_send)
     last_vipc_frame_id = meta_main.frame_id
 
 if __name__ == "__main__":
