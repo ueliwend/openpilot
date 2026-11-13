@@ -528,17 +528,20 @@ class JunctionEpisodes:
 DETECT_WINDOW = (1.4, 1.6)  # s of travel: the detector's path offset is the mean over this stretch (owner 13 Nov 12:13)
 OWN_MODEL_TAU = 1.0  # s: the model's heading return in the own-move estimate (EST; the A8 test loop's model)
 OWN_DRIFT_TAU = 30.0  # s: high-pass of the own-move estimate (bounds a drift of the integrated estimate; slower than usual's 10 s)
-OWN_PULLBACK = 0.35  # rho_hat: assumed share of our own move the model's path pulls back; (1 - rho_hat) y_own is subtracted (rev 7.1)
+OWN_PULLBACK = 0.7  # rho_hat: the model pull-back assumed in the estimate and (1 - rho_hat) the subtracted share (fix 1: re-tuned, was 0.35)
+OWN_MEASURED_MARGIN = 0.05  # m: the subtracted own move never exceeds the car's measured move relative to the right reference + this (fix 1)
 
 
 class SwerveDetector:
   """Rev 7.1 single obstacle detector (owner 13 Nov 12:08 / 12:13): upstream Blendful's swerve test (blendful.py) with two changes.
   (a) offset = mean of (plan_y - lane centre) over the plan points from 1.4 s to 1.6 s of travel (upstream: the point at 1.5 s);
   (b) the sideways move our own delivered correction causes is estimated and subtracted from the offset before usual and swerve are formed:
-      c_d = c through a first-order lag lat_action_t (actuator delay), psi' = v^2 c_d / v - psi / OWN_MODEL_TAU (heading, with the model's
-      heading return), y' = v psi; y_own = y high-passed with 30 s (bounds drift; usual's 10 s low-pass then acts on the subtracted
-      offset, so offset - usual removes the 10 s high-pass of our move exactly when the estimate is right); k = 1 - rho_hat;
-      offset = raw - k y_own.
+      c_d = c through a first-order lag lat_action_t (actuator delay); fix 1 (owner 13 Nov 13:37 "Estimate it but don't let it exceed the
+      limit"): psi' = v c_d - psi / OWN_MODEL_TAU - 2 v rho_hat y / L^2 (heading return and the model's pull-back toward its own path, so a
+      steady correction gives the bounded y = c L^2 / (2 rho_hat), where it balances the pull), y' = v psi; y_own = y high-passed with 30 s;
+      the subtracted part is clamped, sign-consistent, to the car's measured move relative to the right reference over the same 30 s
+      high-pass (road part of the change of Y_R(0), switch part removed) + 0.05 m; k = 1 - rho_hat; offset = raw - k y_own_clamped.
+      While lateral control is not engaged the estimate is frozen and usual is reset; at re-engagement both start again (fix 1, F1).
   Then upstream: usual = 10 s low-pass (20 s while going around), swerve = |offset - usual| - 0.25 |k| L^2 / 2,
   away = swerve - |(-centre_now - k y_own) - usual| (the car-departure term uses the car's position without our own move as well, otherwise
   our move would count twice), latch on away > 0.2 (2 s after a turn), off at swerve < 0.1 or inside a curve.
@@ -555,24 +558,49 @@ class SwerveDetector:
     self.y = 0.0
     self.y_lp = 0.0
     self.y_own = 0.0
+    self.y_own_raw = 0.0
+    self.measured = 0.0  # the car's cumulative move to the right relative to the right reference (switch part removed), m
+    self.measured_lp = 0.0
+    self.yr0_prev: float | None = None
+    self.lat_active_prev = True
     self.offset = 0.0
     self.swerve = 0.0
     self.away = 0.0
     self.departure = 0.0
 
-  def own_move(self, c: float, v: float, lat_action_t: float, dt: float) -> float:
+  def own_move(self, c: float, v: float, look: float, lat_action_t: float, yr0: float, sw0: float, dt: float) -> float:
     self.c_d += (c - self.c_d) * dt / (dt + max(lat_action_t, 1e-3))
-    self.psi += (v * self.c_d - self.psi / OWN_MODEL_TAU) * dt
+    self.psi += (v * self.c_d - self.psi / OWN_MODEL_TAU - 2.0 * v * OWN_PULLBACK * self.y / max(look, 1.0) ** 2) * dt
     self.y += v * self.psi * dt
     self.y_lp += (self.y - self.y_lp) * dt / (dt + OWN_DRIFT_TAU)
-    self.y_own = self.y - self.y_lp
+    self.y_own_raw = self.y - self.y_lp
+    if self.yr0_prev is not None:
+      self.measured -= (yr0 - self.yr0_prev) - sw0  # the road part of the change of Y_R(0): the car moving right lowers Y_R(0)
+    self.yr0_prev = yr0
+    self.measured_lp += (self.measured - self.measured_lp) * dt / (dt + OWN_DRIFT_TAU)
+    m = self.measured - self.measured_lp
+    self.y_own = float(np.clip(self.y_own_raw, min(m, 0.0) - OWN_MEASURED_MARGIN, max(m, 0.0) + OWN_MEASURED_MARGIN))
     return self.y_own
 
+  def _restart_own_move(self):
+    self.c_d = self.psi = self.y = self.y_lp = self.y_own = self.y_own_raw = 0.0
+    self.measured = self.measured_lp = 0.0
+
   def update(self, plan_x: np.ndarray, plan_y: np.ndarray, centre: np.ndarray, v: float, look: float, model_curvature: float,
-             lane_curvature: float, c: float, lat_action_t: float, dt: float) -> float:
+             lane_curvature: float, c: float, lat_action_t: float, dt: float, yr0: float = 0.0, sw0: float = 0.0,
+             lat_active: bool = True) -> float:
     xs = np.linspace(DETECT_WINDOW[0], DETECT_WINDOW[1], 5) * look / 1.5
     raw = float(np.mean(np.interp(xs, plan_x, plan_y) - np.interp(xs, X_IDXS, centre)))
-    k_own = (1.0 - OWN_PULLBACK) * self.own_move(c, v, lat_action_t, dt)
+    if lat_active and not self.lat_active_prev:  # re-engagement: the estimate and usual start again (fix 1, F1)
+      self._restart_own_move()
+      self.usual = None
+    self.lat_active_prev = lat_active
+    if lat_active:
+      k_own = (1.0 - OWN_PULLBACK) * self.own_move(c, v, look, lat_action_t, yr0, sw0, dt)
+    else:  # not engaged: the car does not follow c; the estimate is frozen, usual follows the offset (no swerve, no latch)
+      self.yr0_prev = yr0
+      k_own = (1.0 - OWN_PULLBACK) * self.y_own
+      self.usual, self.going_around = None, False
     self.offset = raw - k_own
     if self.usual is None:
       self.usual = self.offset
@@ -734,6 +762,7 @@ class RightInputs:
   ref_lane_width: float = LANE_WIDTH_DEFAULT  # the reference instance's filtered lane width (left limit with one reference)
   c_delivered: float = 0.0  # last frame's delivered correction c, 1/m (rev 7.1: the detector's own-move estimate)
   lat_action_t: float = 0.275  # actuator delay, s (rev 7.1: the detector's own-move estimate)
+  lat_active: bool = True  # carControl.latActive: the car follows the correction (fix 1: the own-move estimate is frozen while False)
   radar: RadarFrame | None = None  # the newest radarTracks message (B6a); None = no radar data: f_radar = 0, Right line = Regular
 
 
@@ -989,7 +1018,8 @@ class RightLineBlendful:
       # rev 7.1: the single detector (upstream's swerve test over 1.4-1.6 s with our own estimated move subtracted) replaces the endpoint gap
       win_c = c_ctr[win_ref]
       lane_k = 2.0 * float(np.polyfit(X_IDXS[win_ref], win_c, 2)[0]) if np.all(np.isfinite(win_c)) else 0.0  # review of rev 7.1: no LinAlgError
-      q_y = self.detector.update(plan_x, plan_y, c_ctr, v, look, model_curvature, lane_k, p.c_delivered, p.lat_action_t, dt)
+      q_y = self.detector.update(plan_x, plan_y, c_ctr, v, look, model_curvature, lane_k, p.c_delivered, p.lat_action_t, dt,
+                                 yr0=float(y_r[0]), sw0=float(switch_part[0]), lat_active=p.lat_active)
       dep = -self.detector.departure  # > 0: the path moved left of its usual place (obstacle on the right), as the side rule below reads it
       car_trig = self.detector.going_around
       # owner 13 Nov 12:08 / 12:52: ONE path detector only; the reference instance's own going-around test is no longer a trigger for the

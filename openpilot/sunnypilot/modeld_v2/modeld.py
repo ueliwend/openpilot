@@ -538,7 +538,7 @@ def main(demo=False):
                            new=bool(sm.updated['radarTracks']), right_blindspot=bool(sm_car.rightBlindspot), config_ok=radar_tracks_ok)
         rl_inputs = RightInputs(frame_dt=frame_dt, gap_low=blendful_gaps[0], gap_high=blendful_gaps[1], c_set=camera_offset_helper.camera_offset,
                                 c_applied=camera_offset_helper.actual_camera_offset, left_blinker=bool(sm_car.leftBlinker),
-                                right_blinker=bool(sm_car.rightBlinker), radar=radar)
+                                right_blinker=bool(sm_car.rightBlinker), radar=radar, lat_active=bool(sm['carControl'].latActive))
 
         def _correction(kappa_m, mo=model_output, mode=blendful_mode, inputs=rl_inputs, v=v_ego, act=blendful_active, t_a=lat_action_t):
           k0 = blendful_ctl.update(mo, v, act, kappa_m, t_a, mode, inputs)
