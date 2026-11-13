@@ -517,8 +517,13 @@ class TestYieldCap:
     assert np.abs(np.diff(cs)).max() * v ** 2 / DT_MDL <= br.SWERVE_RELEASE + 1e-6
 
   def test_obstacle_on_the_left_never_pulls_left(self):
+    # the model goes right (oncoming traffic); from the yield's first frame the correction never pushes left.  Before it (trigger latency,
+    # design I1, accepted in review r4): rev 6.13's re-seed (frame ~58 in this open loop) restarts the move at the car, so the right-line
+    # target is still near the car when the plan swerves right and its correction points back left by at most 0.03 m/s^2 for 3 frames
     ctl, rows = swerve_run(-1)
-    assert min(r[0] for r in rows) >= -1e-6  # the model goes right (oncoming traffic); the correction never pushes left
+    first = next(r[6] for r in rows if r[3])
+    assert min(r[0] for r in rows[first:]) >= -1e-6
+    assert min(r[0] for r in rows[:first]) * 13.0 ** 2 >= -0.03
     assert rows[-1][2] == -1
 
   def test_inside_curve_fade_does_not_trigger_the_cap(self):

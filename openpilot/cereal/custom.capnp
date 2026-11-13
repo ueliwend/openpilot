@@ -564,6 +564,9 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   # rev 6.10 "Start and floor"
   blendfulDeliveredSource @90 :UInt8;  # right-line share delivered: 0 right-line correction, 1 Regular's (larger of, target left of the centre), 2 right-line (larger of)
   blendfulTargetMinusCentre @91 :Float32;  # T_RL - T_C' at x = L, m (< 0: the right-line target is left of the lane centre)
+  # rev 6.12
+  blendfulReseeded @92 :Bool;  # the start was re-seeded at the car this frame (once per reset, a at a steady a_cmd, B5 item 2)
+  blendfulAuthorityLimited @93 :Bool;  # Regular delivered while T_RL is right of the centre for > 2 s (model pull; with blendfulDClipped, blendfulStrength)
 
   enum TurnDirection {
     none @0;

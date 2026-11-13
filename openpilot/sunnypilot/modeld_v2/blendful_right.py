@@ -65,7 +65,10 @@ RESEED_LOOKAHEADS = 2.0  # points beyond 2 L take T_raw every frame (rev 6.4)
 REFERENCE_RATE = 0.042  # m/s, r_ref
 CAR_MOVE_SPEED = 0.05  # m/s, the decided move speed of the car (r_ref is set so that the car stays below it)
 FOLLOW_SPEED = -0.02  # m/s: while the car moves left faster than this (and is left of T_RL) the start follows it (rev 6.10, EST)
-FOLLOW_SPEED_TAU = 1.0  # s, low-pass of the car's sideways speed for the follow rule (implementation choice: line jitter, round-4 open point)
+FOLLOW_SPEED_TAU = 1.0  # s, low-pass of the car's sideways speed for the follow rule (rev 6.11 item 4, EST)
+RESEED_STABLE = 1.0  # s: the re-seed fires once a has reached a_cmd and a_cmd has been unchanged this long (rev 6.12 B5 item 2, C612-1)
+CAR_LEFT_HYST = 0.02  # m, hysteresis of 'car left of the centre' for the larger-of rule (rev 6.12, R4-S2)
+AUTHORITY_LIMITED_TIME = 2.0  # s: Regular delivered while T_RL is right of the centre this long -> 'authority-limited' (C611-2)
 # measurement-filter rotation lever (B2, rev 6.3): "design" = lever x (scale 1, default); "model_axis" = lever x vEgo / v_x(0)
 ROTATION_SCALES = ("design", "model_axis")
 # delivered right-line share (rev 6.10, log): the right-line correction, or the larger of Regular's and it while T_RL is left of the centre
@@ -268,6 +271,11 @@ class MoveSpeedLimit:
       self.followed = True
     return t_rl
 
+  def reseed(self, y_r: np.ndarray, t4: np.ndarray, w: float) -> np.ndarray:
+    """Re-seed the start at the car (rev 6.12 B5 item 2): G0 := the car's gap, A := 0; returns the new T_RL."""
+    self._start_at_the_car(float(y_r[0]))
+    return self._target(y_r, y_r - t4, w, 0.0)
+
   def _target(self, y_r: np.ndarray, g4: np.ndarray, w: float, dt: float) -> np.ndarray:
     if w > 1e-9:
       want = w * (self.g0 - g4)
@@ -302,6 +310,12 @@ class Authority:
       if self.hold <= 0.0:
         self.a = min(self.a_cmd, self.a + A_IN * dt)
     return self.a
+
+
+def reseed_due(a: float, a_cmd: float, a_cmd_age: float) -> bool:
+  """Rev 6.13 B5 item 2: a has reached the commanded a_cmd (after the dead band and dwell) and a_cmd has been unchanged for >= 1.0 s,
+  evaluated only while a > 0 (taken literally the condition also holds in the reset frame, a = a_cmd = 0, and would disarm the re-seed)."""
+  return a > 0.0 and abs(a - a_cmd) < 1e-9 and a_cmd_age >= RESEED_STABLE - 1e-9
 
 
 class Timed:
@@ -778,6 +792,9 @@ class RightLineBlendful:
     self.ground = GroundTarget()
     self.move = MoveSpeedLimit()
     self.ref_present_prev = False
+    self.reseed_armed = False  # rev 6.12 B5 item 2: armed at every reset, fires once
+    self.car_left = False  # 'car left of the centre' with hysteresis (R4-S2)
+    self.regular_right_t = 0.0  # how long Regular has been delivered while T_RL is right of the centre (C611-2)
     self.jumps = JumpDetector()
     self.centre_src = CentreLimitSource()
     self.w_prev = None
@@ -1026,7 +1043,20 @@ class RightLineBlendful:
     present = qa > 0.0
     reasons = (a <= 0.0, was_episode and not in_episode, yield_ended, present and not self.ref_present_prev, self.mode_on)
     self.ref_present_prev, self.mode_on = present, False
-    t_rl = self.move.update(y_r, t4, a * s_r * f_yr, switch_part, vx0, dt, any(reasons))
+    w_rl = a * s_r * f_yr
+    t_rl = self.move.update(y_r, t4, w_rl, switch_part, vx0, dt, any(reasons))
+    # re-seed once per reset (rev 6.12 B5 item 2 with C612-1): armed at the reset; fires in the first frame in which a has reached a_cmd
+    # and a_cmd has been unchanged for >= 1.0 s; if the car is left of T_RL the start is re-seeded at the car; after the switch rebase
+    # (inside move.update above); the swerve trigger (self.gap: running minimum, usual) is not touched
+    if any(reasons):
+      self.reseed_armed = True
+    reseeded = False
+    au = self.authority
+    if self.reseed_armed and reseed_due(a, au.a_cmd, au.dwell):
+      if float(t_rl[0]) > 0.0:
+        t_rl = self.move.reseed(y_r, t4, w_rl)
+        reseeded = True
+      self.reseed_armed = False
     target = self.safety_bounds(t_rl, t_bound_line, t_bound_edge, w_e)  # T_RL <= T4 already holds the object bound and the bounds
     # --- correction (B4)
     d_rl, k0_rl, k_fit, d_clipped = self._correction(target, plan_x, plan_y, v, s_r)
@@ -1036,11 +1066,20 @@ class RightLineBlendful:
     # Deviation (round 4 open point): also while the car itself is left of the centre limit, so that the right-line share cannot drop
     # below Regular's when T_RL passes the centre ahead of a car still left of it (kappa_RL(T_C') < kappa_up where s_R < trust: a limit
     # cycle with the follow rule in the resting scene)
+    # Rev 6.11 / 6.12: kappa_R = max(kappa_up, kappa_RL) while T_RL(L) is left of T_C'(L) or the car is left of T_C'(0) (+-0.02 m
+    # hysteresis, R4-S2), and no bound puts the target left of the centre inside the fit window [0.5, 1.5] L_a (R4-S1); kappa_RL otherwise
     trl_minus_centre = float(np.interp(iL, X_IDXS, t_rl - c_ctr))
-    car_left_of_centre = float(c_ctr[0]) > 0.0
-    larger_of = (trl_minus_centre < -1e-6 or car_left_of_centre) and not bound_active and not rc.bound_active
+    car_offset = float(c_ctr[0])  # > 0: the car is left of the centre limit
+    self.car_left = car_offset > -CAR_LEFT_HYST if self.car_left else car_offset > CAR_LEFT_HYST
+    la = approach_length(max(v, 1.0))
+    win_fit = (X_IDXS >= FIT_WINDOW[0] * la) & (X_IDXS <= FIT_WINDOW[1] * la)
+    bound_left_in_window = bool(np.any((t4 < c_ctr - 1e-6) & win_fit))  # line / edge bound (the object bound never goes left of T_C')
+    larger_of = (trl_minus_centre < -1e-6 or self.car_left) and not bound_left_in_window
     k_r = max(k0_up, k0_rl) if larger_of else k0_rl
     delivered = (DELIVER_REGULAR if k0_up > k0_rl else DELIVER_LARGER_RIGHT_LINE) if larger_of else DELIVER_RIGHT_LINE
+    regular_right = delivered == DELIVER_REGULAR and trl_minus_centre > 0.0
+    self.regular_right_t = self.regular_right_t + dt if regular_right else 0.0
+    authority_limited = self.regular_right_t > AUTHORITY_LIMITED_TIME
     wts = junction_policy(in_episode, a, right_line_mode=not force_regular)
     k0 = wts.w_rl * k_r + wts.w_up * k0_up
     if fading:
@@ -1073,6 +1112,8 @@ class RightLineBlendful:
       'yield_side': log_side(caps), 'yield_source': src, 'centre_source': centre_src, 'yield_moving': self.moving_t > 0.0,
       't_raw': t_raw, 't_lim': t_lim, 't4': t4, 'y_edge_r': filt[3], 'c_ctr': c_ctr, 'y_r': y_r, 'y_l': y_l, 'beta': beta, 'jump_inno': np.array(inno),
       'approach': float(np.interp(iL, X_IDXS, mv.a_lim)), 'gap_reset': float(np.interp(iL, X_IDXS, mv.g0)), 'start_follows_car': mv.followed,
+      'reseeded': reseeded, 'authority_limited': authority_limited,
+      'car_left': self.car_left, 'bound_left_in_window': bound_left_in_window,
       'delivered': delivered, 'trl_minus_centre': trl_minus_centre,
       'move_reset': sum(int(r_) << i for i, r_ in enumerate(reasons)), 'switch_part': float(np.interp(iL, X_IDXS, switch_part)),
       'move_limiting': mv.limiting, 'rotation_scale': ROTATION_SCALES.index(self.rotation_scale), 'radar': rc,
@@ -1314,6 +1355,8 @@ def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
   builder.blendfulApproach = float(lg['approach'])
   builder.blendfulGapReset = float(lg['gap_reset'])
   builder.blendfulStartFollowsCar = bool(lg['start_follows_car'])
+  builder.blendfulReseeded = bool(lg['reseeded'])
+  builder.blendfulAuthorityLimited = bool(lg['authority_limited'])
   builder.blendfulDeliveredSource = int(lg['delivered'])
   builder.blendfulTargetMinusCentre = float(lg['trl_minus_centre'])
   builder.blendfulMoveLimiting = bool(lg['move_limiting'])

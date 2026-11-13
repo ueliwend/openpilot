@@ -73,7 +73,18 @@ def read_radar_tracks_ok(params) -> bool:
       return False
     return radar_tracks_ok(messaging.log_from_bytes(cp_bytes, car.CarParams), messaging.log_from_bytes(cp_sp_bytes, custom.CarParamsSP))
   except Exception:
+    global _CONFIG_ERROR_LOGGED
+    if not _CONFIG_ERROR_LOGGED:  # logged once (review r4 N1): a broken import or parse would otherwise keep Right line at Regular silently
+      _CONFIG_ERROR_LOGGED = True
+      try:
+        from openpilot.common.swaglog import cloudlog
+        cloudlog.exception("blendful: radar configuration unreadable, radar check treated as unhealthy")
+      except Exception:
+        pass
     return False
+
+
+_CONFIG_ERROR_LOGGED = False
 
 
 def healthy_empty_radar() -> RadarFrame:

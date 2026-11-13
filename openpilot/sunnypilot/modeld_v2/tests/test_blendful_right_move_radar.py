@@ -587,14 +587,17 @@ def scene_loop(kmh, scene, seconds=45.0, regular=False, gap=0.44):
   v = kmh / 3.6
   ctl = BlendfulCorrection()
   sc = {'y0': 0.0, 'regular_s': 5.0, 'pull': None, 'probs': 0.9, 'mode': lambda t: MODE_RIGHT, 'prob': lambda t: None, 'left': lambda t: -1.75,
-        'gap': gap}
+        'gap': gap, 'patch': None}
   sc.update(SCENES[scene])
   y, psi, kc = sc['y0'], 0.0, 0.0
   buf = [0.0] * 4
   rows = []
+  extra = {'reseeded': [], 'a': [], 'authority_limited': [], 'car_left': []}
   look = max(1.5 * v, 10.0)
   for i in range(int(seconds / DT_MDL)):
     t = i * DT_MDL - sc['regular_s']
+    if sc['patch'] is not None:
+      sc['patch'](ctl, t)
     pr = sc['prob'](t)
     mo = model_output(v, y, psi, kc, left=sc['left'](t), right_line_prob=sc['probs'] if pr is None else pr)
     mo['lane_lines_prob'][0, 3] = sc['probs']
@@ -617,7 +620,10 @@ def scene_loop(kmh, scene, seconds=45.0, regular=False, gap=0.44):
     rows.append((t, y, v * psi, float(np.interp(look, X, lg['target'])) + shift if lg else np.nan,
                  float(np.interp(look, X, lg['c_ctr'])) + shift if lg else np.nan, lg.get('delivered', -1) if lg else -1,
                  bool(lg.get('start_follows_car', False)) if lg else False))
+    for k in extra:
+      extra[k].append(float(lg.get(k, 0.0)) if lg else 0.0)
   scene_loop.last_log = ctl.result.log
+  scene_loop.extra = {k: np.array(x) for k, x in extra.items()}
   r = np.array(rows, dtype=float)
   return r[:, 0], r[:, 1], r[:, 2], r[:, 3], r[:, 4], r[:, 5], r[:, 6]
 
@@ -627,8 +633,34 @@ def toggling(t):
 
 
 def flicker(t):
-  """The ONE shared quality-flicker fixture (design rev 6.10 E3): q(t) = 0.45 + 0.3 sin(2 pi t) on the right line, from t = 0 to 30 s."""
+  """The quality-flicker fixture q(t) = 0.45 + 0.3 sin(2 pi t) from t = 0 to 30 s.  Applied as the raw right-line probability (round 4; upstream's
+  0.5 s probability filter delivers about 0.45 +- 0.09 to the gate: partial fades), the second, reported variant (design rev 6.12 E3, R4-S3)."""
   return float(0.45 + 0.3 * np.sin(2 * np.pi * t)) if 0 <= t < 30 else 0.9
+
+
+def patch_each_frame(attr, make):
+  """Wrap ctl.right.<attr>.update (the object is rebuilt on every instance reset, so the wrap is checked every frame)."""
+  def patch(ctl, t):
+    obj = getattr(ctl.right, attr)
+    if getattr(obj, '_fixture_t', None) is None:
+      obj.update = make(obj.update, obj)
+    obj._fixture_t = t
+  return patch
+
+
+def gate_flicker_patch():
+  """The shared flicker fixture defined AT THE GATE (design rev 6.12 E3, review R4-S3): the quality the right-line confidence gate reads is
+  q_R(t) = 0.45 + 0.3 sin(2 pi t) from t = 0 to 30 s; each dip reaches the gate's zero and is a reset."""
+  def make(orig, obj):
+    return lambda q: orig(float(0.45 + 0.3 * np.sin(2 * np.pi * obj._fixture_t)) if 0 <= obj._fixture_t < 30 else q)
+  return patch_each_frame('quality_gate', make)
+
+
+def authority_cap_patch(cap):
+  """Direct authority fixture (design rev 6.12 E3, C612-1): a* is capped at `cap`, so a settles below 1."""
+  def make(orig, obj):
+    return lambda a_star: orig(min(a_star, cap))
+  return patch_each_frame('authority', make)
 
 
 SCENES = {
@@ -637,7 +669,10 @@ SCENES = {
   # Regular rests about 0.15 m left of the centre: line probabilities 0.55 (Regular's trust about 0.8) and a model pull calibrated per speed
   'resting': {'y0': -0.4, 'regular_s': 0.0, 'pull': {30: -0.396, 50: -0.55, 80: -0.462}, 'probs': 0.55},
   'toggle': {'y0': 0.5, 'regular_s': 0.0, 'mode': toggling},  # at the right-hand position, then Right line <-> Regular every 2 s
-  'flicker': {'y0': 0.5, 'regular_s': 0.0, 'prob': flicker},
+  'flicker': {'y0': 0.5, 'regular_s': 0.0, 'prob': flicker},  # the raw-probability variant (reported)
+  'flicker_gate': {'y0': 0.5, 'regular_s': 0.0, 'patch': gate_flicker_patch()},  # the shared fixture at the gate input
+  # mode on 0.15 m right of the centre with a capped at a* (the authority fixture of rev 6.12; a* set per test)
+  **{f'astar{int(c * 10):02d}': {'y0': 0.15, 'regular_s': 0.0, 'patch': authority_cap_patch(c)} for c in (0.6, 0.8, 0.9, 1.0)},
   # a large GUI gap puts the right-line target left of the centre; the centre then steps 0.2 m right (the left line 0.4 m in)
   'centre_step': {'gap': 2.0, 'left': lambda t: -1.75 + (0.4 if t > 5.0 else 0.0)},
 }
@@ -655,10 +690,9 @@ def own_move_peak(t, y, vs, tg, tc):
 
 
 class TestStartAndFloor:
-  """Design numbers (EST, the design's crude loop): plain 0.0498-0.0506; return 0.0665 / 0.0750 / 0.0732 vs Regular 0.0667 / 0.0752 / 0.0733;
-  resting <= 0.048; toggling 0.041-0.049; flicker 0.038-0.044.  Whole instance (round 4, TEST in this loop): plain 0.0497 / 0.0509 / 0.0508;
-  return equal to Regular (0.0886 / 0.1262 / 0.1023), Keep Right's own move 0.0484-0.0515; resting: see the test; toggling own move
-  0.0546-0.0563 and flicker 0.0543-0.0674 (strict xfail, round-4 open points)."""
+  """Design rev 6.13 reference numbers (TEST, the designer's harness on the real module, 70 s): plain own 0.0485-0.0496; toggling 0.0483-0.0494;
+  flicker (raw probability) 0.048-0.0517; a* 0.6 0.0526 / 0.0510 / 0.0524, 0.8 <= 0.0501, 0.9 <= 0.0490, 1.0 0.0477-0.0483; peak right of the
+  centre <= Regular + 0.0017.  Criterion asserted: Keep Right's own move <= 0.052 m/s (a* fixtures <= 0.053, design E3 at 357cb88)."""
   @pytest.mark.parametrize("kmh", SPEEDS)
   def test_plain_move(self, kmh):
     t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'plain', seconds=50.0)
@@ -675,45 +709,94 @@ class TestStartAndFloor:
 
   @pytest.mark.parametrize("kmh", SPEEDS)
   def test_regular_resting_left_of_the_centre(self, kmh):
-    # Design: the car reaches +0.5 m.  In the whole instance a model pull that holds Regular 0.15 m left of the centre at trust 0.8 is a
-    # plan 0.40-0.55 m left of the centre; the right-line fit is clipped at D_MAX 1.0 m (C9) and scaled by s_R (0.75 at probabilities 0.55),
-    # so the right-line correction saturates below what +0.5 m needs: Keep Right ends at -0.15 .. -0.05 m, never left of Regular (round-4
-    # open point).  Asserted: never left of Regular's rest, everything right of the centre <= 0.052 m/s, overall peak <= Regular's settling +
-    # 0.002, and the right-line fit at its clip at the end (the reason)
+    # Rev 6.12 E3: never left of Regular and the authority-limited flag (C611-2), not +0.5 m.  A model pull that holds Regular 0.15 m left
+    # of the centre at trust 0.8 is a plan 0.40-0.55 m left of the centre; the right-line fit is clipped at D_MAX 1.0 m (C9) and scaled by
+    # s_R, so Regular (the larger) is delivered while the right-line target is right of the centre: Keep Right ends at -0.15 .. -0.05 m
     t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'resting', seconds=60.0)
-    lg = scene_loop.last_log
+    ex, lg = scene_loop.extra, scene_loop.last_log
     tr, yr, vr, *_ = scene_loop(kmh, 'resting', seconds=60.0, regular=True)
     assert -0.2 < yr[-1] < -0.1  # the fixture: Regular rests about 0.15 m left of the centre
+    g = (t >= 0) & (tr >= 0)
+    assert np.all(y[g] >= yr[g] - 0.005)  # never left of Regular (5 mm: the loop's integration phase)
     assert right_of_centre_peak(t, y, vs) <= 0.052
     assert vs[t >= 0].max() <= vr[tr >= 0].max() + 0.002
-    assert y[-1] >= yr[-1] - 0.005
-    assert lg['d_clipped'] or abs(y[-1] - 0.5) < 0.03
+    # authority-limited (C611-2) exactly where Regular is delivered with the right-line target right of the centre for > 2 s (50 km/h here);
+    # at 30 / 80 km/h the larger right-line correction is delivered and the car rests right of Regular (no flag)
+    if src[-1] == br.DELIVER_REGULAR:
+      assert ex['authority_limited'][-1] == 1.0 and lg['trl_minus_centre'] > 0.0
+    else:
+      assert src[-1] == br.DELIVER_LARGER_RIGHT_LINE and ex['authority_limited'][-1] == 0.0 and y[-1] > yr[-1] + 0.02
+    if kmh == 50:
+      assert ex['authority_limited'][-1] == 1.0
 
   @pytest.mark.parametrize("kmh", SPEEDS)
   def test_reset_right_of_the_centre_with_mode_toggling_does_not_pull_back(self, kmh):
     # Regular's phases move the car toward the centre; a reset never pulls it further back than Regular alone does
-    t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'toggle', seconds=45.0)
-    tr, yr, vr, *_ = scene_loop(kmh, 'toggle', seconds=45.0, regular=True)
+    t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'toggle', seconds=70.0)
+    tr, yr, vr, *_ = scene_loop(kmh, 'toggle', seconds=70.0, regular=True)
     assert y[t >= 0].min() >= yr[tr >= 0].min() - 0.01 and abs(y[-1] - 0.5) < 0.01  # (8 mm more in this loop: phase of the toggles)
 
-  @pytest.mark.xfail(strict=True, reason="round-4 open point: toggling every 2 s, Keep Right's own move 0.0546-0.0563 m/s in the whole "
-                                         + "instance (design EST 0.041-0.049): a rising a moves the blend from Regular's centre toward the car")
   @pytest.mark.parametrize("kmh", SPEEDS)
   def test_mode_toggling_own_move(self, kmh):
-    t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'toggle', seconds=45.0)
+    # was a strict xfail in round 4 (0.0546-0.0563); the once-per-reset re-seed (rev 6.13) fixes it.  Exactly one re-seed: the toggles end at
+    # t = 30 s; each reset re-arms, and the re-seed fires (once) only after a has settled at a_cmd for 1 s
+    t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'toggle', seconds=70.0)
+    tr, yr, vr, *_ = scene_loop(kmh, 'toggle', seconds=70.0, regular=True)
     assert own_move_peak(t, y, vs, tg, tc) <= 0.052
-
-  @pytest.mark.xfail(strict=True, reason="round-4 open point: the shared flicker fixture, Keep Right's own move 0.0543-0.0674 m/s in the whole "
-                                         + "instance (design EST 0.038-0.044; Regular alone 0.033-0.058 right of the centre)")
-  @pytest.mark.parametrize("kmh", SPEEDS)
-  def test_quality_flicker_across_the_gate(self, kmh):
-    t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'flicker', seconds=45.0)
-    assert own_move_peak(t, y, vs, tg, tc) <= 0.052
+    assert right_of_centre_peak(t, y, vs) <= max(right_of_centre_peak(tr, yr, vr) + 0.002, 0.052)
+    assert abs(y[-1] - 0.5) < 0.01
 
   @pytest.mark.parametrize("kmh", SPEEDS)
-  def test_quality_flicker_ends_at_the_right_hand_position(self, kmh):
-    t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'flicker', seconds=45.0)
-    assert abs(y[-1] - 0.5) < 0.02 and y[t >= 0].min() > -0.1
+  @pytest.mark.parametrize("scene", ['flicker_gate', 'flicker'])
+  def test_quality_flicker_across_the_gate(self, kmh, scene):
+    # flicker_gate: the shared fixture at the gate input (rev 6.12 E3, R4-S3); flicker: the raw-probability variant (reported)
+    # At the gate input each early dip is a reset at +0.5 m: a = 0 and Regular pulls the car back at up to 0.21 m/s; the swerve trigger reads
+    # that move as a swerve (obstacle on the right) and caps the rightward correction at 0 for about 20 s, so the car waits up to 9 mm left
+    # of Regular's path and Regular's own return afterwards (a = 0) is the peak right of the centre (0.066 at 50 km/h vs 0.063 in the
+    # Regular-only run).  Pre-existing trigger behaviour (df4d2d5), reported in round 5; asserted: within Regular + 0.002, or below the
+    # speed that upstream's own correction (a = 0) reaches in the same run
+    t, y, vs, tg, tc, src, fol = scene_loop(kmh, scene, seconds=70.0)
+    a = scene_loop.extra['a']
+    tr, yr, vr, *_ = scene_loop(kmh, scene, seconds=70.0, regular=True)
+    assert own_move_peak(t, y, vs, tg, tc) <= 0.052
+    roc = right_of_centre_peak(t, y, vs)
+    upstream_alone = (t >= 0) & (a == 0.0)
+    assert roc <= max(right_of_centre_peak(tr, yr, vr) + 0.002, 0.052) or (scene == 'flicker_gate' and roc <= vs[upstream_alone].max())
+    assert abs(y[-1] - 0.5) < 0.01 and y[t >= 0].min() >= yr[tr >= 0].min() - 0.01
+
+  def test_the_gate_fixture_reaches_the_gate_zero(self):
+    # the gate-input fixture's dips are resets (a goes to 0), unlike the raw-probability variant (partial fades)
+    scene_loop(50, 'flicker_gate', seconds=35.0)
+    a = scene_loop.extra['a']
+    tt = np.arange(len(a)) * DT_MDL
+    assert np.any((tt > 2) & (tt < 30) & (a == 0.0)) and np.any((tt > 2) & (tt < 30) & (a > 0.0))
+
+  @pytest.mark.parametrize("kmh", SPEEDS)
+  @pytest.mark.parametrize("cap", [0.6, 0.8, 0.9, 1.0])
+  def test_authority_settling_below_one_after_a_reset_right_of_the_centre(self, kmh, cap):
+    # C612-1: mode on 0.15 m right of the centre, a capped at a*: the start re-seeds once at the car after a settles; own move <= 0.053 m/s
+    # (design harness 0.0477-0.0526); end position reported (design +0.28-0.31 / +0.39-0.41 / +0.44-0.45 / +0.50 m)
+    t, y, vs, tg, tc, src, fol = scene_loop(kmh, f'astar{int(cap * 10):02d}', seconds=70.0)
+    ex = scene_loop.extra
+    own = own_move_peak(t, y, vs, tg, tc)
+    TestStartAndFloor.astar_rows = getattr(TestStartAndFloor, 'astar_rows', {})
+    TestStartAndFloor.astar_rows[(cap, kmh)] = (own, float(y[-1]))
+    print(f'a*={cap} {kmh} km/h: own {own:.4f} end {y[-1]:+.3f} re-seeds {int(ex["reseeded"].sum())}')
+    assert own <= 0.053
+    assert int(ex['reseeded'].sum()) == 1
+    assert abs(ex['a'][-1] - cap) < 1e-6
+    assert {0.6: (0.26, 0.33), 0.8: (0.37, 0.43), 0.9: (0.43, 0.47), 1.0: (0.49, 0.51)}[cap][0] < y[-1] < \
+      {0.6: (0.26, 0.33), 0.8: (0.37, 0.43), 0.9: (0.43, 0.47), 1.0: (0.49, 0.51)}[cap][1]
+
+  def test_the_re_seed_needs_a_above_zero(self, monkeypatch):
+    # rev 6.13: taken literally ("a has reached a_cmd and a_cmd unchanged >= 1 s") the condition holds in the reset frame itself (a = a_cmd = 0,
+    # a_cmd held since the last change) and disarms the re-seed before a has risen: no re-seed ever, and the a* = 0.8 fixture fails
+    assert not br.reseed_due(0.0, 0.0, 5.0)
+    assert br.reseed_due(0.8, 0.8, 1.0) and not br.reseed_due(0.8, 0.8, 0.9) and not br.reseed_due(0.7, 0.8, 5.0)
+    monkeypatch.setattr(br, 'reseed_due', lambda a, a_cmd, age: abs(a - a_cmd) < 1e-9 and age >= br.RESEED_STABLE - 1e-9)
+    t, y, vs, tg, tc, src, fol = scene_loop(50, 'astar08', seconds=70.0)
+    assert scene_loop.extra['reseeded'].sum() == 0
+    assert own_move_peak(t, y, vs, tg, tc) > 0.053
 
   @pytest.mark.parametrize("kmh", SPEEDS)
   def test_a_bound_left_of_the_centre_is_reached(self, kmh, monkeypatch):
@@ -760,6 +843,128 @@ class TestStartAndFloor:
     assert np.mean(tgs[-200:]) - np.mean(tgs[:200]) > -0.02  # no net leftward drift beyond the jitter
     assert abs(y - 0.5) < 0.03
     TestStartAndFloor.follow_events = follows
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# round 5 (design rev 6.12 / 6.13): the larger-of rule's window (R4-S1) and hysteresis (R4-S2), the re-seed and the swerve trigger, jitter
+def static_run(v, ys, mode=MODE_RIGHT, shape=None, seconds_each=3.0, ctl=None, **kw):
+  """Open loop: the car held at ground position y (lane centre 0) for seconds_each per entry of ys; shape(mo, t) edits the model output."""
+  ctl = ctl or BlendfulCorrection()
+  logs = []
+  for j, y in enumerate(ys):
+    for i in range(int(seconds_each / DT_MDL)):
+      mo = model_output(v, y, 0.0, 0.0)
+      if shape is not None:
+        shape(mo, (j * seconds_each) + i * DT_MDL)
+      ctl.update(mo, v, True, 0.0, LAT_T, mode, inputs(gap_low=0.44, gap_high=0.44, **kw))
+    logs.append(dict(ctl.result.log))
+  return ctl, logs
+
+
+class TestLargerOfWindowAndHysteresis:
+  @pytest.mark.parametrize("far, binds", [(2.0, False), (1.2, True)])
+  def test_a_far_field_bound_does_not_switch_the_larger_of_rule_off(self, far, binds):
+    # R4-S1: the car 0.3 m left of the centre (larger-of on); from t = 8 s the right line ahead of far * L_a moves in by 1.7 m (a lane that
+    # narrows beyond a junction): the line bound puts the target left of the centre there.  Beyond the fit window [0.5, 1.5] L_a it does not
+    # switch the larger-of rule off (Regular stays delivered); inside the window it does (the right-line correction is delivered)
+    v = 50 / 3.6
+    la = br.approach_length(v)
+
+    def narrowing(mo, t):
+      if t > 8.0:
+        m = X > far * la
+        mo['lane_lines'][0, 2:4, m, 0] -= 1.7
+    _, logs = static_run(v, [-0.3] * 4, shape=narrowing)
+    lg = logs[-1]
+    assert lg['bound_active'] and np.any(lg['t4'] < lg['c_ctr'] - 0.05) and lg['car_left']
+    assert lg['bound_left_in_window'] == binds
+    assert (lg['delivered'] == br.DELIVER_RIGHT_LINE) == binds
+    if not binds:
+      assert lg['delivered'] == br.DELIVER_REGULAR
+
+  def test_car_left_of_the_centre_has_2_cm_hysteresis(self):
+    # R4-S2: "car left of the centre" switches on above +0.02 m and off below -0.02 m (offset of the centre limit from the car at x = 0)
+    v = 50 / 3.6
+    ys = [-0.1, 0.01, -0.01, 0.03, 0.01, -0.01, -0.03, 0.01]
+    want = [True, True, True, False, False, False, True, True]
+    _, logs = static_run(v, ys, seconds_each=4.0)
+    offs = [float(lg['c_ctr'][0]) for lg in logs]
+    for y, o in zip(ys, offs, strict=True):
+      assert abs(o + y) < 0.004, (y, o)  # the fixture: the centre-limit offset at the car is the car's distance left of the centre
+    assert [bool(lg['car_left']) for lg in logs] == want
+
+
+class TestReseedAndSwerveTrigger:
+  @staticmethod
+  def first_yield(frames_hold, reseed=True, monkeypatch=None):
+    if not reseed:
+      monkeypatch.setattr(br, 'reseed_due', lambda *a: False)
+    ctl = BlendfulCorrection()
+    first, reseed_frame, q = None, None, []
+    for i in range(frames_hold + 150):
+      t = max(0.0, (i - frames_hold) * DT_MDL)
+      ctl.update(Scene(v=13.0, plan=-0.8 * min(1.0, t / 0.5)).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, inputs())
+      lg = ctl.result.log
+      if lg['reseeded']:
+        reseed_frame = i
+      if first is None and ctl.result.yield_active:
+        first = i
+      q.append(ctl.result.yield_q)
+    if not reseed:
+      monkeypatch.undo()
+    return first, reseed_frame, np.array(q, dtype=float)
+
+  def test_the_re_seed_leaves_the_swerve_trigger_untouched(self, monkeypatch):
+    # C612-1: the re-seed moves the start of the right-line target only; the swerve trigger's running minimum and usual are not reset.  A swerve
+    # (obstacle on the right) starting during or right after the re-seed is caught in the same frame, with the same endpoint gaps, as without it
+    _, rs, _ = self.first_yield(400)
+    assert rs is not None
+    for start in (rs - 2, rs, rs + 1, rs + 10):
+      with_reseed = self.first_yield(start)
+      without = self.first_yield(start, reseed=False, monkeypatch=monkeypatch)
+      assert with_reseed[0] is not None and with_reseed[0] == without[0], (start, with_reseed[0], without[0])
+      np.testing.assert_array_equal(with_reseed[2], without[2])
+
+  def test_no_ratchet_under_line_jitter_with_repeated_resets(self):
+    # 3 cm independent jitter on every line and a 0.4 s quality dip to zero at the gate input (a reset) every 40 s, 6 times: after each reset
+    # the start is the car and the re-seed fires at most once; the car returns to the right-hand position each time and neither the position
+    # before a reset nor the excursion after it moves left from one reset to the next (no ratchet).  Note (pre-existing, identical at
+    # df4d2d5): in this loop the blend toward Regular during the dip and the re-entry hold move the car 0.25 m left within 2 s, the swerve
+    # trigger reads that as a swerve (obstacle on the right) and caps for about 20 s at -0.06 m; hence the 40 s period
+    v = 50 / 3.6
+    rng = np.random.default_rng(11)
+    ctl = BlendfulCorrection()
+    y, psi, kc = 0.5, 0.0, 0.0
+    buf = [0.0] * 4
+    reseeds, ys = 0, []
+    n, period, t0 = 6, 40.0, 30.0
+    dip = patch_each_frame('quality_gate', lambda orig, obj: (lambda q: orig(0.0 if t0 <= obj._fixture_t < t0 + n * period
+                                                                               and (obj._fixture_t - t0) % period < 0.4 else q)))
+    for i in range(int((t0 + n * period + 10) / DT_MDL)):
+      t = i * DT_MDL
+      mo = model_output(v, y, psi, kc)
+      mo['lane_lines'][0, :, :, 0] += 0.03 * rng.standard_normal((4, 1))
+      mo['plan'][0, :, 1] = -psi * X
+      k_model = -psi / v
+      dip(ctl, t)
+      ctl.update(mo, v, True, k_model, LAT_T, MODE_RIGHT, inputs(gap_low=0.44, gap_high=0.44))
+      reseeds += int(ctl.result.log['reseeded'])
+      ys.append(y)
+      buf.append(ctl.c + k_model)
+      cmd = buf.pop(0)
+      for _ in range(5):
+        kc += (cmd - kc) * 0.01 / 0.3
+        psi += v * kc * 0.01
+        y += v * psi * 0.01
+    ys = np.array(ys)
+    tt = np.arange(len(ys)) * DT_MDL
+    before = [float(ys[np.argmin(abs(tt - (t0 + k * period - 0.1)))]) for k in range(n)]
+    lows = [float(ys[(tt >= t0 + k * period) & (tt < t0 + (k + 1) * period)].min()) for k in range(n)]
+    TestReseedAndSwerveTrigger.jitter_rows = (before, lows, reseeds, float(y))
+    assert min(before) > 0.47 and before[-1] - before[0] > -0.02
+    assert max(lows) - min(lows) < 0.03
+    assert abs(y - 0.5) < 0.03
+    assert reseeds <= n + 1  # at most one per reset (n dips + the start)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
