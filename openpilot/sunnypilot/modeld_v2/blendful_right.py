@@ -1052,7 +1052,7 @@ class RightLineBlendful:
     w_rl = a * s_r * f_yr
     # rev 6.15: the limiter's creation (start, lane-tracking restart) and w = 0 are reset frames, each with its own log bit
     reasons = (a <= 0.0, was_episode and not in_episode, yield_ended, present and not self.ref_present_prev, self.mode_on,
-               self.move.created, w_rl <= 0.0)
+               self.move.created, w_rl <= 1e-9)
     self.ref_present_prev, self.mode_on = present, False
     t_rl = self.move.update(y_r, t4, w_rl, switch_part, vx0, dt, any(reasons))
     # re-seed once per reset (rev 6.12 B5 item 2 with C612-1): armed at the reset; fires in the first frame in which a has reached a_cmd
@@ -1163,6 +1163,9 @@ class BlendfulCorrection:
     self.release_window = False
     self.building = False
     self.hand_over = False  # owner 13 Nov 09:27: the whole correction is handed to the model's path (log)
+    self.hand_over_c = 0.0  # delivered correction c (1/m) at the latch of the last hand-over (log)
+    self.hand_over_time = 0.0  # s from the latch of the last hand-over until c reached 0 (log)
+    self.hand_over_counting = False  # the last hand-over's c has not reached 0 yet
     self.right_idle = True
     self.invalid = False  # this frame's inputs or computed correction were non-finite: released toward 0, instances reset (S3)
     self.update_ms = 0.0  # time of the whole last update (S5); fill_log consumes it
@@ -1197,7 +1200,7 @@ class BlendfulCorrection:
     self.right_idle = True
     self.result = RightResult(fading=True)
     self.cap_mem = {}
-    self.cap_active = self.release_window = self.building = False
+    self.cap_active = self.release_window = self.building = self.hand_over = self.hand_over_counting = False
     self.k_up = 0.0
     self.c = self._limit(0.0, v, RELEASE)
     self.k0 = self.c / self.gain
@@ -1222,7 +1225,7 @@ class BlendfulCorrection:
       self._gain(mo, lat_action_t, finite_model_inputs(mo, lat_action_t, right_line=False))
       f = self.gain
       self.reference.update(mo, v_ego, active, model_curvature, enabled=False)
-      self.cap_active = self.release_window = False
+      self.cap_active = self.release_window = self.hand_over = self.hand_over_counting = False
       self.cap_mem = {}
       c = self._limit(0.0, v_lim, RELEASE)
       self.c, self.k0, self.k_up = c, c / f, 0.0
@@ -1294,7 +1297,10 @@ class BlendfulCorrection:
           self.cap_active = True
     else:
       self.cap_mem = {}
+    latched = bool(right_runs and res.own_yield) and not self.hand_over
     self.hand_over = bool(right_runs and res.own_yield)
+    if latched:
+      self.hand_over_c, self.hand_over_time, self.hand_over_counting = self.c, 0.0, self.c != 0.0
     if self.hand_over:
       # owner 13 Nov 09:27 ("I thought hand directly to the normal path, not to blendful... otherwise it needs yo get detected twice..."):
       # from the latch of Keep Right's own swerve trigger until that yield ends, the target of the WHOLE correction (Keep Right's extra and
@@ -1305,6 +1311,9 @@ class BlendfulCorrection:
     c_new = self._limit(c_target, v_lim, release)
     self.building = (c_target - c_new) > 1e-9  # still building toward the right
     self.c = c_new if np.isfinite(c_new) else 0.0
+    if self.hand_over_counting:  # from the latch until c has reached 0 (kept afterwards: the duration of the last hand-over)
+      self.hand_over_time += p.frame_dt
+      self.hand_over_counting = self.c != 0.0
     self.k0 = self.c / f
     return self.k0
 
@@ -1344,6 +1353,9 @@ def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
   builder.blendfulCapActive = bool(ctl.cap_active)
   builder.blendfulUpdateTime = float(ctl.take_update_ms())  # the whole update of this frame, ms; 0 when the class did not run (S5)
   builder.blendfulNonFinite = bool(ctl.invalid)
+  builder.blendfulHandOver = bool(ctl.hand_over)
+  builder.blendfulHandOverCorrection = float(ctl.hand_over_c)
+  builder.blendfulHandOverTime = float(ctl.hand_over_time)
   lg = ctl.result.log
   if mode == MODE_OFF or not lg:
     return

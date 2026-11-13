@@ -544,7 +544,7 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   blendfulGapReset @71 :Float32;  # G0, the gap to the right reference at the last reset (rebased by reference switches), m
   blendfulStartFollowsCar @72 :Bool;  # the start followed the car this frame (car moving left of -0.02 m/s and left of the right-line target, rev 6.10)
   blendfulMoveLimiting @73 :Bool;  # the 0.05 m/s limit binds somewhere in the window
-  blendfulMoveReset @74 :UInt8;  # reset reasons this frame: bit 0 a = 0, 1 junction end, 2 yield end, 3 right reference regained, 4 mode on
+  blendfulMoveReset @74 :UInt8;  # reset reasons this frame: bit 0 a = 0, 1 junction end, 2 yield end, 3 right reference regained, 4 mode on, 5 limiter created, 6 w <= 0
   blendfulSwitchPart @75 :Float32;  # switch part of the change of Y_R added to G0 this frame, m
   blendfulRotationScale @76 :UInt8;  # FILTER_ROTATION_SCALE: 0 design, 1 model_axis
   # radar right-side clearance check (B6a item 8)
@@ -567,6 +567,10 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   # rev 6.12
   blendfulReseeded @92 :Bool;  # the start was re-seeded at the car this frame (once per reset, a at a steady a_cmd, B5 item 2)
   blendfulAuthorityLimited @93 :Bool;  # Regular delivered while T_RL is right of the centre for > 2 s (model pull; with blendfulDClipped, blendfulStrength)
+  # hand-over to the model's path (owner 13 Nov 09:27): from the latch of Keep Right's own swerve trigger the whole correction goes to 0
+  blendfulHandOver @94 :Bool;  # the hand-over is active this frame
+  blendfulHandOverCorrection @95 :Float32;  # delivered correction c at the latch of the last hand-over, 1/m
+  blendfulHandOverTime @96 :Float32;  # s from the latch of the last hand-over until c reached 0 (counting while c != 0, then kept)
 
   enum TurnDirection {
     none @0;

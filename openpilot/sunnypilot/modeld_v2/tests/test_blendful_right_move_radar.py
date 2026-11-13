@@ -948,7 +948,7 @@ class TestReseedAndSwerveTrigger:
     ctl = BlendfulCorrection()
     y, psi, kc = 0.5, 0.0, 0.0
     buf = [0.0] * 4
-    reseeds, ys = 0, []
+    reseeds, ys, episodes, prev_reset = 0, [], 0, 0
     n, period, t0 = 6, 40.0, 30.0
     dip = patch_each_frame('quality_gate', lambda orig, obj: (lambda q: orig(0.0 if t0 <= obj._fixture_t < t0 + n * period
                                                                                and (obj._fixture_t - t0) % period < 0.4 else q)))
@@ -961,6 +961,9 @@ class TestReseedAndSwerveTrigger:
       dip(ctl, t)
       ctl.update(mo, v, True, k_model, LAT_T, MODE_RIGHT, inputs(gap_low=0.44, gap_high=0.44))
       reseeds += int(ctl.result.log['reseeded'])
+      mr = int(ctl.result.log['move_reset'])
+      episodes += int(mr != 0 and prev_reset == 0)  # a reset episode: a rising edge of the move-limit reset reasons
+      prev_reset = mr
       ys.append(y)
       buf.append(ctl.c + k_model)
       cmd = buf.pop(0)
@@ -972,13 +975,14 @@ class TestReseedAndSwerveTrigger:
     tt = np.arange(len(ys)) * DT_MDL
     before = [float(ys[np.argmin(abs(tt - (t0 + k * period - 0.1)))]) for k in range(n)]
     lows = [float(ys[(tt >= t0 + k * period) & (tt < t0 + (k + 1) * period)].min()) for k in range(n)]
-    TestReseedAndSwerveTrigger.jitter_rows = (before, lows, reseeds, float(y))
+    TestReseedAndSwerveTrigger.jitter_rows = (before, lows, reseeds, float(y), episodes)
     assert min(before) > 0.47 and before[-1] - before[0] > -0.02
     assert max(lows) - min(lows) < 0.03
     assert abs(y - 0.5) < 0.03
-    # at most one per reset; since rev 6.15 a frame with w = 0 is a reset too (a dip gives two reset episodes: the dip and the w = 0 frames
-    # of the re-entry), so the bound is 2 per dip plus the start
-    assert reseeds <= 2 * n + 2
+    # at most one re-seed per reset episode (rising edge of move_reset).  Here bit 6 (w = 0) never occurs alone (always with bit 0, a = 0);
+    # the extra episodes beyond the dips come from bit 2 (yield end) and bit 3 (right reference regained): each dip's false swerve cap
+    # (note above) ends in a yield end, which re-arms and re-seeds once the follow rule is gone (rev 6.15)
+    assert reseeds <= episodes
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -1090,26 +1094,51 @@ class TestClearanceYieldHold:
 # ---------------------------------------------------------------------------------------------------------------------------------
 # owner 13 Nov 09:27: once Keep Right's own swerve trigger has latched, hand the whole correction to the model's path
 class TestHandOverToTheModelPath:
-  def test_own_yield_releases_the_whole_correction_through_the_limiter(self):
+  """Owner 13 Nov 09:27: from the latch of Keep Right's own swerve trigger the WHOLE correction goes to 0 through the final limiter.  The
+  fixtures are chosen so that no cap rule can bring c to 0: the capped side is the other side than the correction's direction (a cap only
+  limits a correction toward the capped side), so only the hand-over does it."""
+  @staticmethod
+  def latched_run(side, no_hand_over=False):
     v = 50 / 3.6
     ctl = BlendfulCorrection()
-    for _ in range(int(30 / DT_MDL)):  # build a right-line correction on a straight road, car at the lane centre (open loop)
-      ctl.update(model_output(v, 0.0, 0.0, 0.0), v, True, 0.0, LAT_T, MODE_RIGHT, inputs(gap_low=0.44, gap_high=0.44))
+    # side +1: a rightward correction (gap 0.44 m: the right-hand position); side -1: a leftward one (gap 2.0 m puts the target left of
+    # the centre, car held 0.3 m right of the centre: Regular and the right-line correction pull left)
+    y0, gap = (0.0, 0.44) if side > 0 else (0.3, 2.0)
+    for _ in range(int(30 / DT_MDL)):  # open loop: the car held at y0
+      ctl.update(model_output(v, y0, 0.0, 0.0), v, True, 0.0, LAT_T, MODE_RIGHT, inputs(gap_low=gap, gap_high=gap))
     c_built = ctl.c
-    assert c_built > 1e-5  # a rightward correction exists
+    assert side * c_built > 1e-5
     orig = ctl.right.update
+    cap_side = br.SIDE_LEFT if side > 0 else br.SIDE_RIGHT  # the other side: no cap rule limits this correction
 
     def latched(*a, **kw):
       res = orig(*a, **kw)
-      res.own_yield, res.yield_active, res.no_growth = True, True, True
-      res.caps = {br.SIDE_RIGHT: 0.3}
+      res.own_yield, res.yield_active, res.no_growth = not no_hand_over, True, True  # no_hand_over: the same yield, not handed over
+      res.caps = {cap_side: 0.3}
       return res
     ctl.right.update = latched
-    cs = []
+    cs, flags = [], []
     for _ in range(int(5 / DT_MDL)):
-      ctl.update(model_output(v, 0.0, 0.0, 0.0), v, True, 0.0, LAT_T, MODE_RIGHT, inputs(gap_low=0.44, gap_high=0.44))
+      ctl.update(model_output(v, y0, 0.0, 0.0), v, True, 0.0, LAT_T, MODE_RIGHT, inputs(gap_low=gap, gap_high=gap))
       cs.append(ctl.c)
-      assert ctl.hand_over
-    cs = np.array(cs)
-    assert np.all(np.diff(cs) <= 1e-15)  # only falls, through the limiter (no step beyond its rates)
+      flags.append(ctl.hand_over)
+    return c_built, np.array(cs), flags, ctl
+
+  @pytest.mark.parametrize("side", [+1, -1])
+  def test_own_yield_releases_the_whole_correction_through_the_limiter(self, side):
+    c_built, cs, flags, ctl = self.latched_run(side)
+    assert all(flags)
+    assert np.all(side * np.diff(cs) <= 1e-15)  # only falls toward 0, through the limiter (no step beyond its rates)
     assert abs(cs[-1]) < 1e-12  # the whole correction (Keep Right's extra and Regular's part) reaches 0: the model's own path
+    # log: the correction at the latch and the time to reach 0
+    assert ctl.hand_over_c == pytest.approx(c_built)
+    t0 = (np.argmax(cs == 0.0) + 1) * DT_MDL
+    assert ctl.hand_over_time == pytest.approx(t0, abs=1e-9) and 0.0 < ctl.hand_over_time < 5.0
+
+  @pytest.mark.parametrize("side", [+1, -1])
+  def test_without_the_hand_over_the_correction_stays(self, side):
+    # the same yield and cap without the hand-over: the other-side cap does not bring c to 0, so the test above discriminates (with the
+    # hand-over line removed from the code it fails: results/2026-11-13_a8_first_push/FOLLOWUP.md)
+    _, cs, flags, _ = self.latched_run(side, no_hand_over=True)
+    assert not any(flags)
+    assert side * cs[-1] > 1e-5
