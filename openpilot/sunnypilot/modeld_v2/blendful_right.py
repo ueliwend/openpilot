@@ -1017,19 +1017,18 @@ class RightLineBlendful:
       car_trig = False
     else:
       # rev 7.1: the single detector (upstream's swerve test over 1.4-1.6 s with our own estimated move subtracted) replaces the endpoint gap
-      lane_k = 2.0 * float(np.polyfit(X_IDXS[win_ref], c_ctr[win_ref], 2)[0])
+      win_c = c_ctr[win_ref]
+      lane_k = 2.0 * float(np.polyfit(X_IDXS[win_ref], win_c, 2)[0]) if np.all(np.isfinite(win_c)) else 0.0  # review of rev 7.1: no LinAlgError
       q_y = self.detector.update(plan_x, plan_y, c_ctr, v, look, model_curvature, lane_k, p.c_delivered, p.lat_action_t, dt)
       dep = -self.detector.departure  # > 0: the path moved left of its usual place (obstacle on the right), as the side rule below reads it
       car_trig = self.detector.going_around
-      ref_trig = self.ref_yield_latch.update(self.ref_around(p))
-      # each trigger supplies its own side (B1): the endpoint gap from its departure (> 0: the plan moved left, obstacle on the right), the
-      # reference instance from its own offset - usual (> 0: its plan end moved right, obstacle on the left), the radar check the right
+      # owner 13 Nov 12:08 / 12:52: ONE path detector only; the reference instance's own going-around test is no longer a trigger for the
+      # mode (it still fades Regular's own share inside the reference instance, as upstream).  Each trigger supplies its own side (B1): the
+      # detector from its departure (> 0: the path moved left, obstacle on the right), the radar check the right
       side_gap = (SIDE_RIGHT if dep > 0 else SIDE_LEFT) if abs(dep) > SIDE_KNOWN else 0
-      side_ref = (SIDE_LEFT if p.ref_departure > 0 else SIDE_RIGHT) if abs(p.ref_departure) > SIDE_KNOWN else 0
       q_rc = clearance_q(rc.deficit, Q_NO_GROWTH, Q_CAP_START, Q_CAP_FULL)
       no_growth, yield_active, caps = self.yields.update([
         TriggerReport('swerve', bool(q_y >= Q_NO_GROWTH or car_trig), bool(car_trig), q_y, side_gap),
-        TriggerReport('reference', bool(ref_trig), bool(ref_trig), Q_CAP_FULL, side_ref),
         TriggerReport('radar_clearance', bool(rc.yield_active), bool(rc.yield_active), q_rc, SIDE_RIGHT),
       ])
     yield_ended = self.no_growth_prev and not no_growth
