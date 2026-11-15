@@ -548,7 +548,7 @@ class TestYieldCap:
     # rev 8: the model goes right (oncoming traffic); the detector scales Keep Right's strength down and hands over at its upper level.
     # Before the hand-over the leftward correction stays within the old pre-yield allowance (0.03 m/s^2; measured 0.022 m/s^2 in this open
     # loop at the rev 8 move speed); from the hand-over on it only falls back to 0 (the model's own path)
-    ctl, rows = swerve_run(-1)
+    ctl, rows = swerve_run(-1, depth=1.2)  # above the upper level (0.43 m at 47 km/h)
     first = next(r[6] for r in rows if r[7])
     assert min(r[0] for r in rows[first:]) >= min(rows[first - 1][0], 0.0) - 1e-12
     assert min(r[0] for r in rows[:first]) * 13.0 ** 2 >= -0.03
@@ -1112,7 +1112,7 @@ class TestYieldRules:
     q = []
     upper = br.detector_levels(13.0)[1]
     for i in range(300):
-      sw = 0.0 if i < 150 else min(0.8, 0.8 * (i - 150) * DT_MDL / 0.5)
+      sw = 0.0 if i < 150 else min(1.2, 1.2 * (i - 150) * DT_MDL / 0.5)  # above the upper level (0.43 m at 47 km/h)
       ctl.update(Scene(v=13.0, pr=0.0, plan=-sw).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
       lg = ctl.result.log
       q.append((lg['away_car'], lg['yield_source'], ctl.hand_over, lg['det_strength']))

@@ -12,10 +12,11 @@ the filtered references, the centre limit, the speed and the B2 motion inputs, n
   item 4: upper speed 120 km/h, was 100).
 - Rev 8 object filters (decision items 1a and 3), against the filtered right reference Y_R(x) when it is usable (quality above the strength's
   zero point); without a usable right reference every corridor object counts for both, as before rev 8:
-  inside = y <= Y_R(x) - 0.10 m (at least 10 cm inside the right line or edge); toward = the object's sideways ground speed toward the lane
-  (leftward), mean of the last 10 messages, yaw-compensated with the B2 motion model, >= TOWARD_LANE_SPEED (placeholder).
+  inside = y <= Y_R(x) - 0.10 m (at least 10 cm inside the right line or edge); toward = classified moving (radial test below) and the
+  object's sideways ground speed toward the lane (leftward), mean of the last 10 messages, yaw-compensated with the B2 motion model,
+  >= TOWARD_LANE_SPEED 1.0 m/s (a vehicle cut-in rule; a pedestrian or cyclist stepping sideways is classified standing and not seen).
 - Object bound (item 1): counts objects that are inside, not moving (the radial classification below; with a usable reference "inside" is
-  the own lane, so moving vehicles in it, e.g. the car ahead, are ignored) and confirmed for BOUND_CONFIRM_MESSAGES (placeholder) messages.
+  the own lane, so moving vehicles in it, e.g. the car ahead, are ignored) and confirmed for BOUND_CONFIRM_MESSAGES (20) messages.
   T_obj = min (y - w_R - m - dc) over them; never further left than the centre limit (floor: the lowest centre limit in the fit window,
   passed in); falls at once, rises after 1 s without a fall at the car's move speed (MOVE_SPEED of blendful_right, passed in as rise).
 - Clearance deficit (item 3) from the car's actual position: the car keeps its present offset from the centre limit along the lane, so its
@@ -38,15 +39,17 @@ from openpilot.common.realtime import DT_MDL
 
 RADAR_TO_MODEL_X = 1.52  # m, radar ahead of the model origin (radard.py:30; EST for the Inster)
 CONFIRM_MESSAGES = 6  # the clearance check (unchanged)
-# rev 8 item 1a: a longer confirmation before an object counts for the object bound.  PLACEHOLDER until Models, Data & Logs measure it
-# (decision item 7, "confirmation length"); provisional: twice the clearance check's 6 messages (0.6 s at the 20 Hz track rate, EST)
-BOUND_CONFIRM_MESSAGES_PLACEHOLDER = 12
+# rev 8 item 1a: a longer confirmation before an object counts for the object bound.  Measured (item 7; results/2026-11-15_rev8_constants
+# at adaea0f4): 20 consecutive messages (1.0 s at the 20 Hz track rate); standing objects counted inside the lane 7.4 -> 4.1 per km (LOG)
+BOUND_CONFIRM_MESSAGES = 20
 # rev 8 items 1a / 3 (owner 15 Nov 08:44 / 09:20): objects up to this far inside the right reference (posts on the line) and beyond it are
 # ignored (the clearance check counts them only when they move toward the lane)
 LINE_INSIDE = 0.10  # m
-# rev 8 item 3: an object moving sideways toward the lane at least this fast counts for the clearance deficit from outside too.  PLACEHOLDER
-# until measured from logs (item 7; radar lateral motion is noisy); provisional: the radial classification's MOVING_SPEED (1 m/s)
-TOWARD_LANE_SPEED_PLACEHOLDER = 1.0  # m/s
+# rev 8 item 3: an object moving sideways toward the lane at least this fast (mean of 10 messages) counts for the clearance deficit from
+# outside too, tested only while the radial moving classification holds.  Measured (item 7, adaea0f4): a vehicle cut-in rule only (11 of 12
+# cut-ins flagged before the line, 1.0 other flags per km; standing clutter cannot trigger it); it cannot see a pedestrian or cyclist
+# stepping sideways (no radial speed: classified standing)
+TOWARD_LANE_SPEED = 1.0  # m/s
 CONSISTENT_DIST, CONSISTENT_LAT = 1.0, 1.0  # m
 MEMORY_X, FORGET_X = 20.0, -3.3  # m: remembered when last seen nearer than this; forgotten 1 m behind the rear bumper
 CORRIDOR_TIME, CORRIDOR_MIN = 3.0, 15.0  # s, m
@@ -160,7 +163,7 @@ class ClearanceResult:
   margin: float = 0.0
   objects: int = 0  # confirmed objects in the corridor
   bound_objects: int = 0  # rev 8: of them the ones the object bound counts (inside, not moving, confirmed for the bound)
-  toward: int = 0  # rev 8: of them the ones moving sideways toward the lane (>= TOWARD_LANE_SPEED_PLACEHOLDER)
+  toward: int = 0  # rev 8: of them the ones moving sideways toward the lane (moving, >= TOWARD_LANE_SPEED)
   nearest_toward: float = 0.0  # rev 8: sideways speed toward the lane of the object with the largest deficit, m/s (log)
   memory: int = 0  # of them remembered beside the car
   moving: int = 0  # of them classified moving
@@ -290,11 +293,11 @@ class RadarClearance:
       res.popups += int(tr.popup)
       # rev 8 items 1a / 3: at least 10 cm inside the right reference (every object without a usable reference); moving toward the lane
       inside = y_ref is None or tr.y <= float(np.interp(xq, x_idxs, y_ref)) - LINE_INSIDE
-      toward = tr.toward_speed >= TOWARD_LANE_SPEED_PLACEHOLDER
+      toward = tr.moving and tr.toward_speed >= TOWARD_LANE_SPEED  # only on the moving vote (measurement adaea0f4)
       res.toward += int(toward)
       # object bound (item 1a): inside, not a moving vehicle in the own lane (with a usable reference "inside" is the own lane), confirmed
       # for the bound's longer confirmation
-      if inside and not (y_ref is not None and tr.moving) and tr.count >= BOUND_CONFIRM_MESSAGES_PLACEHOLDER:
+      if inside and not (y_ref is not None and tr.moving) and tr.count >= BOUND_CONFIRM_MESSAGES:
         res.bound_objects += 1
         t_raw = min(t_raw, tr.y - w_r - m - dc)
       # clearance deficit (item 3): from the car's actual position carried along the lane, P(x) = T_C'(x) - T_C'(0)

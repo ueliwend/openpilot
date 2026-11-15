@@ -76,12 +76,13 @@ SWERVE_YIELD = (0.2, 0.45)  # m, upstream Blendful's YIELD (blendful.py)
 # rev 8 item 2 (owner 15 Nov 09:11 / 09:41): the obstacle detector scales the strength target a* down continuously with its deviation (the
 # swerve value): factor 1 at or below the lower level, 0 at or above the upper level, linear between; the existing 1 s strength filter
 # smooths it.  The hand-over to the model's path latches at the upper level (strength 0 and hand-over at the same point).
-# PLACEHOLDERS until Models, Data & Logs measure them (item 7): lower = about the 90th percentile of the swerve value in normal driving, per
-# speed range; upper = their proposal from the same logs.  Provisional: upstream Blendful's own away fade band YIELD (0.2 m -> 0.45 m), the
-# same at every speed.  Per-speed values: one entry per speed in all three tuples (np.interp between them, constant beyond).
-DETECTOR_LEVEL_SPEEDS_PLACEHOLDER = (0.0,)  # m/s
-DETECTOR_LOWER_PLACEHOLDER = (SWERVE_YIELD[0],)  # m
-DETECTOR_UPPER_PLACEHOLDER = (SWERVE_YIELD[1],)  # m
+# Owner 15 Nov 10:53 (docs/decisions/2026-11-15.md, on the measurement inster-dev results/2026-11-15_rev8_constants at adaea0f4): the safer
+# side at all speeds: the scale-down starts at the 75th percentile of the normal deviation, strength zero and hand-over at the 95th.  Each
+# band's pair sits at its band centre, linear over speed between the centres, held outside them: <= 50 km/h band 18-50 km/h (the detector
+# runs from MIN_SPEED 18 km/h) -> 34 km/h; 50-80 km/h -> 65 km/h; 80-120 km/h -> 100 km/h (held above 120 km/h).  The 50-120 km/h lower
+# levels are interpolated from the measurement's time-above table (EST) until the exact p75 values are posted.
+# Rows: (band centre km/h, lower m, upper m).
+DETECTOR_LEVELS = ((34.0, 0.22, 0.55), (65.0, 0.07, 0.25), (100.0, 0.04, 0.14))
 # rev 8 items 1a / 3: a right reference with q_R above this (the strength's zero point, STRENGTH_Q[0]) is usable for the radar's line filters
 REF_USABLE_Q = 0.2
 # jumps (B5 table, C6)
@@ -289,9 +290,9 @@ def strength_from_confidence(q: float) -> float:
 
 
 def detector_levels(v: float) -> tuple[float, float]:
-  """rev 8 item 2: the detector's lower and upper level (m) at speed v (placeholders, see DETECTOR_*_PLACEHOLDER)."""
-  return (float(np.interp(v, DETECTOR_LEVEL_SPEEDS_PLACEHOLDER, DETECTOR_LOWER_PLACEHOLDER)),
-          float(np.interp(v, DETECTOR_LEVEL_SPEEDS_PLACEHOLDER, DETECTOR_UPPER_PLACEHOLDER)))
+  """rev 8 item 2: the detector's lower and upper level (m) at speed v (m/s), linear over speed between the band centres of DETECTOR_LEVELS."""
+  kmh = [r[0] / 3.6 for r in DETECTOR_LEVELS]
+  return (float(np.interp(v, kmh, [r[1] for r in DETECTOR_LEVELS])), float(np.interp(v, kmh, [r[2] for r in DETECTOR_LEVELS])))
 
 
 def detector_strength(swerve: float, lower: float, upper: float) -> float:

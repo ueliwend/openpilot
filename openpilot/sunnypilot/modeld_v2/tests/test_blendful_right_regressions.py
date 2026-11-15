@@ -84,7 +84,7 @@ class TestHandBackWindowCap:
     ctl = BlendfulCorrection()
     rows = []
     for i in range(switch_frame + 120):
-      sw = 0.0 if i < 200 else min(0.8, 0.8 * (i - 200) * DT_MDL / 0.5)
+      sw = 0.0 if i < 200 else min(1.2, 1.2 * (i - 200) * DT_MDL / 0.5)  # rev 8: above the upper level (0.43 m at 47 km/h)
       mode = MODE_RIGHT if i < switch_frame else MODE_REGULAR
       ctl.update(Scene(v=v, plan=-sw).model_output(), v, True, 0.0, LAT_T, mode, RightInputs())
       rows.append((ctl.c, ctl.release_window, ctl.right.a, ctl.hand_over))
