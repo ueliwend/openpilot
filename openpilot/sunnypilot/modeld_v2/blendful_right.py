@@ -73,6 +73,17 @@ FILTER_ROTATION_SCALE = "design"
 Q_NO_GROWTH, Q_CAP_START, Q_CAP_FULL = 0.1, 0.15, 0.2
 USUAL_TAU, USUAL_TAU_AROUND = 10.0, 20.0  # s
 SWERVE_YIELD = (0.2, 0.45)  # m, upstream Blendful's YIELD (blendful.py)
+# rev 8 item 2 (owner 15 Nov 09:11 / 09:41): the obstacle detector scales the strength target a* down continuously with its deviation (the
+# swerve value): factor 1 at or below the lower level, 0 at or above the upper level, linear between; the existing 1 s strength filter
+# smooths it.  The hand-over to the model's path latches at the upper level (strength 0 and hand-over at the same point).
+# PLACEHOLDERS until Models, Data & Logs measure them (item 7): lower = about the 90th percentile of the swerve value in normal driving, per
+# speed range; upper = their proposal from the same logs.  Provisional: upstream Blendful's own away fade band YIELD (0.2 m -> 0.45 m), the
+# same at every speed.  Per-speed values: one entry per speed in all three tuples (np.interp between them, constant beyond).
+DETECTOR_LEVEL_SPEEDS_PLACEHOLDER = (0.0,)  # m/s
+DETECTOR_LOWER_PLACEHOLDER = (SWERVE_YIELD[0],)  # m
+DETECTOR_UPPER_PLACEHOLDER = (SWERVE_YIELD[1],)  # m
+# rev 8 items 1a / 3: a right reference with q_R above this (the strength's zero point, STRENGTH_Q[0]) is usable for the radar's line filters
+REF_USABLE_Q = 0.2
 # jumps (B5 table, C6)
 JUMP_LINE, JUMP_EDGE, JUMP_FRAMES, JUMP_HOLD, JUMP_WEIGHT = 0.6, 1.2, 2, 2.0, 0.5  # m, m, frames, s, candidate weight
 # junctions (B7); all thresholds are EST start values, set on E1
@@ -84,7 +95,6 @@ WIDTH_TAU, WIDTH_STALE, WIDTH_REMEASURE = 10.0, 20.0, 2.0  # s
 # road class (B5 table, C4)
 ROAD_DWELL = 5.0  # s
 # yield trigger aggregation (B6 / C8; review B1, N10)
-SIDE_KNOWN = 0.1  # m: a trigger knows the obstacle side once its own departure exceeds this ("the side of the first departure > 0.1 m")
 SIDE_RIGHT, SIDE_LEFT = 1, -1
 BOTH_SIDES = (SIDE_RIGHT, SIDE_LEFT)
 LOG_SIDE_BOTH = 2  # log value of the yield side while both directions are capped
@@ -276,6 +286,17 @@ STRENGTH_Q = (0.2, 0.7)  # rev 7 (owner 13 Nov 11:59): strength 0 at a right-lin
 
 def strength_from_confidence(q: float) -> float:
   return float(np.clip((q - STRENGTH_Q[0]) / (STRENGTH_Q[1] - STRENGTH_Q[0]), 0.0, 1.0))
+
+
+def detector_levels(v: float) -> tuple[float, float]:
+  """rev 8 item 2: the detector's lower and upper level (m) at speed v (placeholders, see DETECTOR_*_PLACEHOLDER)."""
+  return (float(np.interp(v, DETECTOR_LEVEL_SPEEDS_PLACEHOLDER, DETECTOR_LOWER_PLACEHOLDER)),
+          float(np.interp(v, DETECTOR_LEVEL_SPEEDS_PLACEHOLDER, DETECTOR_UPPER_PLACEHOLDER)))
+
+
+def detector_strength(swerve: float, lower: float, upper: float) -> float:
+  """rev 8 item 2: factor on the strength target, 1 at swerve <= lower, 0 at swerve >= upper, linear between."""
+  return float(np.clip((upper - swerve) / max(upper - lower, 1e-6), 0.0, 1.0))
 
 
 class Authority:
@@ -545,7 +566,9 @@ class SwerveDetector:
       While lateral control is not engaged the estimate is frozen and usual is reset; at re-engagement both start again (fix 1, F1).
   Then upstream: usual = 10 s low-pass (20 s while going around), swerve = |offset - usual| - 0.25 |k| L^2 / 2,
   away = swerve - |(-centre_now - k y_own) - usual| (the car-departure term uses the car's position without our own move as well, otherwise
-  our move would count twice), latch on away > 0.2 (2 s after a turn), off at swerve < 0.1 or inside a curve.
+  our move would count twice), latch on away > the hand-over level (2 s after a turn), off at swerve < half of it or inside a curve.  Rev 8
+  item 2: the hand-over level is the detector's upper level (was upstream's 0.2 m, with the release at 0.1 m); the swerve value scales the
+  strength target (detector_strength) instead of the no-growth / cap rules.
   departure = offset - usual (> 0: the path moved right of its usual place: obstacle on the left)."""
   def __init__(self):
     self.reset()
@@ -589,7 +612,7 @@ class SwerveDetector:
 
   def update(self, plan_x: np.ndarray, plan_y: np.ndarray, centre: np.ndarray, v: float, look: float, model_curvature: float,
              lane_curvature: float, c: float, lat_action_t: float, dt: float, yr0: float = 0.0, sw0: float = 0.0,
-             lat_active: bool = True) -> float:
+             lat_active: bool = True, hand_over_level: float = SWERVE_YIELD[0]) -> float:
     xs = np.linspace(DETECT_WINDOW[0], DETECT_WINDOW[1], 5) * look / 1.5
     raw = float(np.mean(np.interp(xs, plan_x, plan_y) - np.interp(xs, X_IDXS, centre)))
     if lat_active and not self.lat_active_prev:  # re-engagement: the estimate and usual start again (fix 1, F1)
@@ -613,9 +636,9 @@ class SwerveDetector:
     self.since_turning = 0.0 if allow * 4 > 0.5 else self.since_turning + dt
     if inside_curve:
       self.going_around = False
-    elif self.away > SWERVE_YIELD[0] and self.since_turning > 2.0:
+    elif self.away > hand_over_level and self.since_turning > 2.0:
       self.going_around = True
-    elif self.swerve < SWERVE_YIELD[0] / 2:
+    elif self.swerve < hand_over_level / 2:
       self.going_around = False
     tau = USUAL_TAU_AROUND if self.going_around else USUAL_TAU
     self.usual += (self.offset - self.usual) * dt / (dt + tau)
@@ -777,7 +800,7 @@ class RightResult:
   yield_q: float = 0.0  # largest q of the capped sides (log)
   yield_side: int = 0  # log_side(caps): 0 none, +1 right, -1 left, 2 both
   episode: bool = False
-  own_yield: bool = False  # Keep Right's own swerve trigger (endpoint gap) has latched its yield this frame (owner 13 Nov 09:27)
+  own_yield: bool = False  # the obstacle detector's hand-over latch holds this frame (owner 13 Nov 09:27; rev 8: at the upper level)
   log: dict = field(default_factory=dict)
 
 
@@ -1012,6 +1035,7 @@ class RightLineBlendful:
     self.w_r_prev = w_r.copy()
     if src == 1:  # the endpoint gap on the right reference leaves the switch part out as well, so a line -> edge switch is no departure
       self.gap_rebase += float(np.interp(look, X_IDXS, switch_part))
+    det_lower, det_upper = detector_levels(v)
     if fading:  # lane change or v < 5 m/s: the detector state and the latches would compare the old lane with the new one (S2)
       self.reset_yields()
       q_y, no_growth, yield_active, caps = 0.0, False, False, {}
@@ -1021,32 +1045,26 @@ class RightLineBlendful:
       win_c = c_ctr[win_ref]
       lane_k = 2.0 * float(np.polyfit(X_IDXS[win_ref], win_c, 2)[0]) if np.all(np.isfinite(win_c)) else 0.0  # review of rev 7.1: no LinAlgError
       q_y = self.detector.update(plan_x, plan_y, c_ctr, v, look, model_curvature, lane_k, p.c_delivered, p.lat_action_t, dt,
-                                 yr0=float(y_r[0]), sw0=float(switch_part[0]), lat_active=p.lat_active)
-      dep = -self.detector.departure  # > 0: the path moved left of its usual place (obstacle on the right), as the side rule below reads it
+                                 yr0=float(y_r[0]), sw0=float(switch_part[0]), lat_active=p.lat_active, hand_over_level=det_upper)
       car_trig = self.detector.going_around
-      # owner 13 Nov 12:08 / 12:52: ONE path detector only; the reference instance's own going-around test is no longer a trigger for the
-      # mode (it still fades Regular's own share inside the reference instance, as upstream).  Each trigger supplies its own side (B1): the
-      # detector from its departure (> 0: the path moved left, obstacle on the right), the radar check the right
-      side_gap = (SIDE_RIGHT if dep > 0 else SIDE_LEFT) if abs(dep) > SIDE_KNOWN else 0
+      # rev 8 item 2: the detector is no yield trigger any more (no no-growth phase, no cap ramp, no side); it scales the strength target
+      # (f_det below) and its latch is the hand-over.  The radar clearance check is the only trigger of the no-growth / cap rules (kept)
       q_rc = clearance_q(rc.deficit, Q_NO_GROWTH, Q_CAP_START, Q_CAP_FULL)
       no_growth, yield_active, caps = self.yields.update([
-        TriggerReport('swerve', bool(q_y >= Q_NO_GROWTH or car_trig), bool(car_trig), q_y, side_gap),
         TriggerReport('radar_clearance', bool(rc.yield_active), bool(rc.yield_active), q_rc, SIDE_RIGHT),
       ])
     yield_ended = self.no_growth_prev and not no_growth
     self.no_growth_prev = no_growth
     q_eff = max(caps.values()) if caps else 0.0
     f_yl = 0.0 if (yield_active and SIDE_RIGHT in caps) else 1.0
-    f_yr = float(np.interp(caps[SIDE_LEFT], (0.2, 0.45), (1.0, 0.0))) if (yield_active and SIDE_LEFT in caps) else 1.0
+    f_det = detector_strength(q_y, det_lower, det_upper)  # rev 8 item 2 (1 while fading: q_y = 0)
     # --- authority (B5)
     qa = strength_from_confidence(q_R)  # rev 7: replaces the confidence gate's on / off curve (ConfGate kept for the reference selection)
     a_star = float(qa)
     f_ep = 0.0 if jn_active else 1.0
-    a_star *= f_bend_t * f_jump_t * f_plaus_t * self.f_blink * f_yl * f_ep * f_radar
+    a_star *= f_bend_t * f_jump_t * f_plaus_t * self.f_blink * f_yl * f_ep * f_radar * f_det
     if force_regular or fading:
       a_star = 0.0
-    if q_y >= Q_NO_GROWTH:
-      a_star = min(a_star, self.authority.a)  # no growth of the strength while a trigger asks for no growth
     a = self.authority.update(a_star, dt)
     # --- step 4: limits from the current references, not rate-limited: the left limit, the object bound (B6a), the right safety bounds
     t_left = np.maximum(t_lim, c_ctr)
@@ -1062,7 +1080,7 @@ class RightLineBlendful:
     w_c = float(np.interp(abs(model_curvature) * v ** 2, [0.18, 0.53], [STRENGTH_RIGHT_ONLY, 1.0])) if self.strength_rising else STRENGTH_RIGHT_ONLY
     s_r = 1.0 - (1.0 - l_q) * (1.0 - w_c * q_R)
     present = qa > 0.0
-    w_rl = a * s_r * f_yr
+    w_rl = a * s_r
     # fix 1 review S1: lateral control back on after more than 1 s off is a creation of the move limiter (start at the car, U = 0, as at
     # start-up), so the kept approach is not applied at once at re-engagement
     if p.lat_active:
@@ -1081,7 +1099,6 @@ class RightLineBlendful:
     target = self.safety_bounds(t_rl, t_bound_line, t_bound_edge, w_e)  # T_RL <= T4 already holds the object bound and the bounds
     # --- correction (B4)
     d_rl, k0_rl, k_fit, d_clipped = self._correction(target, plan_x, plan_y, v, s_r)
-    k0_rl *= f_yr
     # delivered correction (rev 6.10, "Start and floor"): while T_RL lies left of the centre limit (at x = L) and no safety or object bound
     # binds, the right-line share is the larger of Regular's and the right-line correction in the rightward sense, else the right-line one
     # Deviation (round 4 open point): also while the car itself is left of the centre limit, so that the right-line share cannot drop
@@ -1113,10 +1130,11 @@ class RightLineBlendful:
     mv = self.move
     log = {
       'applied': a > 0.0, 'gap': g, 'gap_now': gap_now, 'q_R': q_R, 'q_L': q_L, 'a': a, 'a_star': a_star,
-      'f_bend': f_bend_t, 'f_yl': f_yl, 'f_yr': f_yr, 'f_jump': f_jump_t, 'f_plaus': f_plaus_t, 'f_blink': self.f_blink, 'f_radar': f_radar,
+      'f_bend': f_bend_t, 'f_yl': f_yl, 'f_yr': 1.0, 'f_jump': f_jump_t, 'f_plaus': f_plaus_t, 'f_blink': self.f_blink, 'f_radar': f_radar,
       'away_car': q_y, 'det_offset': self.detector.offset, 'det_usual': self.detector.usual or 0.0, 'det_own': self.detector.y_own,
       'det_away': self.detector.away, 'a_star_q': qa, 's_r': s_r, 'w_c': w_c, 'right_only': right_only,
-      'curve_accel': abs(model_curvature) * v ** 2, 'yield_active': yield_active, 'bound_active': bound_active,
+      'curve_accel': abs(model_curvature) * v ** 2, 'yield_active': yield_active or car_trig, 'bound_active': bound_active,
+      'det_strength': f_det, 'det_levels': (det_lower, det_upper),
       'k_rl': k0_rl, 'weights': (wts.w_rl, wts.w_up), 'l_c': profile_length(max(v, 1.0)), 'd': d_rl, 'd_clipped': d_clipped, 'filter_ms': t_filter,
       'filtered': np.concatenate([[np.interp(xq, X_IDXS, f) for xq in (0.0, 0.5 * look, look, 1.5 * look)] for f in filt]),
       'raw': np.concatenate([[np.interp(xq, X_IDXS, r_) for xq in (0.0, 0.5 * look, look, 1.5 * look)] for r_ in raw]),
@@ -1140,8 +1158,8 @@ class RightLineBlendful:
       'move_reset': sum(int(r_) << i for i, r_ in enumerate(reasons)), 'switch_part': float(np.interp(iL, X_IDXS, switch_part)),
       'move_limiting': mv.limiting, 'rotation_scale': ROTATION_SCALES.index(self.rotation_scale), 'radar': rc,
     }
-    return RightResult(k0=float(k0), fading=fading, yield_active=yield_active, no_growth=no_growth, caps=caps, yield_q=float(q_eff),
-                       own_yield=bool(car_trig and yield_active),
+    return RightResult(k0=float(k0), fading=fading, yield_active=yield_active or car_trig, no_growth=no_growth, caps=caps,
+                       yield_q=float(q_eff), own_yield=bool(car_trig),
                        yield_side=log_side(caps), episode=in_episode, log=log)
 
   @staticmethod
@@ -1248,8 +1266,9 @@ class BlendfulCorrection:
       self.right.episodes.reset()
     self.mode = mode
     # the right-line instance runs in Right line, and in Regular while its share a is still handed back or its yield phase still runs, so
-    # the yield cap acts in the hand-back window for as long as the yield lasts (B2)
-    right_runs = mode == MODE_RIGHT or (mode == MODE_REGULAR and (self.right.a > 0.0 or self.right.yields.phase))
+    # the yield cap acts in the hand-back window for as long as the yield lasts (B2); rev 8: also while its hand-over holds (before rev 8
+    # the detector's no-growth phase, which lasted at least as long as the latch, kept it running)
+    right_runs = mode == MODE_RIGHT or (mode == MODE_REGULAR and (self.right.a > 0.0 or self.right.yields.phase or self.hand_over))
     if right_runs:
       valid = finite_model_inputs(mo, v_ego, model_curvature, lat_action_t, p.gap_low, p.gap_high, p.c_set, p.c_applied, p.frame_dt)
     else:
