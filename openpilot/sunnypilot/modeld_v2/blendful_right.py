@@ -73,9 +73,10 @@ FILTER_ROTATION_SCALE = "design"
 Q_NO_GROWTH, Q_CAP_START, Q_CAP_FULL = 0.1, 0.15, 0.2
 USUAL_TAU, USUAL_TAU_AROUND = 10.0, 20.0  # s
 SWERVE_YIELD = (0.2, 0.45)  # m, upstream Blendful's YIELD (blendful.py)
-# rev 8 item 2 (owner 15 Nov 09:11 / 09:41): the obstacle detector scales the strength target a* down continuously with its deviation (the
-# swerve value): factor 1 at or below the lower level, 0 at or above the upper level, linear between; the existing 1 s strength filter
-# smooths it.  The hand-over to the model's path latches at the upper level (strength 0 and hand-over at the same point).
+# rev 8 item 2 (owner 15 Nov 09:11 / 09:41): the obstacle detector scales Keep Right's strength down continuously with its deviation (the
+# swerve value): factor 1 at or below the lower level, 0 at or above the upper level, linear between, smoothed by a 1 s low-pass like the
+# strength.  Review B1 (owner 13 Nov 09:27 / 11:23: hand over to the model's path, not to Blendful): the filtered factor multiplies the WHOLE
+# delivered correction in Right line, so the scale-down goes to the model's own path and factor 0 = correction 0 = the hand-over level.
 # Owner 15 Nov 10:53 (docs/decisions/2026-11-15.md, on the measurement inster-dev results/2026-11-15_rev8_constants at adaea0f4): the safer
 # side at all speeds: the scale-down starts at the 75th percentile of the normal deviation, strength zero and hand-over at the 95th.  Each
 # band's pair sits at its band centre, linear over speed between the centres, held outside them: <= 50 km/h band 18-50 km/h (the detector
@@ -816,6 +817,9 @@ class RightLineBlendful:
 
   def reset(self):
     self.authority = Authority()
+    # rev 8 review B1: the detector factor's own 1 s low-pass (same filter as the strength), starting at 1 (no scale-down)
+    self.det_gain = Authority()
+    self.det_gain.a = 1.0
     self.episodes = JunctionEpisodes()
     self.road = RoadClass()
     self.bend_active = Timed(off_time=1.0)
@@ -1054,7 +1058,8 @@ class RightLineBlendful:
                                  yr0=float(y_r[0]), sw0=float(switch_part[0]), lat_active=p.lat_active, hand_over_level=det_upper)
       car_trig = self.detector.going_around
       # rev 8 item 2: the detector is no yield trigger any more (no no-growth phase, no cap ramp, no side); it scales the strength target
-      # (f_det below) and its latch is the hand-over.  The radar clearance check is the only trigger of the no-growth / cap rules (kept)
+      # (f_det below, on the whole correction) and its latch is the hand-over.  The radar clearance check is the only trigger of the
+      # no-growth / cap rules (kept)
       q_rc = clearance_q(rc.deficit, Q_NO_GROWTH, Q_CAP_START, Q_CAP_FULL)
       no_growth, yield_active, caps = self.yields.update([
         TriggerReport('radar_clearance', bool(rc.yield_active), bool(rc.yield_active), q_rc, SIDE_RIGHT),
@@ -1068,10 +1073,15 @@ class RightLineBlendful:
     qa = strength_from_confidence(q_R)  # rev 7: replaces the confidence gate's on / off curve (ConfGate kept for the reference selection)
     a_star = float(qa)
     f_ep = 0.0 if jn_active else 1.0
-    a_star *= f_bend_t * f_jump_t * f_plaus_t * self.f_blink * f_yl * f_ep * f_radar * f_det
+    a_star *= f_bend_t * f_jump_t * f_plaus_t * self.f_blink * f_yl * f_ep * f_radar  # these factors hand back to Regular
     if force_regular or fading:
       a_star = 0.0
     a = self.authority.update(a_star, dt)
+    # rev 8 review B1 (owner 13 Nov 09:27 "hand directly to the normal path, not to blendful", 11:23 no fall-back to Regular there): the
+    # detector's scale-down goes to the model's own path like the hand-over, not into a (which would hand the share to Regular's centring
+    # pull): in Right line the WHOLE delivered correction (Keep Right's and Regular's part) is multiplied by the detector factor through its
+    # own 1 s low-pass (Keep Right's effective strength a g_det), so factor 0 = correction 0 = the hand-over level
+    g_det = self.det_gain.update(f_det, dt)
     # --- step 4: limits from the current references, not rate-limited: the left limit, the object bound (B6a), the right safety bounds
     t_left = np.maximum(t_lim, c_ctr)
     t_obj = c_ctr if rc.right_blindspot else np.full(NX, rc.t_obj)  # rightBlindspot: no right-line shift
@@ -1124,6 +1134,8 @@ class RightLineBlendful:
     authority_limited = self.regular_right_t > AUTHORITY_LIMITED_TIME
     wts = junction_policy(in_episode, a, right_line_mode=not force_regular)
     k0 = wts.w_rl * k_r + wts.w_up * k0_up
+    if not force_regular:  # Right line only; the Regular hand-back window stays Regular's (Q10)
+      k0 *= g_det
     if fading:
       k0 = 0.0
     right_only = bool(q_R > 0.5 and l_q < 0.3)
@@ -1138,7 +1150,7 @@ class RightLineBlendful:
       'away_car': q_y, 'det_offset': self.detector.offset, 'det_usual': self.detector.usual or 0.0, 'det_own': self.detector.y_own,
       'det_away': self.detector.away, 'a_star_q': qa, 's_r': s_r, 'w_c': w_c, 'right_only': right_only,
       'curve_accel': abs(model_curvature) * v ** 2, 'yield_active': yield_active or car_trig, 'bound_active': bound_active,
-      'det_strength': f_det, 'det_levels': (det_lower, det_upper),
+      'det_strength': f_det, 'det_levels': (det_lower, det_upper), 'det_gain': g_det,
       'k_rl': k0_rl, 'weights': (wts.w_rl, wts.w_up), 'l_c': profile_length(max(v, 1.0)), 'd': d_rl, 'd_clipped': d_clipped, 'filter_ms': t_filter,
       'filtered': np.concatenate([[np.interp(xq, X_IDXS, f) for xq in (0.0, 0.5 * look, look, 1.5 * look)] for f in filt]),
       'raw': np.concatenate([[np.interp(xq, X_IDXS, r_) for xq in (0.0, 0.5 * look, look, 1.5 * look)] for r_ in raw]),
@@ -1417,6 +1429,7 @@ def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
   builder.blendfulDetectorOwnMove = float(lg['det_own'])
   builder.blendfulDetectorAway = float(lg['det_away'])
   builder.blendfulDetectorStrength = float(lg['det_strength'])
+  builder.blendfulDetectorGain = float(lg['det_gain'])
   builder.blendfulAuthorityLimited = bool(lg['authority_limited'])
   builder.blendfulDeliveredSource = int(lg['delivered'])
   builder.blendfulTargetMinusCentre = float(lg['trl_minus_centre'])

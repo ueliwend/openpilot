@@ -291,20 +291,19 @@ def closed_loop(v, scene, seconds=45.0, gap=0.44, regular_s=5.0, y0=0.0, referen
 
 
 SPEEDS = (30, 50, 80)
-# rev 8 open question (results/2026-11-15_a8_rev8/RESULT.md): in the heading-keeping loop the model does not pull back (rho 0); at the 0.2 m/s
-# move the own-move estimate (rho_hat 0.7: 30 % subtracted) leaves up to 0.33-0.37 m of our own move in the swerve value, far above the
-# owner's lower levels at speed (0.16 m at 47 km/h, 0.06 m at 80 km/h): the strength is scaled down during our own move and the car weaves
-# back toward the centre (up to 0.4 m, settling after 40-100 s at 80-120 km/h) before it rests at +0.5 m.  These cases are expected to fail
-# until it is resolved (strict: a fix shows up as XPASS)
-OWN_MOVE_LEAK = pytest.mark.xfail(strict=True, reason="rev 8 open question: own-move leak into the detector at 0.2 m/s with rho 0 (RESULT.md)")
+# rev 8, review S2: the 0.2 m/s move itself (owner's move speed) in this rho 0 loop: overshoot 0.046-0.050 m (> 0.04 m) and settling
+# 1.12-1.18 cm (> 1 cm), also with the detector out of reach (RESULT.md).  Expected to fail until the move or the bounds are revisited
+# (strict: a change shows up as XPASS).  The own-move-leak cases of 7d12d78fe pass since the review-B1 fix (detector factor on the whole
+# correction).
+MOVE_SPEED_DYNAMICS = pytest.mark.xfail(strict=True, reason="rev 8: overshoot / settling of the 0.2 m/s move in the rho 0 loop (RESULT.md)")
 
 
-def leak_speeds(*leaking):
-  return [pytest.param(k, marks=OWN_MOVE_LEAK) if k in leaking else k for k in SPEEDS]
+def move_speeds(*failing):
+  return [pytest.param(k, marks=MOVE_SPEED_DYNAMICS) if k in failing else k for k in SPEEDS]
 
 
 class TestClosedLoop:
-  @pytest.mark.parametrize("kmh", leak_speeds(50, 80))
+  @pytest.mark.parametrize("kmh", move_speeds(30, 50))
   def test_step_of_half_a_metre(self, kmh):
     t, y, vs, _, _ = closed_loop(kmh / 3.6, lambda t: {})
     final = 1.75 - br.W_R - 0.44  # 0.5 m right of the centre
@@ -320,15 +319,14 @@ class TestClosedLoop:
     assert y.max() - final < 0.04  # overshoot (rev 8 at 0.2 m/s: 0.027-0.034 m; rev 7.2 at 0.042 m/s: about 2.5 %, reported)
     assert np.abs(y[arr + int(20 / DT_MDL):] - final).max() < 0.01
 
-  @OWN_MOVE_LEAK
-  @pytest.mark.parametrize("kmh", SPEEDS)
+  @pytest.mark.parametrize("kmh", move_speeds(50, 80))
   def test_step_settles_within_1_cm_5_s_after_arrival(self, kmh):
     t, y, vs, _, _ = closed_loop(kmh / 3.6, lambda t: {})
     final = 1.75 - br.W_R - 0.44
     arr = int(np.argmax(y >= 0.9 * final))
     assert np.abs(y[arr + int(5 / DT_MDL):] - final).max() < 0.01
 
-  @pytest.mark.parametrize("kmh", leak_speeds(50, 80))
+  @pytest.mark.parametrize("kmh", SPEEDS)
   def test_right_reference_switch_line_to_edge_through_the_weights(self, kmh):
     # 5 s into the move the inner right line (1.75) fades over 1 s and the edge (2.15, counted 2.05) takes over.  Without the switch part
     # in G0 the switch would add its own speed to the move (check 20b); rev 8: the car stays within the move speed + 0.02 m/s
@@ -655,13 +653,13 @@ class TestStartAndFloor:
   """Scene tests in the heading-keeping loop.  Rev 7: the unweighted approach grows at r_ref and after a drop-out or a Regular phase the
   correction returns at the strength filter's pace, so the old own-move criterion (<= 0.052 m/s) no longer applies; rev 8: r_ref is the move
   speed 0.2 m/s.  Asserted: no hand-over, the end positions, never further left than Regular, and a bound on the speed."""
-  @pytest.mark.parametrize("kmh", leak_speeds(80))
+  @pytest.mark.parametrize("kmh", SPEEDS)
   def test_plain_move(self, kmh):
     t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'plain', seconds=50.0)
     assert own_move_peak(t, y, vs, tg, tc) <= MOVE_SANITY and right_of_centre_peak(t, y, vs) <= MOVE_SANITY
     assert abs(y[-1] - 0.5) < 0.01 and not scene_loop.extra['hand_over'].any()
 
-  @pytest.mark.parametrize("kmh", leak_speeds(80))
+  @pytest.mark.parametrize("kmh", SPEEDS)
   def test_return_from_left_of_the_centre(self, kmh):
     t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'return', seconds=50.0)
     tr, yr, vr, *_ = scene_loop(kmh, 'return', seconds=50.0, regular=True)
@@ -698,14 +696,14 @@ class TestStartAndFloor:
     if kmh == 50:
       assert ex['authority_limited'][-1] == 1.0
 
-  @pytest.mark.parametrize("kmh", leak_speeds(80))
+  @pytest.mark.parametrize("kmh", SPEEDS)
   def test_reset_right_of_the_centre_with_mode_toggling_does_not_pull_back(self, kmh):
     # Regular's phases move the car toward the centre; a reset never pulls it further back than Regular alone does
     t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'toggle', seconds=70.0)
     tr, yr, vr, *_ = scene_loop(kmh, 'toggle', seconds=70.0, regular=True)
     assert y[t >= 0].min() >= yr[tr >= 0].min() - 0.01 and abs(y[-1] - 0.5) < 0.01  # (8 mm more in this loop: phase of the toggles)
 
-  @pytest.mark.parametrize("kmh", leak_speeds(80))
+  @pytest.mark.parametrize("kmh", SPEEDS)
   @pytest.mark.parametrize("scene", ['toggle', 'flicker'])
   def test_mode_toggling_and_quality_flicker(self, kmh, scene):
     # Right line <-> Regular every 2 s, or the right-line probability 0.45 +- 0.3 at 1 Hz, from the right-hand position: no hand-over, the car
@@ -1117,7 +1115,7 @@ class TestHandOverToTheModelPath:
 # rev 8 (owner's decisions of 15 Nov 2026, inster-dev results/2026-11-15_a8_rev8/DESIGN.md): each test below fails on rev 7.2 (8924142)
 class TestRev8MoveSpeed:
   """Item 5: one sideways move speed, 0.2 m/s, for the car's move and the radar bound's release."""
-  @pytest.mark.parametrize("kmh", leak_speeds(80))
+  @pytest.mark.parametrize("kmh", SPEEDS)
   def test_first_engagement_moves_at_the_move_speed(self, kmh):
     t, y, vs, tg, tc, src, fol = scene_loop(kmh, 'plain', seconds=20.0)
     on = t >= 0
@@ -1263,27 +1261,28 @@ class TestRev8Detector:
     for _ in range(frames):
       ctl.update(Scene(v=self.V).model_output(), self.V, True, 0.0, LAT_T, MODE_RIGHT, inputs())
       lg = ctl.result.log
-      out.append((lg['a'], lg['a_star'], lg['a_star_q'], ctl.result.no_growth, ctl.cap_active))
+      out.append((lg['det_gain'], lg['det_strength'], lg['a'], ctl.result.no_growth, ctl.cap_active))
     return np.array(out, dtype=float)
 
   def test_no_freeze_below_the_lower_level(self, monkeypatch):
     # swerve 0.15 m from the first frame (rev 7.2: no growth of the strength from 0.1 m, a stays 0)
     self.patch(monkeypatch, lambda i: 0.15)
     r = self.run(100)
-    assert r[-1, 0] > 0.95 and not r[:, 3].any() and not r[:, 4].any()
+    assert r[-1, 2] > 0.95 and np.all(r[:, 0] == 1.0) and not r[:, 3].any() and not r[:, 4].any()
 
   def test_strength_target_scales_linearly_between_the_levels_through_the_1_s_filter(self, monkeypatch):
+    # the factor is linear between the levels and reaches the correction through its own 1 s low-pass (review B1: on the whole correction,
+    # Keep Right's effective strength a x gain); a itself is not lowered by the detector (that would hand the share to Regular)
     lo, up = br.detector_levels(self.V)
     sched = [0.0] * 120 + [lo + 0.25 * (up - lo)] * 60 + [lo + 0.5 * (up - lo)] * 100 + [up + 0.1] * 60
     self.patch(monkeypatch, lambda i: sched[min(i, len(sched) - 1)])
     r = self.run(len(sched))
     for i0, f in ((120, 0.75), (180, 0.5), (280, 0.0)):
-      seg = r[i0 + 1:i0 + 60]
-      assert np.allclose(seg[:, 1], f * seg[:, 2], atol=1e-9)  # a* = a*_q x factor
-    a0 = r[179, 0]
+      assert np.allclose(r[i0 + 1:i0 + 60, 1], f, atol=1e-9)
+    g0 = r[179, 0]
     k = DT_MDL / (DT_MDL + br.STRENGTH_TAU)
-    expect = 0.5 + (a0 - 0.5) * (1 - k) ** 20  # 1 s of the first-order filter toward 0.5
-    assert r[199, 0] == pytest.approx(expect, abs=1e-6)
+    assert r[199, 0] == pytest.approx(0.5 + (g0 - 0.5) * (1 - k) ** 20, abs=1e-6)  # 1 s of the first-order filter toward 0.5
+    assert np.all(np.diff(r[100:, 2]) >= -1e-12) and r[-1, 2] == 1.0  # a keeps rising: the scale-down is not a hand-back to Regular
     assert not r[:, 3].any()  # no no-growth phase from the detector
 
   def test_detector_strength_and_the_provisional_levels(self):
@@ -1318,3 +1317,47 @@ def test_rev8_safety_limits_unchanged():
   # guard (passes on rev 7.2 too): the final limiter, the right safety bounds and the fit clips are those of rev 7.2
   assert (br.BUILD, br.RELEASE, br.FADING_RELEASE, br.SWERVE_RELEASE) == (0.5, 2.0, 0.5, 5.0)
   assert (br.LINE_BOUND, br.EDGE_BOUND, br.D_MAX, br.ERROR_CLIP, br.W_R) == (0.2, 0.3, 1.0, 1.0, 0.81)
+
+
+class TestRev8DetectorToTheModelPath:
+  """Review B1 (owner 13 Nov 09:27 / 11:23): while the detector scales Keep Right down, the car goes to the model's own path, not to Regular's
+  centring pull: in Right line the whole delivered correction is multiplied by the detector factor through its own 1 s low-pass."""
+  @pytest.mark.parametrize("kmh,amp", [(50, 0.25), (50, 0.4), (80, 0.25), (80, 0.4)])
+  @pytest.mark.parametrize("rho", [0.3, 0.6])
+  def test_obstacle_on_the_left_the_car_never_moves_toward_it(self, kmh, amp, rho):
+    # held position, then the model evades an obstacle on the LEFT (plan moves right by amp over 1 s): the car never moves left
+    # (7d12d78fe: up to 0.33 m toward the obstacle; the factor on the whole correction with a also lowered: 0.045 / 0.066 m at rho 0.6, 0.25 m)
+    r = pullback_loop(rho, kmh, seconds=68.0, swerve_at=60.0, sw_amp=-amp)
+    y60 = r[int(round(60.0 / DT_MDL)), 1]
+    assert y60 - r[r[:, 0] >= 60.0, 1].min() <= 1e-3
+
+  @staticmethod
+  def run(mode, swerve):
+    ctl = BlendfulCorrection()
+    cs, ups = [], []
+    for _ in range(200):
+      ctl.update(Scene(v=13.0, center=0.3).model_output(), 13.0, True, 0.0, LAT_T, mode, inputs())  # the car 0.3 m left: Regular pulls
+      cs.append(ctl.c)
+      ups.append(ctl.k_up)
+    return np.array(cs), np.array(ups), ctl
+
+  def test_factor_zero_is_correction_zero_in_right_line_and_regular_is_untouched(self, monkeypatch):
+    up = br.detector_levels(13.0)[1]
+    TestRev8Detector.patch(monkeypatch, lambda i: up + 0.1)  # strength factor 0, no latch (the fake never latches)
+    cs, ups, ctl = self.run(MODE_RIGHT, up + 0.1)
+    assert abs(ups[-1]) > 1e-5 and abs(cs[-1]) < 1e-12 and ctl.result.log['det_gain'] == 0.0 and not ctl.hand_over
+    TestRev8Detector.patch(monkeypatch, lambda i: up + 0.1)
+    cr, upr, _ = self.run(MODE_REGULAR, up + 0.1)  # Regular mode: the instance does not run (a = 0), Regular's add-on unchanged
+    assert abs(cr[-1] - upr[-1]) < 1e-9 and abs(cr[-1]) > 1e-5
+
+  def test_the_factor_reaches_the_correction_through_a_1_s_low_pass(self, monkeypatch):
+    lo, up = br.detector_levels(13.0)
+    sched = [0.0] * 100 + [(lo + up) / 2] * 100
+    TestRev8Detector.patch(monkeypatch, lambda i: sched[min(i, len(sched) - 1)])
+    ctl = BlendfulCorrection()
+    gs = []
+    for _ in range(200):
+      ctl.update(Scene(v=13.0).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, inputs())
+      gs.append(ctl.result.log['det_gain'])
+    k = DT_MDL / (DT_MDL + br.STRENGTH_TAU)
+    assert gs[99] == 1.0 and gs[119] == pytest.approx(0.5 + 0.5 * (1 - k) ** 20, abs=1e-9)
