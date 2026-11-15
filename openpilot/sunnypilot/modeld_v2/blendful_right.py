@@ -36,7 +36,7 @@ MODE_OFF, MODE_REGULAR, MODE_RIGHT = 0, 1, 2
 W_R = 0.81  # m, rear outer wheel edge from the car centreline
 L_D = 1.95  # m, device ahead of the no-slip point
 EDGE_EXTRA = 0.1  # m, a road edge counts this much further in than a line (owner 16:55)
-GAP_SPEEDS = (50 / 3.6, 100 / 3.6)  # m/s, the gap is gap_low at and below 50 km/h, gap_high from 100 km/h
+GAP_SPEEDS = (50 / 3.6, 120 / 3.6)  # m/s, the gap is gap_low at and below 50 km/h, gap_high from 120 km/h (rev 8 item 4; was 100 km/h)
 LINE_BOUND = 0.2  # m, rear wheel stays this far from the right line (plus off-tracking)
 EDGE_BOUND = 0.3  # m, same for a clear right edge
 # measurement filter (B2)
@@ -58,10 +58,10 @@ BUILD, RELEASE, FADING_RELEASE, SWERVE_RELEASE = 0.5, 2.0, 0.5, 5.0  # m/s^3, fi
 TARGET_RATE = 0.25  # m/s, both directions (rev 6.3: the speed of moves to the right is set by the final move-speed limit)
 LAG_BOUND, LAG_RATE = 1.0, 0.5  # m, m/s: where the target lags its raw value by more, that point moves at LAG_RATE (still glide-limited)
 RESEED_LOOKAHEADS = 2.0  # points beyond 2 L take T_raw every frame (rev 6.4)
-# final move-speed limit (B5 step 4b, rev 6.5 / 6.7; owner 21:44 question 9): the car moves at <= 0.05 m/s; the means is the reference
-# rate r_ref, the rate at which the approach to the right reference may grow (start value 0.042 m/s, rev 6.7; final value from the kit)
-REFERENCE_RATE = 0.042  # m/s, r_ref
-CAR_MOVE_SPEED = 0.05  # m/s, the decided move speed of the car (r_ref is set so that the car stays below it)
+# final move-speed limit (B5 step 4b, rev 6.5 / 6.7): the approach to the right reference grows at this rate.  Rev 8 item 5 (owner 15 Nov
+# 09:27 / 09:13): ONE fixed sideways speed for the car's move and the radar object bound's release (radar_clearance, passed in as rise);
+# replaces r_ref 0.042 m/s and the 0.05 m/s car move speed
+MOVE_SPEED = 0.2  # m/s
 CAR_LEFT_HYST = 0.02  # m, hysteresis of 'car left of the centre' for the larger-of rule (rev 6.12, R4-S2)
 AUTHORITY_LIMITED_TIME = 2.0  # s: Regular delivered while T_RL is right of the centre this long -> 'authority-limited' (C611-2)
 # measurement-filter rotation lever (B2, rev 6.3): "design" = lever x (scale 1, default); "model_axis" = lever x vEgo / v_x(0)
@@ -271,10 +271,10 @@ class MoveSpeedLimit:
     keeps U (G continuous); rev 7: the unweighted U grows by <= r_ref dt; only the limiter's creation resets."""
     self.g0 = np.maximum(self.g0, g4)
     u_want = self.g0 - g4
-    # rev 7 (owner 13 Nov 11:15-12:19, one continuous controller): only the growth of the UNWEIGHTED approach U is limited (<= r_ref dt per
-    # frame, r_ref a placeholder until measured); U is kept while the weight w falls and when it rises again, so after a drop-out the
+    # rev 7 (owner 13 Nov 11:15-12:19, one continuous controller): only the growth of the UNWEIGHTED approach U is limited (<= MOVE_SPEED dt
+    # per frame, rev 8 item 5); U is kept while the weight w falls and when it rises again, so after a drop-out the
     # correction returns at the strength filter's pace, not with a restarted slow move.  A decrease passes at once.
-    self.u = np.minimum(u_want, self.u + REFERENCE_RATE * dt)
+    self.u = np.minimum(u_want, self.u + MOVE_SPEED * dt)
     self.limiting = bool(np.any(self.u < u_want - 1e-9))
     self.a_lim = w * self.u
     return y_r - (self.g0 - self.u)
@@ -1017,9 +1017,14 @@ class RightLineBlendful:
     t_raw = np.maximum(t_r_line, c_ctr)
     t_lim = self.ground.update(t_raw, vx0, yaw_rate, dt, scale, reseed_x=RESEED_LOOKAHEADS * look)
     lag_L = float(np.interp(iL, X_IDXS, self.ground.lag))
-    # --- radar right-side clearance check (B6a): reads the radar, the references and the centre limit, never the plan
+    # --- radar right-side clearance check (B6a): reads the radar, the references and the centre limit, never the plan.  Rev 8: the line
+    # filters read the right reference when it is usable (items 1a / 3), the object bound is floored at the lowest centre limit in the fit
+    # window (item 1b: there the bound then acts exactly as before, max(T_obj, T_C'), but its held state never sits left of the centre) and
+    # rises at the move speed (items 1c / 5)
+    la = approach_length(max(v, 1.0))
+    win_fit = (X_IDXS >= FIT_WINDOW[0] * la) & (X_IDXS <= FIT_WINDOW[1] * la)
     rc = self.radar.update(p.radar, v, vx0, yaw_rate, g, dc, W_R, X_IDXS, c_ctr, filt[3] - EDGE_EXTRA, w_r[1], dt, l_d=L_D,
-                           rise=REFERENCE_RATE)
+                           rise=MOVE_SPEED, y_ref=y_r if q_R > REF_USABLE_Q else None, floor=float(np.min(c_ctr[win_fit])))
     f_radar = 1.0 if rc.healthy else 0.0
     # --- yields (B6, C7, C8): the endpoint-gap trigger on the right reference, else the left one, else the plan alone, the reference
     # instance, and the radar clearance trigger, each with its own side
@@ -1109,8 +1114,6 @@ class RightLineBlendful:
     trl_minus_centre = float(np.interp(iL, X_IDXS, t_rl - c_ctr))
     car_offset = float(c_ctr[0])  # > 0: the car is left of the centre limit
     self.car_left = car_offset > -CAR_LEFT_HYST if self.car_left else car_offset > CAR_LEFT_HYST
-    la = approach_length(max(v, 1.0))
-    win_fit = (X_IDXS >= FIT_WINDOW[0] * la) & (X_IDXS <= FIT_WINDOW[1] * la)
     bound_left_in_window = bool(np.any((t4 < c_ctr - 1e-6) & win_fit))  # line / edge bound (the object bound never goes left of T_C')
     larger_of = (trl_minus_centre < -1e-6 or self.car_left) and not bound_left_in_window
     k_r = max(k0_up, k0_rl) if larger_of else k0_rl

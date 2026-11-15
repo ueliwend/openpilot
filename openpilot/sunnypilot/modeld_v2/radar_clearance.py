@@ -1,18 +1,28 @@
 """
 Right-side clearance check from the radar (A8 right-line Blendful, design rev 6.5 section B6a; inster-dev
-results/2026-11-12_a8_right_line_blendful/DESIGN.md at 5f80b26).  A second obstacle check next to the plan-based endpoint-gap trigger: it reads
-only the radar tracks (`radarTracks`, car.RadarData, published by card.py from the Inster's RADAR_3A5_3C4 tracks), the filtered references,
-the centre limit and the speed, never the model's plan.
+results/2026-11-12_a8_right_line_blendful/DESIGN.md at 5f80b26; rev 8: results/2026-11-15_a8_rev8/DESIGN.md, the owner's decisions of
+15 Nov 2026).  It reads only the radar tracks (`radarTracks`, car.RadarData, published by card.py from the Inster's RADAR_3A5_3C4 tracks),
+the filtered references, the centre limit, the speed and the B2 motion inputs, never the model's plan.
 
 - Objects: model frame x = dRel + 1.52 m, y = -yRel + dc (radar yRel > 0 = left; radar on the car's centreline, EST).
 - Confirmed: the same trackId in >= 6 consecutive messages with a consistent position (within 1.0 m of dRel + vRel dt and 1.0 m laterally).
 - Memory: a confirmed object last seen at x < 20 m is kept, moved with the B2 motion model, until x < -3.3 m (1 m behind the rear bumper).
 - Corridor: x <= max(15 m, 3 s v), right of the centre limit; objects more than 1.0 m beyond a clear right edge are roadside and ignored.
-- Margin m(v) = g(v) + e(v): g the GUI gap in use, e 0.2 m at <= 50 km/h rising linearly to 0.5 m at >= 100 km/h (owner 22:24).
-- Object bound T_obj = min (y - w_R - m - dc) over the corridor; falls at once, rises after 1 s without a fall at 0.05 m/s.
-- Clearance deficit d = m - min (y - w_R - dc - T_C'(x)); d > 0 starts the clearance yield (obstacle side right), released when d < -0.1 m
-  for 1 s (or the object is gone); the cap ramps over d 0 .. 0.05 m.
-- Stationary / moving (radial test over 8 of 10 messages) and pop-ups are logged only.
+- Margin m(v) = g(v) + e(v): g the GUI gap in use, e 0.2 m at <= 50 km/h rising linearly to 0.5 m at >= 120 km/h (owner 22:24; rev 8
+  item 4: upper speed 120 km/h, was 100).
+- Rev 8 object filters (decision items 1a and 3), against the filtered right reference Y_R(x) when it is usable (quality above the strength's
+  zero point); without a usable right reference every corridor object counts for both, as before rev 8:
+  inside = y <= Y_R(x) - 0.10 m (at least 10 cm inside the right line or edge); toward = the object's sideways ground speed toward the lane
+  (leftward), mean of the last 10 messages, yaw-compensated with the B2 motion model, >= TOWARD_LANE_SPEED (placeholder).
+- Object bound (item 1): counts objects that are inside, not moving (the radial classification below; with a usable reference "inside" is
+  the own lane, so moving vehicles in it, e.g. the car ahead, are ignored) and confirmed for BOUND_CONFIRM_MESSAGES (placeholder) messages.
+  T_obj = min (y - w_R - m - dc) over them; never further left than the centre limit (floor: the lowest centre limit in the fit window,
+  passed in); falls at once, rises after 1 s without a fall at the car's move speed (MOVE_SPEED of blendful_right, passed in as rise).
+- Clearance deficit (item 3) from the car's actual position: the car keeps its present offset from the centre limit along the lane, so its
+  path is P(x) = T_C'(x) - T_C'(0) (P(0) = 0, the car where it is now); d = m - min (y - w_R - dc - P(x)) over the corridor objects that
+  are inside or toward.  d > 0 starts the clearance yield (obstacle side right), released when d < -0.1 m for 1 s (or the object is gone);
+  the cap ramps over d 0 .. 0.05 m.
+- Stationary / moving (radial test over 8 of 10 messages): selects the bound's objects (rev 8); pop-ups are logged only.
 - Health: no message, a message older than 0.3 s, an invalid message, any RadarData.errors flag, a non-finite dRel / yRel in the message,
   or a car radar configuration that publishes no side tracks (review R3-B1: radarUnavailable, or a Hyundai without RADAR_FULL_RADAR, whose
   messages are valid but empty or lead-only) -> unhealthy; healthy again 1 s after healthy messages return.  The caller turns unhealthy into
@@ -27,14 +37,23 @@ import numpy as np
 from openpilot.common.realtime import DT_MDL
 
 RADAR_TO_MODEL_X = 1.52  # m, radar ahead of the model origin (radard.py:30; EST for the Inster)
-CONFIRM_MESSAGES = 6
+CONFIRM_MESSAGES = 6  # the clearance check (unchanged)
+# rev 8 item 1a: a longer confirmation before an object counts for the object bound.  PLACEHOLDER until Models, Data & Logs measure it
+# (decision item 7, "confirmation length"); provisional: twice the clearance check's 6 messages (0.6 s at the 20 Hz track rate, EST)
+BOUND_CONFIRM_MESSAGES_PLACEHOLDER = 12
+# rev 8 items 1a / 3 (owner 15 Nov 08:44 / 09:20): objects up to this far inside the right reference (posts on the line) and beyond it are
+# ignored (the clearance check counts them only when they move toward the lane)
+LINE_INSIDE = 0.10  # m
+# rev 8 item 3: an object moving sideways toward the lane at least this fast counts for the clearance deficit from outside too.  PLACEHOLDER
+# until measured from logs (item 7; radar lateral motion is noisy); provisional: the radial classification's MOVING_SPEED (1 m/s)
+TOWARD_LANE_SPEED_PLACEHOLDER = 1.0  # m/s
 CONSISTENT_DIST, CONSISTENT_LAT = 1.0, 1.0  # m
 MEMORY_X, FORGET_X = 20.0, -3.3  # m: remembered when last seen nearer than this; forgotten 1 m behind the rear bumper
 CORRIDOR_TIME, CORRIDOR_MIN = 3.0, 15.0  # s, m
 ROADSIDE_BEYOND_EDGE, EDGE_CLEAR_WEIGHT = 1.0, 0.5  # m, candidate weight of the right edge
-MARGIN_EXTRA = (0.2, 0.5)  # m at <= 50 km/h and >= 100 km/h
-MARGIN_SPEEDS = (50 / 3.6, 100 / 3.6)
-BOUND_HOLD = 1.0  # s; the bound then rises at r_ref (blendful_right.REFERENCE_RATE, passed in)
+MARGIN_EXTRA = (0.2, 0.5)  # m at <= 50 km/h and >= 120 km/h
+MARGIN_SPEEDS = (50 / 3.6, 120 / 3.6)  # rev 8 item 4 (owner 15 Nov 09:25): upper speed 120 km/h (was 100)
+BOUND_HOLD = 1.0  # s; the bound then rises at the car's move speed (blendful_right.MOVE_SPEED, passed in; rev 8 item 5)
 DEFICIT_RAMP, DEFICIT_RELEASE, DEFICIT_RELEASE_TIME = 0.05, -0.1, 1.0  # m, m, s
 GHOST_TIME = 1.0  # s, a track that lost its confirmation stays the remembered object this long (or until 1 m behind the rear bumper)
 STALE_AGE, HEALTHY_RETURN = 0.3, 1.0  # s
@@ -114,10 +133,19 @@ class Track:
   seen: bool = True  # in the newest message (False: remembered beside the car)
   ghost_t: float = 0.0  # > 0: a track that lost its confirmation, kept as the remembered object for this long (B6a item 4, rev 6.8)
   moving_votes: deque = field(default_factory=lambda: deque(maxlen=MOVING_WINDOW))
+  lat_steps: deque = field(default_factory=lambda: deque(maxlen=MOVING_WINDOW))  # rev 8: (yaw-compensated sideways step, message dt) pairs
 
   @property
   def moving(self) -> bool:
     return sum(self.moving_votes) >= MOVING_MIN
+
+  @property
+  def toward_speed(self) -> float:
+    """rev 8 item 3: the sideways ground speed toward the lane (leftward, > 0), mean over the last MOVING_WINDOW consistent messages; 0 until
+    that many are there."""
+    if len(self.lat_steps) < MOVING_WINDOW:
+      return 0.0
+    return -sum(d for d, _ in self.lat_steps) / max(sum(t for _, t in self.lat_steps), 1e-3)
 
 
 @dataclass
@@ -131,8 +159,11 @@ class ClearanceResult:
   yield_q: float = 0.0  # in the units of the B6 cap ramp (0.15 at d = 0 .. 0.2 at d = 0.05 m), Q_NO_GROWTH while only latched
   margin: float = 0.0
   objects: int = 0  # confirmed objects in the corridor
+  bound_objects: int = 0  # rev 8: of them the ones the object bound counts (inside, not moving, confirmed for the bound)
+  toward: int = 0  # rev 8: of them the ones moving sideways toward the lane (>= TOWARD_LANE_SPEED_PLACEHOLDER)
+  nearest_toward: float = 0.0  # rev 8: sideways speed toward the lane of the object with the largest deficit, m/s (log)
   memory: int = 0  # of them remembered beside the car
-  moving: int = 0  # of them classified moving (log only)
+  moving: int = 0  # of them classified moving
   popups: int = 0  # confirmed this frame less than 2 s ahead or beside the car (log only)
   nearest: tuple = (0.0, 0.0, 0.0)  # x, y and clearance (car's right side to the object now, m) of the corridor object with the largest deficit
   hold: float = 0.0  # s since the bound last fell
@@ -165,7 +196,7 @@ class RadarClearance:
     return ok
 
   # --- tracks
-  def _ingest(self, radar: RadarFrame, v: float, msg_dt: float, dc: float):
+  def _ingest(self, radar: RadarFrame, v: float, msg_dt: float, dc: float, vx0: float = 0.0, yaw_rate: float = 0.0, l_d: float = 1.95):
     seen_ids = set()
     for tid, d_rel, y_rel, v_rel in radar.tracks:
       tid = int(tid)
@@ -178,12 +209,16 @@ class RadarClearance:
           self._remember(tr)  # the slot jumped: the confirmed object stays remembered at its last position (rev 6.8, R3-S3)
         count = tr.count + 1 if consistent else 1
         votes = tr.moving_votes if consistent else deque(maxlen=MOVING_WINDOW)
+        lat = tr.lat_steps if consistent else deque(maxlen=MOVING_WINDOW)
         confirmed = tr.confirmed and consistent
+        if consistent:  # rev 8: sideways ground step = the move against a ground-fixed point predicted with the B2 motion model
+          lat.append(((y - tr.y) + yaw_rate * msg_dt * (x + l_d + vx0 * msg_dt / 2), msg_dt))
       else:
-        count, votes, confirmed = 1, deque(maxlen=MOVING_WINDOW), False
+        count, votes, lat, confirmed = 1, deque(maxlen=MOVING_WINDOW), deque(maxlen=MOVING_WINDOW), False
       az = np.arctan2(y_rel, max(d_rel, 1e-3))
       votes.append(abs(v_rel + v * np.cos(az)) >= MOVING_SPEED)
-      new = Track(x=x, y=y, d_rel=float(d_rel), y_rel=float(y_rel), v_rel=float(v_rel), count=count, confirmed=confirmed, moving_votes=votes)
+      new = Track(x=x, y=y, d_rel=float(d_rel), y_rel=float(y_rel), v_rel=float(v_rel), count=count, confirmed=confirmed, moving_votes=votes,
+                  lat_steps=lat)
       if not new.confirmed and new.count >= CONFIRM_MESSAGES:
         new.confirmed = True
         new.popup = x < POPUP_TIME * max(v, 1.0)
@@ -200,7 +235,7 @@ class RadarClearance:
 
   def _remember(self, tr: Track):
     self.ghosts.append(Track(x=tr.x, y=tr.y, d_rel=tr.d_rel, y_rel=tr.y_rel, v_rel=tr.v_rel, count=tr.count, confirmed=True, seen=False,
-                             ghost_t=GHOST_TIME, moving_votes=tr.moving_votes))
+                             ghost_t=GHOST_TIME, moving_votes=tr.moving_votes, lat_steps=tr.lat_steps))
 
   def _move_memory(self, vx0: float, yaw_rate: float, dt: float, l_d: float):
     """Remembered objects are ground-fixed: moved with the B2 motion model into the new car frame (and forgotten behind the car)."""
@@ -218,15 +253,17 @@ class RadarClearance:
     self.ghosts = [g for g in self.ghosts if g.ghost_t > 1e-9 and g.x >= FORGET_X]
 
   def update(self, radar: RadarFrame | None, v: float, vx0: float, yaw_rate: float, gap: float, dc: float, w_r: float,
-             x_idxs: np.ndarray, c_ctr: np.ndarray, y_edge: np.ndarray, edge_weight: np.ndarray, dt: float = DT_MDL, l_d: float = 1.95,
-             rise: float = 0.042) -> ClearanceResult:
+             x_idxs: np.ndarray, c_ctr: np.ndarray, y_edge: np.ndarray, edge_weight: np.ndarray, dt: float = DT_MDL, l_d: float = 1.95, *,
+             rise: float, y_ref: np.ndarray | None = None, floor: float = -NO_BOUND) -> ClearanceResult:
     """gap: g(v), the GUI gap in use; w_r: the car's half width to its right side; c_ctr: the centre limit T_C'(x); y_edge, edge_weight: the
     filtered right edge and its weight in the right reference (B3); l_d: the device ahead of the no-slip point (B2 motion model); rise: the
-    object bound's rise rate after its hold, r_ref."""
+    object bound's rise rate after its hold, the car's move speed (rev 8 item 5); y_ref: the filtered right reference Y_R(x) when it is
+    usable, else None (rev 8 items 1a / 3: the line-relative filters then do not apply); floor: the object bound is never left of this, the
+    centre limit (rev 8 item 1b)."""
     res = ClearanceResult()
     fresh = self._health(radar, dt)
     if fresh and radar.new:
-      self._ingest(radar, v, max(dt, 1e-3), dc)
+      self._ingest(radar, v, max(dt, 1e-3), dc, vx0, yaw_rate, l_d)
     self._move_memory(vx0, yaw_rate, dt, l_d)
     if not fresh:  # a stale or faulty radar gives no objects; the caller fades Right line to Regular
       self.tracks = {k: t for k, t in self.tracks.items() if not t.seen}
@@ -236,6 +273,7 @@ class RadarClearance:
     m = gap + margin_extra(v)
     res.margin = m
     x_h = max(CORRIDOR_MIN, CORRIDOR_TIME * v)
+    ctr0 = float(c_ctr[0])
     t_raw, d, nearest = NO_BOUND, -NO_BOUND, None
     for tr in list(self.tracks.values()) + self.ghosts:
       if not tr.confirmed or tr.x > x_h or tr.x < FORGET_X:
@@ -250,19 +288,31 @@ class RadarClearance:
       res.memory += int(not tr.seen)
       res.moving += int(tr.moving)
       res.popups += int(tr.popup)
-      t_raw = min(t_raw, tr.y - w_r - m - dc)
-      d_i = m - (tr.y - w_r - dc - ctr)
-      if d_i > d:
-        d, nearest = d_i, tr
+      # rev 8 items 1a / 3: at least 10 cm inside the right reference (every object without a usable reference); moving toward the lane
+      inside = y_ref is None or tr.y <= float(np.interp(xq, x_idxs, y_ref)) - LINE_INSIDE
+      toward = tr.toward_speed >= TOWARD_LANE_SPEED_PLACEHOLDER
+      res.toward += int(toward)
+      # object bound (item 1a): inside, not a moving vehicle in the own lane (with a usable reference "inside" is the own lane), confirmed
+      # for the bound's longer confirmation
+      if inside and not (y_ref is not None and tr.moving) and tr.count >= BOUND_CONFIRM_MESSAGES_PLACEHOLDER:
+        res.bound_objects += 1
+        t_raw = min(t_raw, tr.y - w_r - m - dc)
+      # clearance deficit (item 3): from the car's actual position carried along the lane, P(x) = T_C'(x) - T_C'(0)
+      if inside or toward:
+        d_i = m - (tr.y - w_r - dc - (ctr - ctr0))
+        if d_i > d:
+          d, nearest = d_i, tr
     if nearest is not None:
       res.nearest = (nearest.x, nearest.y, nearest.y - w_r - dc)  # clearance from the car's right side where the car is now
-    # held object bound: falls at once, rises after 1 s without a fall at 0.05 m/s
+      res.nearest_toward = float(nearest.toward_speed)
+    # held object bound: falls at once, rises after 1 s without a fall at the move speed; never left of the floor (rev 8 item 1b)
     if t_raw < self.t_obj - 1e-9:
-      self.t_obj, self.hold = t_raw, 0.0
+      self.t_obj, self.hold = max(t_raw, floor), 0.0
     else:
       self.hold += dt
       if self.hold >= BOUND_HOLD - 1e-9:
         self.t_obj = min(t_raw, self.t_obj + rise * dt) if t_raw < NO_BOUND else min(NO_BOUND, self.t_obj + rise * dt)
+    self.t_obj = max(self.t_obj, floor)
     res.t_obj_raw, res.t_obj, res.hold = t_raw, self.t_obj, self.hold
     # clearance yield (obstacle side right): starts at d > 0; released when d < -0.1 m for 1 s (no object left counts as d < -0.1 m; a
     # track that lost its confirmation stays the remembered object meanwhile, see _remember), or at once when the object that set it is
