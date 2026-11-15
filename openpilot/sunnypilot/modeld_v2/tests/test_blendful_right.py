@@ -359,10 +359,10 @@ class TestCorrectionLaw:
     k0_up = 0.0021
     rl, res = run_rl([Scene(pl=1.0, pr=0.0)] * 150, k0_up=k0_up)
     assert rl.a == 0.0
-    # a = 0: upstream's correction (blend law kappa0 = a RL + (1 - a) up); rev 8 review B1: in Right line times the detector gain (here the
-    # start-up step of the centre limit, 0.1 m, is above the 72 km/h lower level 0.064 m: gain down to 0.87), exactly upstream's at gain 1
-    assert all(r.k0 == pytest.approx(r.log['det_gain'] * k0_up, rel=1e-12, abs=0.0) for r in res)
-    assert all(r.k0 == k0_up for r in res if r.log['det_gain'] == 1.0) and min(r.log['det_gain'] for r in res) > 0.85
+    # a = 0: exactly upstream's correction (blend law kappa0 = a RL + (1 - a) up), also while the detector factor is below 1 (review S3: the
+    # gain scales Keep Right's share only; here the start-up step of the centre limit, 0.1 m, is above the 72 km/h lower level 0.064 m:
+    # gain down to 0.87; 3fedb5476 delivered gain x upstream)
+    assert all(r.k0 == k0_up for r in res) and min(r.log['det_gain'] for r in res) < 0.9
 
   def test_blend_is_continuous_in_a(self):
     # rev 7: a is a first-order low-pass (tau 1 s) of a*: no step larger than the filter's (plus the 1e-3 end snap), monotone toward a*

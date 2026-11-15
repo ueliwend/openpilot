@@ -616,5 +616,5 @@ struct BlendfulInster @0xa4f1eb3323f5f582 {
   blendfulRadarBoundObjects @91 :UInt8;  # corridor objects the object bound counts (>= 10 cm inside the right reference, not moving, confirmed for the bound)
   blendfulRadarTowardObjects @92 :UInt8;  # corridor objects moving sideways toward the lane (count for the clearance deficit from outside too)
   blendfulRadarNearestTowardSpeed @93 :Float32;  # sideways speed toward the lane of the object with the largest deficit, m/s (> 0 toward)
-  blendfulDetectorGain @94 :Float32;  # rev 8 review B1: the detector factor through its own 1 s low-pass; multiplies the whole correction in Right line
+  blendfulDetectorGain @94 :Float32;  # rev 8 review B1 / S3: the detector factor through its own 1 s low-pass; multiplies Keep Right's share in Right line
 }

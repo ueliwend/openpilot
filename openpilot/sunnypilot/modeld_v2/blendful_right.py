@@ -75,8 +75,9 @@ USUAL_TAU, USUAL_TAU_AROUND = 10.0, 20.0  # s
 SWERVE_YIELD = (0.2, 0.45)  # m, upstream Blendful's YIELD (blendful.py)
 # rev 8 item 2 (owner 15 Nov 09:11 / 09:41): the obstacle detector scales Keep Right's strength down continuously with its deviation (the
 # swerve value): factor 1 at or below the lower level, 0 at or above the upper level, linear between, smoothed by a 1 s low-pass like the
-# strength.  Review B1 (owner 13 Nov 09:27 / 11:23: hand over to the model's path, not to Blendful): the filtered factor multiplies the WHOLE
-# delivered correction in Right line, so the scale-down goes to the model's own path and factor 0 = correction 0 = the hand-over level.
+# strength.  Review B1 / S3 (owner 13 Nov 09:27 / 11:23: hand over to the model's path, not to Blendful; Right line = Regular where it hands
+# back): the filtered factor multiplies Keep Right's share a k_R in Right line (not a, not Regular's share), so the scale-down goes to the
+# model's own path; with a = 1 factor 0 = correction 0 = the hand-over level.
 # Owner 15 Nov 10:53 (docs/decisions/2026-11-15.md, on the measurement inster-dev results/2026-11-15_rev8_constants at adaea0f4): the safer
 # side at all speeds: the scale-down starts at the 75th percentile of the normal deviation, strength zero and hand-over at the 95th.  Each
 # band's pair sits at its band centre, linear over speed between the centres, held outside them: <= 50 km/h band 18-50 km/h (the detector
@@ -1058,7 +1059,7 @@ class RightLineBlendful:
                                  yr0=float(y_r[0]), sw0=float(switch_part[0]), lat_active=p.lat_active, hand_over_level=det_upper)
       car_trig = self.detector.going_around
       # rev 8 item 2: the detector is no yield trigger any more (no no-growth phase, no cap ramp, no side); it scales the strength target
-      # (f_det below, on the whole correction) and its latch is the hand-over.  The radar clearance check is the only trigger of the
+      # (f_det below, on Keep Right's share) and its latch is the hand-over.  The radar clearance check is the only trigger of the
       # no-growth / cap rules (kept)
       q_rc = clearance_q(rc.deficit, Q_NO_GROWTH, Q_CAP_START, Q_CAP_FULL)
       no_growth, yield_active, caps = self.yields.update([
@@ -1079,8 +1080,8 @@ class RightLineBlendful:
     a = self.authority.update(a_star, dt)
     # rev 8 review B1 (owner 13 Nov 09:27 "hand directly to the normal path, not to blendful", 11:23 no fall-back to Regular there): the
     # detector's scale-down goes to the model's own path like the hand-over, not into a (which would hand the share to Regular's centring
-    # pull): in Right line the WHOLE delivered correction (Keep Right's and Regular's part) is multiplied by the detector factor through its
-    # own 1 s low-pass (Keep Right's effective strength a g_det), so factor 0 = correction 0 = the hand-over level
+    # pull): in Right line Keep Right's share a k_R is multiplied by the detector factor through its own 1 s low-pass (effective strength
+    # a g_det); where Keep Right holds the car (a = 1) factor 0 = correction 0 = the hand-over level
     g_det = self.det_gain.update(f_det, dt)
     # --- step 4: limits from the current references, not rate-limited: the left limit, the object bound (B6a), the right safety bounds
     t_left = np.maximum(t_lim, c_ctr)
@@ -1133,9 +1134,10 @@ class RightLineBlendful:
     self.regular_right_t = self.regular_right_t + dt if regular_right else 0.0
     authority_limited = self.regular_right_t > AUTHORITY_LIMITED_TIME
     wts = junction_policy(in_episode, a, right_line_mode=not force_regular)
-    k0 = wts.w_rl * k_r + wts.w_up * k0_up
-    if not force_regular:  # Right line only; the Regular hand-back window stays Regular's (Q10)
-      k0 *= g_det
+    # review S3 (owner 13 Nov 11:23: where Keep Right hands back, Right line behaves like Regular): the detector gain scales Keep Right's share
+    # only, so Regular's share (1 - a) k_up stays Regular's (no right line, blinker, radar health, junction, clearance yield); Right line only,
+    # the Regular hand-back window stays Regular's (Q10)
+    k0 = wts.w_rl * k_r * (1.0 if force_regular else g_det) + wts.w_up * k0_up
     if fading:
       k0 = 0.0
     right_only = bool(q_R > 0.5 and l_q < 0.3)
