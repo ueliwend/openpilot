@@ -1415,6 +1415,7 @@ def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
   builder.blendfulDetectorUsual = float(lg['det_usual'])
   builder.blendfulDetectorOwnMove = float(lg['det_own'])
   builder.blendfulDetectorAway = float(lg['det_away'])
+  builder.blendfulDetectorStrength = float(lg['det_strength'])
   builder.blendfulAuthorityLimited = bool(lg['authority_limited'])
   builder.blendfulDeliveredSource = int(lg['delivered'])
   builder.blendfulTargetMinusCentre = float(lg['trl_minus_centre'])
@@ -1430,6 +1431,9 @@ def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
   builder.blendfulRadarMoving = int(min(rc.moving, 255))
   builder.blendfulRadarPopups = int(min(rc.popups, 255))
   builder.blendfulRadarNearest = [float(x) for x in rc.nearest]
+  builder.blendfulRadarBoundObjects = int(min(rc.bound_objects, 255))
+  builder.blendfulRadarTowardObjects = int(min(rc.toward, 255))
+  builder.blendfulRadarNearestTowardSpeed = float(rc.nearest_toward)
   builder.blendfulObjectBound = float(rc.t_obj)
   builder.blendfulObjectBoundHold = float(rc.hold)
   builder.blendfulObjectBoundActive = bool(rc.bound_active)

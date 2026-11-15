@@ -525,7 +525,7 @@ struct BlendfulInster @0xa4f1eb3323f5f582 {
   blendfulAuthorityTarget @7 :Float32;  # a*
   blendfulFadeBend @8 :Float32;
   blendfulFadeYieldLeft @9 :Float32;
-  blendfulFadeYieldRight @10 :Float32;
+  blendfulFadeYieldRight @10 :Float32;  # rev 8: always 1 (the detector no longer fades the right-line share by a left-side cap)
   blendfulFadeJump @11 :Float32;
   blendfulFadePlausibility @12 :Float32;
   blendfulFadeBlinker @13 :Float32;
@@ -586,13 +586,13 @@ struct BlendfulInster @0xa4f1eb3323f5f582 {
   blendfulRadarHealthy @66 :Bool;  # f_radar = 1 (tracks fresh, no error flags, 1 s since they returned)
   blendfulRadarObjects @67 :UInt8;  # confirmed objects in the right corridor
   blendfulRadarMemory @68 :UInt8;  # of them remembered beside the car
-  blendfulRadarMoving @69 :UInt8;  # of them classified moving (log only)
+  blendfulRadarMoving @69 :UInt8;  # of them classified moving (rev 8: the object bound ignores them in the own lane)
   blendfulRadarPopups @70 :UInt8;  # confirmed this frame less than 2 s ahead (log only)
   blendfulRadarNearest @71 :List(Float32);  # [x, y, clearance of the car's right side] of the corridor object with the largest deficit, m
   blendfulObjectBound @72 :Float32;  # held object bound T_obj (1000 = none)
   blendfulObjectBoundHold @73 :Float32;  # s since the object bound last fell
   blendfulObjectBoundActive @74 :Bool;
-  blendfulClearanceDeficit @75 :Float32;  # d = m(v) - clearance at the centre limit, m (> 0 starts the clearance yield)
+  blendfulClearanceDeficit @75 :Float32;  # d = m(v) - clearance, m (> 0 starts the clearance yield); rev 8: from the car's actual position (was the centre limit)
   blendfulClearanceYield @76 :Bool;
   blendfulClearanceMargin @77 :Float32;  # m(v) = g(v) + e(v), m
   blendfulRightBlindspot @78 :Bool;
@@ -610,5 +610,10 @@ struct BlendfulInster @0xa4f1eb3323f5f582 {
   blendfulDetectorOffset @86 :Float32;  # mean (plan_y - lane centre) over 1.4-1.6 s, our own estimated move subtracted, m
   blendfulDetectorUsual @87 :Float32;  # 10 s (20 s going around) low-pass of the offset, m
   blendfulDetectorOwnMove @88 :Float32;  # estimated sideways move from our correction (30 s high-pass), m; (1 - 0.35) of it is subtracted
-  blendfulDetectorAway @89 :Float32;  # swerve minus the car-departure term, m (latch > 0.2)
+  blendfulDetectorAway @89 :Float32;  # swerve minus the car-departure term, m (hand-over latch above the detector's upper level; rev 7.2: 0.2)
+  # rev 8 (owner 15 Nov 2026; inster-dev results/2026-11-15_a8_rev8/DESIGN.md)
+  blendfulDetectorStrength @90 :Float32;  # factor on the strength target from the detector's swerve value: 1 at <= lower level, 0 at >= upper level
+  blendfulRadarBoundObjects @91 :UInt8;  # corridor objects the object bound counts (>= 10 cm inside the right reference, not moving, confirmed for the bound)
+  blendfulRadarTowardObjects @92 :UInt8;  # corridor objects moving sideways toward the lane (count for the clearance deficit from outside too)
+  blendfulRadarNearestTowardSpeed @93 :Float32;  # sideways speed toward the lane of the object with the largest deficit, m/s (> 0 toward)
 }
