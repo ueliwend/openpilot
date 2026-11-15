@@ -76,8 +76,10 @@ class TestTargetUnderQualityFlicker:
 class TestHandBackWindowCap:
   @pytest.mark.parametrize("switch_frame", [206, 210, 215, 220])
   def test_b2_cap_holds_after_a_switch_to_regular_inside_a_yield(self, switch_frame):
-    # obstacle on the right (the model swerves 0.8 m left from frame 200, 0.5 s); the cap brought c to 0, then the driver switches to
-    # Regular while the right-line share a is still being handed back.  Round 2: c came back toward the obstacle up to 0.18 m/s^2.
+    # obstacle on the right (the model swerves 0.8 m left from frame 200, 0.5 s), then the driver switches to Regular while the right-line
+    # share a is still being handed back.  Round 2: c came back toward the obstacle up to 0.18 m/s^2.  Rev 8: the detector no longer caps; it
+    # scales the strength and hands over at its upper level (frame ~206 here), so at the earliest switch c is still on its way to 0: it never
+    # grows toward the obstacle after the switch and reaches 0 (the instance keeps running in Regular while its hand-over holds)
     v = 13.0
     ctl = BlendfulCorrection()
     rows = []
@@ -85,12 +87,13 @@ class TestHandBackWindowCap:
       sw = 0.0 if i < 200 else min(0.8, 0.8 * (i - 200) * DT_MDL / 0.5)
       mode = MODE_RIGHT if i < switch_frame else MODE_REGULAR
       ctl.update(Scene(v=v, plan=-sw).model_output(), v, True, 0.0, LAT_T, mode, RightInputs())
-      rows.append((ctl.c, ctl.release_window, ctl.right.a))
+      rows.append((ctl.c, ctl.release_window, ctl.right.a, ctl.hand_over))
     assert rows[switch_frame - 1][2] > 0.0 or switch_frame >= 220  # inside the hand-back window for the early switches
     c_at_switch = rows[switch_frame - 1][0]
     after = [r[0] for r in rows[switch_frame:]]
     assert max(after) <= max(c_at_switch, 0.0) + 1e-12  # no growth toward the obstacle after the switch
-    assert max(after) * v * v <= 1e-3
+    assert all(b <= a + 1e-15 for a, b in zip(after[:-1], after[1:], strict=True))
+    assert after[-1] * v * v <= 1e-3 and any(r[3] for r in rows[switch_frame:])
 
   def test_b2_regular_is_exactly_upstream_once_the_window_and_the_yield_are_over(self):
     v = 13.0

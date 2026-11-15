@@ -310,9 +310,10 @@ class TestReferences:
     assert abs(refs[0] + 1.8) < 0.05 and abs(refs[-1] + 1.6) < 0.05
     assert np.max(np.abs(np.diff(refs))) < 0.25  # K2 / check 15: up to 4 m/s before the offset rate limit, never a step
 
-  @pytest.mark.parametrize("width,gap50,gap100", [(2.6, 0.49, 0.49), (3.0, 0.60, 0.69), (4.5, 0.60, 1.10), (6.0, 0.60, 1.10)])
-  def test_narrow_roads_without_lines_table(self, width, gap50, gap100):
-    for v, expected in ((50 / 3.6, gap50), (100 / 3.6, gap100)):
+  @pytest.mark.parametrize("width,gap50,gap120", [(2.6, 0.49, 0.49), (3.0, 0.60, 0.69), (4.5, 0.60, 1.10), (6.0, 0.60, 1.10)])
+  def test_narrow_roads_without_lines_table(self, width, gap50, gap120):
+    # rev 8 item 4: the high gap applies from 120 km/h (was 100 km/h)
+    for v, expected in ((50 / 3.6, gap50), (120 / 3.6, gap120)):
       rl, res = steady(v=v, pl=0.0, pr=0.0, edges=True, edge_half=width / 2, edge_std=0.3, frames=300)
       gap_edge = width / 2 - (target_at(res.log, v) + W_R)
       assert abs(gap_edge - expected) < 0.03, (width, v, gap_edge)
@@ -408,8 +409,10 @@ class TestCorrectionLaw:
     assert abs(target_at(res.log, 13.0)) < 1e-6  # centred: T_C' binds
 
   def test_gui_gap_and_speed_interpolation(self):
-    assert br.gap_for_speed(10.0, 0.5, 1.0) == 0.5 and br.gap_for_speed(30.0, 0.5, 1.0) == 1.0
-    assert abs(br.gap_for_speed(75 / 3.6, 0.5, 1.0) - 0.75) < 1e-9
+    # rev 8 item 4 (owner 15 Nov 09:24): low gap up to 50 km/h, high gap from 120 km/h (was 100), linear between
+    assert br.gap_for_speed(10.0, 0.5, 1.0) == 0.5 and br.gap_for_speed(120 / 3.6, 0.5, 1.0) == 1.0
+    assert abs(br.gap_for_speed(85 / 3.6, 0.5, 1.0) - 0.75) < 1e-9
+    assert br.gap_for_speed(100 / 3.6, 0.5, 1.0) == pytest.approx(0.5 + 0.5 * 50 / 70)  # the high gap is not reached at 100 km/h any more
     for lo, hi in ((0.2, 2.0), (1.0, 0.3)):
       rl, res = steady(v=13.0, width=6.0, frames=300, rl_kwargs={'inputs': RightInputs(gap_low=lo, gap_high=hi)})
       gap = 3.0 - (target_at(res.log, 13.0) + W_R)
@@ -485,48 +488,71 @@ def swerve_run(side=+1, k0_up=0.0, frames_hold=100, frames_total=260, depth=0.8,
     sw = depth * min(1.0, t / swerve_T)
     sc = Scene(v=13.0, plan=-side * sw)
     ctl.update(sc.model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
-    rows.append((ctl.c, ctl.result.yield_q, ctl.result.yield_side, ctl.result.yield_active, ctl.cap_active, ctl.release_window, i))
+    rows.append((ctl.c, ctl.result.yield_q, ctl.result.yield_side, ctl.result.yield_active, ctl.cap_active, ctl.release_window, i,
+                 ctl.hand_over))
   return ctl, rows
 
 
+def radar_cap_run(y_of_t, frames_hold=100, frames_total=260, v=13.0):
+  """Rev 8: the no-growth / cap rules are triggered only by the radar clearance check (the detector scales the strength instead).  Controller
+  in Right line mode, the car held at the lane centre and pulled right; from frame frames_hold a radar object 6 m ahead travels with the car
+  (moving: the object bound ignores it in the own lane, so the target stays right) at the lateral position y_of_t(t) (m right of the car).
+  At <= 50 km/h the margin is 0.5 + 0.2 = 0.7 m, so the clearance deficit is d = 0.7 - (y - 0.81) = 1.51 - y."""
+  ctl = BlendfulCorrection()
+  rows = []
+  for i in range(frames_total):
+    t = (i - frames_hold) * DT_MDL
+    tracks = [(5, 6.0, -float(y_of_t(t)), 0.0)] if t >= 0 else []
+    radar = br.RadarFrame(tracks=tracks, age=0.0, fault=False, new=True, config_ok=True)
+    ctl.update(Scene(v=v).model_output(), v, True, 0.0, LAT_T, MODE_RIGHT, RightInputs(radar=radar))
+    rows.append((ctl.c, ctl.result.yield_q, ctl.result.yield_side, ctl.result.yield_active, ctl.cap_active, ctl.release_window, i,
+                 ctl.result.log['radar'].deficit))
+  return ctl, rows
+
+
+def ramp(y0, y1, T):
+  return lambda t: y0 + (y1 - y0) * min(1.0, max(t, 0.0) / T)
+
+
 class TestYieldCap:
+  """The B6 cap rules, rev 8: triggered by the radar clearance check only (obstacle side right)."""
   def test_no_correction_toward_the_obstacle_inside_a_yield(self):
-    ctl, rows = swerve_run(+1)
-    assert rows[90][0] > 0.0  # pulled right before the swerve
+    ctl, rows = radar_cap_run(ramp(1.62, 1.30, 3.0), frames_total=400)
+    assert rows[90][0] > 0.0  # pulled right before the object comes in
     v = 13.0
     prev_c = None
-    windows = 0
-    for c, q, s, active, _cap, rel, _i in rows[100:]:
+    seen = 0
+    for c, q, s, active, _cap, rel, _i, _d in rows[100:]:
       s_c = s * c  # s is this frame's capped side (+1 here; 0 outside a no-growth phase)
       if active and q >= br.Q_NO_GROWTH and prev_c is not None:
-        assert s_c <= max(s * prev_c, 0.0) + 1e-12  # no growth from q = 0.1 m
+        seen += 1
+        assert s == 1
+        assert s_c <= max(s * prev_c, 0.0) + 1e-12  # no growth from the start of the yield
       if active and not rel and q >= br.Q_CAP_FULL:
         assert s_c <= 1e-6  # the hard rule: zero correction toward the obstacle side, outside cap-release windows
-      if rel:
-        windows += 1
       prev_c = c
+    assert seen > 50
     last = rows[-1]
     assert last[3] and last[0] * last[2] <= 1e-6
-    # the release never exceeds the 5 m/s^3 of controlsd's clip_curvature
     dc = np.abs(np.diff([r[0] for r in rows])) * v ** 2 / DT_MDL
-    assert dc.max() <= br.SWERVE_RELEASE + 1e-6
+    assert dc.max() <= br.SWERVE_RELEASE + 1e-6  # the release never exceeds the 5 m/s^3 of controlsd's clip_curvature
 
   def test_release_window_rate_and_listing(self):
-    ctl, rows = swerve_run(+1, swerve_T=0.1)  # a sudden swerve
+    ctl, rows = radar_cap_run(lambda t: 1.25)  # an object that appears with a deficit of 0.26 m: full cap at once
     assert any(r[5] for r in rows)  # a cap-release window is reported
     cs = np.array([r[0] for r in rows])
-    v = 13.0
-    assert np.abs(np.diff(cs)).max() * v ** 2 / DT_MDL <= br.SWERVE_RELEASE + 1e-6
+    assert np.abs(np.diff(cs)).max() * 13.0 ** 2 / DT_MDL <= br.SWERVE_RELEASE + 1e-6
+    assert abs(cs[-1]) < 1e-9
 
   def test_obstacle_on_the_left_never_pulls_left(self):
-    # the model goes right (oncoming traffic); from the yield's first frame the correction never pushes left.  Before it (trigger latency,
-    # design I1, accepted in review r4): rev 6.13's re-seed (frame ~58 in this open loop) restarts the move at the car, so the right-line
-    # target is still near the car when the plan swerves right and its correction points back left by at most 0.03 m/s^2 for 3 frames
+    # rev 8: the model goes right (oncoming traffic); the detector scales Keep Right's strength down and hands over at its upper level.
+    # Before the hand-over the leftward correction stays within the old pre-yield allowance (0.03 m/s^2; measured 0.022 m/s^2 in this open
+    # loop at the rev 8 move speed); from the hand-over on it only falls back to 0 (the model's own path)
     ctl, rows = swerve_run(-1)
-    first = next(r[6] for r in rows if r[3])
-    assert min(r[0] for r in rows[first:]) >= -1e-6
+    first = next(r[6] for r in rows if r[7])
+    assert min(r[0] for r in rows[first:]) >= min(rows[first - 1][0], 0.0) - 1e-12
     assert min(r[0] for r in rows[:first]) * 13.0 ** 2 >= -0.03
-    assert rows[-1][2] == -1
+    assert abs(rows[-1][0]) < 1e-12 and rows[-1][7]
 
   def test_inside_curve_fade_does_not_trigger_the_cap(self):
     ctl = BlendfulCorrection()
@@ -538,16 +564,17 @@ class TestYieldCap:
     assert not ctl.result.yield_active
 
   def test_early_cap_ramp(self):
-    # a slow swerve to the left (obstacle on the right): between q 0.15 and 0.2 m the toward-obstacle correction is at most the cap
-    # memory times (0.2 - q) / 0.05, and from 0.2 m it is 0 (outside the cap-release window)
+    # the object comes in slowly: between d 0 and 0.05 m (q 0.15 .. 0.2) the toward-obstacle correction is at most the cap memory times
+    # (0.2 - q) / 0.05, and from d 0.05 m it is 0 (outside the cap-release window)
     ctl = BlendfulCorrection()
-    for _ in range(100):
-      ctl.update(Scene(v=13.0).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
-    assert ctl.c > 0.0
     in_ramp = 0
-    for i in range(200):
-      sw = 0.002 * i
-      ctl.update(Scene(v=13.0, plan=-sw).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
+    for i in range(400):
+      t = (i - 100) * DT_MDL
+      tracks = [(5, 6.0, -ramp(1.56, 1.40, 10.0)(t), 0.0)] if t >= 0 else []
+      radar = br.RadarFrame(tracks=tracks, age=0.0, fault=False, new=True, config_ok=True)
+      ctl.update(Scene(v=13.0).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs(radar=radar))
+      if i == 99:
+        assert ctl.c > 0.0
       q = ctl.result.caps.get(br.SIDE_RIGHT)
       if q is None:
         continue
@@ -1079,60 +1106,51 @@ def upstream_from_centre_trigger(sw_start, sw_T, T=60.0, noise=0.03, seed=1):
 
 class TestYieldRules:
   def test_trigger_works_with_a_weak_right_reference(self):
-    # right reference gone (q_R < 0.3): the left reference carries the trigger, a swerve is still seen (C8: no q_R gate)
+    # right reference gone (q_R < 0.3): the left reference carries the detector, a swerve is still seen (C8: no q_R gate); rev 8: it hands
+    # over at the upper level and its strength factor is 0 there
     ctl = BlendfulCorrection()
     q = []
+    upper = br.detector_levels(13.0)[1]
     for i in range(300):
       sw = 0.0 if i < 150 else min(0.8, 0.8 * (i - 150) * DT_MDL / 0.5)
       ctl.update(Scene(v=13.0, pr=0.0, plan=-sw).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
-      q.append((ctl.result.yield_q, ctl.result.log['yield_source'], ctl.result.yield_active))
-    assert q[-1][1] == 2 and q[-1][2] and max(x[0] for x in q) > 0.2 and not any(x[2] for x in q[:150])
-
-  def test_obstacle_side_is_latched_at_the_start_of_the_yield(self):
-    ctl = BlendfulCorrection()
-    sides = []
-    for i in range(400):
-      if i < 150:
-        plan = 0.0
-      elif i < 250:
-        plan = -0.8  # swerve left: obstacle on the right (+1)
-      else:
-        plan = 0.8 * (1 if i < 300 else 1)  # the plan then crosses to the other side while the yield still holds: the side must not flip
-      ctl.update(Scene(v=13.0, plan=plan).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
-      if ctl.result.yield_active:
-        sides.append(ctl.result.yield_side)
-    assert sides and sides[0] == 1
-    first_flip = next((i for i, s in enumerate(sides) if s != 1), None)
-    assert first_flip is None or first_flip > 60  # not flipped while the first yield is still active
+      lg = ctl.result.log
+      q.append((lg['away_car'], lg['yield_source'], ctl.hand_over, lg['det_strength']))
+    assert q[-1][1] == 2 and q[-1][2] and max(x[0] for x in q) > upper and not any(x[2] for x in q[:150])
+    assert all(x[3] == 0.0 for x in q if x[0] >= upper)
 
   def test_cap_memory_lives_with_the_yield_and_never_grows(self):
-    ctl, rows = swerve_run(+1, swerve_T=3.0, frames_total=400)
-    mems = []
     ctl2 = BlendfulCorrection()
-    for i in range(400):
-      sw = 0.0 if i < 100 else min(0.8, 0.8 * (i - 100) * DT_MDL / 3.0)
-      ctl2.update(Scene(v=13.0, plan=-sw).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
+    mems = []
+    for i in range(700):
+      t = (i - 100) * DT_MDL
+      tracks = [(5, 6.0, -ramp(1.62, 1.30, 3.0)(t), 0.0)] if 0 <= t < 15.0 else []  # the object leaves after 15 s
+      radar = br.RadarFrame(tracks=tracks, age=0.0, fault=False, new=True, config_ok=True)
+      ctl2.update(Scene(v=13.0).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs(radar=radar))
       mems.append(ctl2.cap_mem.get(br.SIDE_RIGHT))
     m = [x for x in mems if x is not None]
     assert m and all(b <= a + 1e-15 for a, b in zip(m[:-1], m[1:], strict=True))  # non-increasing for as long as it lives
-    # the swerve ends: the memory is released with the yield (empty again once the latch released)
-    for _ in range(1500):  # the usual follows the swerve with tau 10 s, so the yield ends within about a minute
-      ctl2.update(Scene(v=13.0, plan=0.0).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
-    assert ctl2.cap_mem == {}
+    assert ctl2.cap_mem == {}  # released with the yield once the object is gone
 
   def test_no_growth_toward_the_obstacle_between_q_0_1_and_0_2(self):
+    # the object comes in to a deficit of 0.05 m and goes back out to -0.05 m: the yield stays latched (release needs d < -0.1 m for 1 s)
+    # with q = 0.1 (no growth only); the correction toward the right never grows during the phase
     ctl = BlendfulCorrection()
     prev = None
     worst = 0.0
+    latched = 0
     for i in range(500):
-      sw = 0.0 if i < 100 else min(0.35, 0.35 * (i - 100) * DT_MDL / 6.0) if i < 300 else max(0.0, 0.35 - 0.35 * (i - 300) * DT_MDL / 6.0)
-      ctl.update(Scene(v=13.0, plan=-sw).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs())
-      s = ctl.result.yield_side
+      t = (i - 100) * DT_MDL
+      y = 1.56 if t < 2.0 else (1.46 if t < 6.0 else 1.56)
+      tracks = [(5, 6.0, -y, 0.0)] if t >= 0 else []
+      radar = br.RadarFrame(tracks=tracks, age=0.0, fault=False, new=True, config_ok=True)
+      ctl.update(Scene(v=13.0).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs(radar=radar))
       if ctl.result.no_growth and prev is not None and ctl.result.yield_q < br.Q_CAP_FULL:
-        assert s in (1, -1)
-        worst = max(worst, s * ctl.c - max(s * prev, 0.0))
+        assert ctl.result.yield_side == 1
+        latched += ctl.result.yield_q == br.Q_NO_GROWTH
+        worst = max(worst, ctl.c - max(prev, 0.0))
       prev = ctl.c
-    assert worst <= 1e-12
+    assert latched > 20 and worst <= 1e-12
 
 
 class TestDClip:
@@ -1366,6 +1384,25 @@ class TestLogging:
     assert abs(msg.blendfulAuthority - ctl.result.log['a']) < 1e-6
     assert msg.blendfulRightApplied == bool(ctl.result.log['applied'])
     assert abs(msg.blendfulGainF - ctl.gain) < 1e-6
+
+  def test_fill_log_writes_the_rev8_fields(self):
+    # rev 8: the detector's strength factor and the radar's object counts, appended at the end of blendfulInster (@90-@93)
+    from openpilot.cereal import custom
+    ctl = BlendfulCorrection()
+    radar = br.RadarFrame(tracks=[(3, 8.0, -1.2, 0.0)], age=0.0, fault=False, new=True, config_ok=True)
+    for i in range(80):
+      ctl.update(Scene(v=13.0, plan=0.0 if i < 60 else -0.3).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs(radar=radar))
+    msg = custom.BlendfulInster.new_message()
+    br.fill_log(msg, ctl, MODE_RIGHT, 13.0)
+    rc = ctl.result.log['radar']
+    assert abs(msg.blendfulDetectorStrength - ctl.result.log['det_strength']) < 1e-6 and msg.blendfulDetectorStrength < 1.0
+    assert msg.blendfulRadarBoundObjects == rc.bound_objects == 0  # moving (travels with the car) in the own lane: not for the bound
+    assert msg.blendfulRadarTowardObjects == rc.toward == 0 and msg.blendfulRadarObjects == 1
+    assert abs(msg.blendfulRadarNearestTowardSpeed - rc.nearest_toward) < 1e-6
+    fields = custom.BlendfulInster.schema.fields_list
+    assert [f.proto.name for f in fields[-4:]] == ['blendfulDetectorStrength', 'blendfulRadarBoundObjects', 'blendfulRadarTowardObjects',
+                                                   'blendfulRadarNearestTowardSpeed']
+    assert [f.proto.ordinal.explicit for f in fields] == list(range(94))  # field numbers stable, the new ones appended
 
   def test_fill_log_writes_the_episode_and_cue_fields(self):
     from openpilot.cereal import custom
