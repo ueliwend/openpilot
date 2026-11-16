@@ -110,10 +110,10 @@ class ModelsLayout(Widget):
                                                      [tr("Off"), tr("Regular"), tr("Right line")], 0, style.BUTTON_ACTION_WIDTH,
                                                      callback=self._on_blendful_selected, inline=False)
 
-    gap_desc = tr("Distance from the right wheel to the right line (or road edge) in Right line mode, growing linearly between 50 and 100 km/h.")
+    gap_desc = tr("Distance from the right wheel to the right line (or road edge) in Right line mode, growing linearly between 50 and 120 km/h.")
     self.blendful_gap_low = option_item_sp(tr("Right line gap up to 50 km/h"), "BlendfulRightGapLow", 20, 200, gap_desc, 5, None, True, "",
                                            style.BUTTON_ACTION_WIDTH, None, True, lambda v: f"{v / 100:.2f} m")
-    self.blendful_gap_high = option_item_sp(tr("Right line gap from 100 km/h"), "BlendfulRightGapHigh", 20, 200, gap_desc, 5, None, True, "",
+    self.blendful_gap_high = option_item_sp(tr("Right line gap from 120 km/h"), "BlendfulRightGapHigh", 20, 200, gap_desc, 5, None, True, "",
                                             style.BUTTON_ACTION_WIDTH, None, True, lambda v: f"{v / 100:.2f} m")
 
     self.camera_offset = option_item_sp(tr("Adjust Camera Offset"), "CameraOffset", -35, 35,
