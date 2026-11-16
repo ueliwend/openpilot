@@ -105,9 +105,10 @@ CMD_RAW = (                                                                # row
 # full scale (1.0 = 409 raw); as a fraction of full scale a cell is cell / 409. The feed-forward tops out at 409 raw again (22 and 32
 # km/h rows; 389.6 / 368.1 / 360.3 at 48 / 76 / 111 km/h), which is the steering limit (INSTER_STEER_MAX), unchanged. Against the table
 # before (below): every cell higher, by 4.2-6.8 %, 0.9-20.45 raw (most at the top of the 22 and 32 km/h rows); the 0.95 factor
-# is 5.3 % of it, the rest (at most 2.4 raw) the refit. Only the table changes: the MPC parameter set below (MPC 11 Nov) and every other
-# value stay as they are. That set was fitted on the table before; on this table it is scored in the simulator, not refitted (round
-# rtk100, candidate "FF table only" = MPC 11 Nov on d31 x 1.00). SIM only, not validated on the car.
+# is 5.3 % of it, the rest (at most 2.4 raw) the refit. Only the table changed with that commit: the MPC parameter set of that day
+# (MPC 11 Nov) and every other value stayed as they were. That set was fitted on the table before; on this table it was scored in the
+# simulator, not refitted (round rtk100, candidate "FF table only" = MPC 11 Nov on d31 x 1.00). The set fitted on this table is MPC
+# 16 Nov (MPC_PARAMS below). SIM only, not validated on the car.
 # 11 Nov 2026 - 16 Nov 2026 (the shape of the joint refit over 29 drives of 9 Nov 2026, fit d30, k_w = 0.897, times s = 0.95, the
 # compromise between summer (k = 1) and winter (k ~ 0.9); every cell the exact product (0.001 raw) of the joint-fit cell and 0.95; top
 # 409 x 0.95 = 388.55 raw; the table the MPC parameter set below was fitted and scored on in the simulator):
@@ -437,7 +438,9 @@ def angle_pi_log_version(controller: int, soft_p: bool, mpc: bool = False, mpc_r
   but its set-up failed, plain PID with the held values); since 11 Nov 2026 every value + 1000 x 2048 (parameter set 11 Nov:
   PI 2368105, PID 2384106, option 5 2376105 / 2392106, PID + MPC + ramp-aware + held 4048106, PID + MPC + held 3536106, MPC set-up failed
   3408106); since 12 Nov 2026 (A7, full scale 1.0 = 409 raw) every value + 1000 x 4096: PI 6464105, PID 6480106, option 5 6472105 /
-  6488106, PID + MPC + ramp-aware + held 8144106, PID + MPC + held 7632106, MPC set-up failed 7504106)."""
+  6488106, PID + MPC + ramp-aware + held 8144106, PID + MPC + held 7632106, MPC set-up failed 7504106); since 16 Nov 2026 (parameter
+  set MPC 16 Nov) every value + 1000 x 8192: PI 14656105, PID 14672106, option 5 14664105 / 14680106, PID + MPC + ramp-aware + held
+  16336106, PID + MPC + held 15824106, MPC set-up failed 15696106)."""
   if controller == LATERAL_PID:
     base, mask = ANGLE_PI_PID_BASE_VERSION, ANGLE_PI_VERSION_D_BIT
   else:
@@ -451,7 +454,7 @@ def angle_pi_log_version(controller: int, soft_p: bool, mpc: bool = False, mpc_r
   if mpc_fixed:
     mask |= ANGLE_PI_VERSION_MPC_FIXED_BIT
   return base + 1000 * (mask | ANGLE_PI_VERSION_FREEZE_DIR_BIT | ANGLE_PI_VERSION_FIXED_FACTOR_BIT | ANGLE_PI_VERSION_SET_11NOV_BIT |
-                        ANGLE_PI_VERSION_FULL_SCALE_409_BIT)
+                        ANGLE_PI_VERSION_FULL_SCALE_409_BIT | ANGLE_PI_VERSION_SET_16NOV_BIT)
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -473,12 +476,20 @@ ANGLE_PI_VERSION_FIXED_FACTOR_BIT = 256   # 30 Oct 2026: fixed factor F0 on the 
 # ANGLE_PI_MPC_* / MPC_RAMP_PARAMS set MPC 11 Nov), always set with F on, so drives on this set are told apart in the logs from drives on
 # the 7 Nov set (earlier table and parameter-set changes did not change the version; this one does, owner 11 Nov). No behaviour hangs
 # on the bit. 16 Nov 2026: the feed-forward table changed (joint fit d31 x 1.00, CMD_RAW above) while the MPC / PID parameter set
-# stays the set of 11 Nov; the bit stays set and from then on marks the parameter set only, not the table.
+# stays the set of 11 Nov; the bit stays set and from then on marks the parameter set only, not the table. Since the set MPC 16 Nov
+# (bit 8192 below) it stays set as well: the bits are "since" markers that add up, and log readers key on it (builds from 9031ad2 on).
 ANGLE_PI_VERSION_SET_11NOV_BIT = 2048
 # 12 Nov 2026 (A7, owner): full scale actuators.torque 1.0 = 409 raw (was 384), always set with F on, so drives on the new unit are told
 # apart in controlsState too (the unit also shows in every rlog as CarParams latAccelFactor 3.94 vs 3.70, and as torqueOutputCan /
 # actuatorsOutput.torque). No behaviour hangs on the bit.
 ANGLE_PI_VERSION_FULL_SCALE_409_BIT = 4096
+# 16 Nov 2026: parameter set MPC 16 Nov (MPC_PARAMS / ANGLE_PI_MPC_* / MPC_RAMP_PARAMS below; the tuning round's candidate "final 1",
+# fitted on the feed-forward table of 16 Nov 2026, joint fit d31 x 1.00), always set with F on, as the 11 Nov bit, so drives on this set
+# are told apart in the logs from drives on MPC 11 Nov (on either table). The set changes the controller only while InsterMPC runs
+# (PI and PID without the MPC keep PI-30Oct / PID-30Oct); the bit marks the build's set in every F mode. No behaviour hangs on the bit.
+# The feed-forward table of 16 Nov 2026 itself has no bit: drives on that table with MPC 11 Nov (builds from 3d8d8fd3f up to this set)
+# show bit 2048 without bit 8192 and are told from earlier ones by the build (initData.gitCommit).
+ANGLE_PI_VERSION_SET_16NOV_BIT = 8192
 LIMIT_TOL_RAW = 1.5          # rounding (+-0.5 raw) and the limiter's driver-torque frame (one carState later on the car side)
 
 
@@ -635,13 +646,28 @@ class InsterWheelRateFilter:
 #   change (state >= 2), non-finite numbers (held until the next finite solve), three solves in a row over MPC_BUDGET_S.
 #   On the car the controller state is reset whenever lateral control is inactive (as the kit at a stretch start); missed model frames
 #   only age the preview (hold beyond 15 steps) and never reset the feed-forward part.
-# torqueState.version: + 1000 x ANGLE_PI_VERSION_MPC_BIT (128). Parameters: MPC_PARAMS (set MPC 11 Nov, fitted at ramp 3 / 6 with the
-# ramp-aware MPC below on the joint-fit feed-forward table x 0.95 for summer and winter together; replaces MPC 7 Nov).
+# torqueState.version: + 1000 x ANGLE_PI_VERSION_MPC_BIT (128). Parameters: MPC_PARAMS (set MPC 16 Nov, fitted at ramp 3 / 6 with the
+# ramp-aware MPC below on the feed-forward table above, joint fit d31 x 1.00, for summer and winter together; replaces MPC 11 Nov).
 MPC_PARAM = "InsterMPC"
 ANGLE_PI_VERSION_MPC_BIT = 128
-# Parameter set MPC 11 Nov (11 Nov 2026, owner: one controller for summer and winter), SIM: Nelder-Mead on the simulator with the
-# feed-forward table of 11 - 16 Nov 2026 (joint-fit shape x 0.95; since 16 Nov 2026 the car's table is the joint fit d31 x 1.00,
-# CMD_RAW above, and this parameter set is unchanged), the car-side ramp 3 / 6 and the ramp-aware MPC, all MPC, PID and ra_* parameters
+# Parameter set MPC 16 Nov (16 Nov 2026; the tuning round's candidate "final 1", round rtk100; accepted by the owner with its warnings),
+# SIM: fitted on the simulator with the feed-forward table above (joint fit d31 x 1.00), the car-side ramp 3 / 6, the ramp-aware MPC
+# and the learned values held at MPC_FIXED (delay 0.20 s), all MPC, PID and ra_* parameters jointly. Nelder-Mead in three stages from
+# the best set of the round before (round rtj100, on the same table): 44 evaluations on 12 simulator variants, 37 on the same 12, then 446
+# on 24 variants (converged: best value improved < 0.001 over 30 iterations).
+# Objective J: 0.5 x summer + 0.5 x winter, each the per-step ideal-controller objective from 6 km/h with speed-band weights + the
+# low-frequency oscillation term (0.15-0.35 Hz, weight 4.3043) + the command-smoothness term (weight 1.14658); summer = both plant files,
+# winter = winter steering plants with torque gain 0.86 / 0.90 / 0.95 and the fitted pull plus a fixed-centre variant (weights 0.2 / 0.2 /
+# 0.4 / 0.2); stability weight 10 (stress and noise tests on a summer and a winter variant).
+# Scores on the full sets (11 runs, 32 summer and 4 x 32 winter variants; SIM, lower is better): J 9.8728, against 10.0959 for MPC 11 Nov
+# on this table and 10.3435 for MPC 11 Nov on the table before (x 0.95). Worse than MPC 11 Nov on this table (SIM, per speed band):
+# path inside +5.8 / +7.4 / +0.8 % at 30-60 / 60-90 / 90-130 km/h, at 60-90 km/h path outside +5.9 %, heading +4.7 %, lateral
+# acceleration +5.7 %; largest stress ratio of the winter fixed-centre set 1.0156 (1.0020). Better: all four criteria at 0-30 km/h
+# (0.7-3.5 %), all five objective sets, the held-out drives as a whole. Three parameters lie at a bound of the search: g_vlo and
+# ra_out (low), ra_pd (0). Values as fitted, bit for bit. SIM only, not validated on the car.
+# Before 16 Nov 2026: parameter set MPC 11 Nov (11 Nov 2026, owner: one controller for summer and winter), SIM: Nelder-Mead on the simulator with the
+# feed-forward table of 11 - 16 Nov 2026 (joint-fit shape x 0.95; from the table change of 16 Nov 2026 to the set MPC 16 Nov the
+# car ran this set on the joint fit d31 x 1.00, CMD_RAW above), the car-side ramp 3 / 6 and the ramp-aware MPC, all MPC, PID and ra_* parameters
 # fitted jointly, in two stages: 227 evaluations from MPC 7 Nov (oscillation weight 3.5, smoothness 0.188), then 207 evaluations from
 # that point on the final objective (objective 13.010 -> 12.939 on the 12 tuning variants; stopped by wall clock, not converged).
 # Final objective: 0.5 x summer + 0.5 x winter, each the per-step ideal-controller objective from 6 km/h + low-frequency oscillation
@@ -654,33 +680,23 @@ ANGLE_PI_VERSION_MPC_BIT = 128
 # summer and all winter variants. Worse: 60-90 km/h in every set (0.035-0.152), 90-120 km/h on every variant (100-110 km/h 0.16 in
 # summer, 0.21-0.23 in winter). F950 stress check 0.071 (<= 1; EST, reduced stress drives). Values as fitted, bit for bit. SIM only,
 # not validated on the car.
-# Before 11 Nov 2026: parameter set MPC 7 Nov, fitted on the 26-drive table (the feed-forward table of 7 Nov 2026; the controller was
-# re-tuned on it before shipping it): the optimisation round of 6 Nov (evening) on the simulator with that table, the car-side ramp at
-# 3 up / 6 down and
-# the ramp-aware MPC below (all MPC, PID and ra_* parameters fitted jointly; the same objective as MPC 6 Nov: the per-step variant of the
-# ideal-controller objective, from 6 km/h, stability weight 10, plus a low-frequency oscillation term (0.15-0.35 Hz, straight and
-# gentle curves, weight 3.5); simulator with the plan-loop and vehicle layers). Nelder-Mead from MPC 6 Nov (release parameters off),
-# converged after 78 iterations on 8 members (cal + tab57 on both plant files, both seeds). The release parameters stay as fitted:
-# small, but not neutral for the objective. With them set to off the 32-member objective is worse, 11.875 vs 11.839, entirely through
-# the stability term, via the pre-drop: two delay stress runs go above their references (1.005 and 1.003; worst 0.998 as fitted); the
-# tracking part is the same (11.839 vs 11.839). Values as fitted, bit for bit.
-# Replaces MPC 6 Nov (fitted on the table before, c19a1b0). SIM only, not validated on the car.
-MPC_PARAMS = {'g': 0.24904231631222715, 'g_lo': 0.407151427781796, 'g_vlo': 0.031453772040196726, 'wy': 0.5167014477912737,
-              'wpsi': 1.9488175405472, 'wdu': 7.776907967981213, 'wu': 7.205549294493615, 'tau_vlo': 1.4681135029991168,
-              'tau_lo': 0.5259044466169603, 'tau_hi': 0.5918330423708914, 'v_on': 39.98938116414386}
-# MPC 7 Nov (7 - 11 Nov 2026): {'g': 0.2565493476760934, 'g_lo': 0.22377120305459947, 'g_vlo': 0.026576882070846172,
-#   'wy': 0.31739420191845724, 'wpsi': 1.7052763121821215, 'wdu': 7.518239192951498, 'wu': 7.91666564387851, 'tau_vlo': 1.5072973847589601,
-#   'tau_lo': 0.5347320633541794, 'tau_hi': 0.5198521809253115, 'v_on': 43.08959807828134}
+MPC_PARAMS = {'g': 0.2686201669884946, 'g_lo': 0.43586811426626626, 'g_vlo': 0.010662091320919055, 'wy': 0.3736743269794651,
+              'wpsi': 1.9499513055835962, 'wdu': 7.665039432279762, 'wu': 6.881644795672081, 'tau_vlo': 1.404447801720307,
+              'tau_lo': 0.4767127050379273, 'tau_hi': 0.5291962164955547, 'v_on': 35.09361097817012}
+# MPC 11 Nov (11 - 16 Nov 2026): {'g': 0.24904231631222715, 'g_lo': 0.407151427781796, 'g_vlo': 0.031453772040196726,
+#   'wy': 0.5167014477912737, 'wpsi': 1.9488175405472, 'wdu': 7.776907967981213, 'wu': 7.205549294493615, 'tau_vlo': 1.4681135029991168,
+#   'tau_lo': 0.5259044466169603, 'tau_hi': 0.5918330423708914, 'v_on': 39.98938116414386}
 # the PID's gain set and D filter when the MPC is in use (selected only then; PI-30Oct / PID-30Oct unchanged otherwise): fitted jointly
-# with MPC_PARAMS (same parameter set MPC 11 Nov), coefficients in m/s as PID-30Oct; each gain is clipped at >= 0 (angle_pi_gain, in the
-# fit as on the car). With MPC 11 Nov: the D gain is 0 below 9.21 m/s (33.2 km/h; its constant term is negative), the I gain 0 below
-# 0.13 m/s (0.5 km/h) and above 39.05 m/s (140.6 km/h); P > 0 everywhere. (MPC 7 Nov: only I, 0 below 0.09 m/s and above 142.0 km/h.)
-ANGLE_PI_MPC_KP = (1.190859156488378, 0.6758686070047979, -0.011033469480174404)
-ANGLE_PI_MPC_KI = (-0.3173593295080285, 2.504047318684433, -0.06391789776183339)
-ANGLE_PI_MPC_KD = (-0.4187312142480444, 0.049049588286649445, -0.00038912116593913096)
-ANGLE_PI_MPC_D_TAU = 0.9395176649192107
-# MPC 7 Nov: KP (2.3291265229498572, 0.3493828389681169, -0.0022509794785350334), KI (-0.14385429318612764, 1.6813322693441184,
-#   -0.04253866028664136), KD (0.09485120379508169, 0.016987681460720737, 7.511713014005203e-05), D_TAU 0.8510167207818206
+# with MPC_PARAMS (same parameter set MPC 16 Nov), coefficients in m/s as PID-30Oct; each gain is clipped at >= 0 (angle_pi_gain, in the
+# fit as on the car). With MPC 16 Nov: the D gain is 0 below 8.30 m/s (29.9 km/h; its constant term is negative), the I gain 0 above
+# 38.72 m/s (139.4 km/h) and positive from standstill (0.87 at 0 m/s); P > 0 everywhere. (MPC 11 Nov: D 0 below 9.21 m/s (33.2 km/h),
+# I 0 below 0.13 m/s and above 39.05 m/s (140.6 km/h).)
+ANGLE_PI_MPC_KP = (1.8199668304414598, 0.33339106685916153, -0.002398250973265501)
+ANGLE_PI_MPC_KI = (0.8722440264929658, 2.749409665008769, -0.0715840399867188)
+ANGLE_PI_MPC_KD = (-0.5169236354858001, 0.06818415680457855, -0.0007080717813811476)
+ANGLE_PI_MPC_D_TAU = 0.6558229212588982
+# MPC 11 Nov: KP (1.190859156488378, 0.6758686070047979, -0.011033469480174404), KI (-0.3173593295080285, 2.504047318684433,
+#   -0.06391789776183339), KD (-0.4187312142480444, 0.049049588286649445, -0.00038912116593913096), D_TAU 0.9395176649192107
 MPC_WA = -1.0                      # log10 q_a (fixed)
 MPC_NBLK = 5                       # control steps per block / solve (20 Hz at dt 0.01)
 MPC_NH = 24                        # horizon blocks (1.2 s)
@@ -728,31 +744,32 @@ MPC_NBUF = 101                     # own desired-curvature buffer (1 s)
 #      limiter (so the MPC part stays inside the ramp);
 #   7. the P / I reference follows it: kappa_ref += k_a, the nominal model's (dead time + lag) response to the shift.
 # Parameters MPC_RAMP_PARAMS (ra_* as in the kit; all weights 0 = the plain InsterMPC). torqueState.version + 1000 x 512.
-# MPC_PARAMS and ANGLE_PI_MPC_* (MPC 7 Nov) were fitted with this option ON, hence its default on (6 Nov 2026): turning on InsterMPC
+# MPC_PARAMS and ANGLE_PI_MPC_* (every set since MPC 6 Nov, MPC 16 Nov too) were fitted with this option ON, hence its default on (6 Nov
+# 2026): turning on InsterMPC
 # gives the fitted controller. InsterMPCRampAware off stays as an A/B option: the car then runs them without the anticipation,
 # a combination that was not fitted or scored.
 MPC_RAMP_PARAM = "InsterMPCRampAware"
 ANGLE_PI_VERSION_MPC_RAMP_BIT = 512
-# MPC 11 Nov (fitted jointly with MPC_PARAMS, ramp 3 / 6, joint-fit table x 0.95): turn-in anticipation lam_in 0.637 at <= 15 km/h, 0.805 at
-# 40 km/h, 0 from 115.5 km/h; release anticipation lam_out 0.0201 / 0.0140 (<= 15 / 40 km/h, 0 at 159.9 km/h), release step 0.061 x the
-# predicted stiction term, no lead, no pre-drop (ra_pd 0; its end time 0.051 s then has no effect).
-# Before (MPC 7 Nov): fitted jointly with MPC_PARAMS (parameter set MPC 7 Nov, ramp 3 / 6, 26-drive table): turn-in anticipation
-# lam_in 0.655 at <= 15 km/h, 0.819 at 40 km/h, 0 from 109.5 km/h; the release side as fitted, with small weights: release anticipation
-# lam_out 0.0025 / 0.0026
-# (<= 15 / 40 km/h, 0 at 160 km/h), release step 0.0005 x the predicted stiction term, no lead, pre-drop 0.003 x the stiction term
-# (ending 0.05 s after the predicted flip). MPC 6 Nov had all release parameters at their neutral off values.
-MPC_RAMP_PARAMS = {'ra_in_lo': 0.6366800074413821, 'ra_in': 0.8047902275045123, 'ra_v0': 115.50503377218267,
-                   'ra_out_lo': 0.020080860987339636, 'ra_out': 0.014029555874718797, 'ra_v0_out': 159.87249223026686,
-                   'ra_st': 0.06106149583776907, 'ra_lead': 0.0, 'ra_pd': 0.0, 'ra_pd_t': 0.051058342512113705}
-# MPC 7 Nov: {'ra_in_lo': 0.654851178336799, 'ra_in': 0.8191807789445549, 'ra_v0': 109.45649599343251, 'ra_out_lo': 0.002499870105593264,
-#   'ra_out': 0.0025705281741539594, 'ra_v0_out': 160.0, 'ra_st': 0.0004975832927271756, 'ra_lead': 0.0, 'ra_pd': 0.003011002037188249,
-#   'ra_pd_t': 0.05}
+# MPC 16 Nov (fitted jointly with MPC_PARAMS, ramp 3 / 6, feed-forward table joint fit d31 x 1.00): turn-in anticipation lam_in 0.674 at
+# <= 15 km/h, 0.850 at 40 km/h, 0 from 113.6 km/h; release anticipation lam_out 0.0454 / 0.0083 (<= 15 / 40 km/h, 0 at 156.8 km/h), release
+# step 0.083 x the predicted stiction term with a lead of 0.013 s (the first set with a lead other than 0), no pre-drop (ra_pd 0; its end
+# time 0.069 s then has no effect).
+# Before (MPC 11 Nov, joint-fit table x 0.95): turn-in anticipation lam_in 0.637 at <= 15 km/h, 0.805 at 40 km/h, 0 from 115.5 km/h;
+# release anticipation lam_out 0.0201 / 0.0140 (<= 15 / 40 km/h, 0 at 159.9 km/h), release step 0.061 x the predicted stiction term, no
+# lead, no pre-drop (ra_pd 0).
+MPC_RAMP_PARAMS = {'ra_in_lo': 0.6739738085037419, 'ra_in': 0.8497412274274787, 'ra_v0': 113.56048010452663,
+                   'ra_out_lo': 0.04537143266834667, 'ra_out': 0.008252515995994372, 'ra_v0_out': 156.77739117565358,
+                   'ra_st': 0.08268633598068, 'ra_lead': 0.012945664842366103, 'ra_pd': 0.0, 'ra_pd_t': 0.06908020155905367}
+# MPC 11 Nov: {'ra_in_lo': 0.6366800074413821, 'ra_in': 0.8047902275045123, 'ra_v0': 115.50503377218267,
+#   'ra_out_lo': 0.020080860987339636, 'ra_out': 0.014029555874718797, 'ra_v0_out': 159.87249223026686, 'ra_st': 0.06106149583776907,
+#   'ra_lead': 0.0, 'ra_pd': 0.0, 'ra_pd_t': 0.051058342512113705}
 MPC_RAMP_RANGES = {'ra_in_lo': (0.0, 1.0), 'ra_in': (0.0, 1.0), 'ra_v0': (45.0, 160.0), 'ra_out_lo': (0.0, 1.0), 'ra_out': (0.0, 1.0),
                    'ra_v0_out': (45.0, 160.0), 'ra_st': (0.0, 1.0), 'ra_lead': (0.0, 0.5), 'ra_pd': (0.0, 1.0),
                    'ra_pd_t': (0.05, 0.5)}
 MPC_RAMP_CAP = float(INSTER_STEER_MAX)    # raw: the predicted request is clipped to the cap
 
-# Learned values held fixed while the MPC runs (owner 9 Nov 2026). Part of the parameter set above (MPC 7 Nov): the values the fit
+# Learned values held fixed while the MPC runs (owner 9 Nov 2026). Part of the parameter set above (unchanged since MPC 7 Nov; MPC 11 Nov
+# and MPC 16 Nov were fitted with them held on every simulated step): the values the fit
 # drives carried, which the simulator read per step from the logs. While InsterMPC is selected (mpc_fixed_values: Inster, v0, PID,
 # InsterSpeedFeedforward, no NNLC), controlsd and modeld use these instead of the learners' values:
 #   lat_delay         s       lagd's lateralDelay: controlsd's controller delay (v0 setpoint, MPC preview split, stiction plan history)

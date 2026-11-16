@@ -55,7 +55,8 @@ from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_
                                                                        mpc_ramp_anticipation, mpc_ramp_envelope, stiction_predicted, \
                                                                        ff_table_top, MPC_NH, MPC_DTB
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_VERSION_MPC_FIXED_BIT, MPC_FIXED
-from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_VERSION_SET_11NOV_BIT, ANGLE_PI_VERSION_FULL_SCALE_409_BIT
+from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import ANGLE_PI_VERSION_SET_11NOV_BIT, ANGLE_PI_VERSION_FULL_SCALE_409_BIT, \
+                                                                       ANGLE_PI_VERSION_SET_16NOV_BIT
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import LatControlTorque as LatControlTorqueV0
@@ -967,14 +968,15 @@ class TestInsterAnglePI(OpenpilotTestCase):
     assert first["F"][3] == angle_pi_log_version(LATERAL_PI, False)
 
   def test_log_version(self):
-    # F drives are identifiable in the logs: torqueState.version 6464105 with F on and the selector unset (PI = PI-30Oct base 105 +
-    # 1000 x (freeze-rule bit 64 | fixed-factor bit 256 | parameter set 11 Nov bit 2048 | full scale 409 bit 4096); 11-12 Nov 2026 2368105,
+    # F drives are identifiable in the logs: torqueState.version 14656105 with F on and the selector unset (PI = PI-30Oct base 105 +
+    # 1000 x (freeze-rule bit 64 | fixed-factor bit 256 | parameter set 11 Nov bit 2048 | full scale 409 bit 4096 | parameter set MPC 16 Nov
+    # bit 8192); 12-16 Nov 2026 6464105, 11-12 Nov 2026 2368105,
     # 30 Oct - 11 Nov 2026 320105, 29 Oct 2026 with G6 64103; before
     # the freeze fix 103; older drives: 102 G2, 101 F's gains with the crawl plan, 100 before it), 0 for v0 otherwise (upstream: 1)
     assert ANGLE_PI_G6_LOG_VERSION == 103 and ANGLE_PI_VERSION_FREEZE_DIR_BIT == 64 and ANGLE_PI_VERSION_FIXED_FACTOR_BIT == 256
     assert ANGLE_PI_G6_LOG_VERSION not in (latcontrol_torque_v0.VERSION, 1)
-    assert ANGLE_PI_VERSION_SET_11NOV_BIT == 2048 and ANGLE_PI_VERSION_FULL_SCALE_409_BIT == 4096
-    for on, expected in ((INSTER_KEYS, 6464105), ((ANGLE_PI_KEY,), 6464105), (STEP2_KEYS, 0), ((), 0),
+    assert ANGLE_PI_VERSION_SET_11NOV_BIT == 2048 and ANGLE_PI_VERSION_FULL_SCALE_409_BIT == 4096 and ANGLE_PI_VERSION_SET_16NOV_BIT == 8192
+    for on, expected in ((INSTER_KEYS, 14656105), ((ANGLE_PI_KEY,), 14656105), (STEP2_KEYS, 0), ((), 0),
                          (INSTER_KEYS + ("NeuralNetworkLateralControl",), 0)):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
       for active in (True, False):
@@ -1152,11 +1154,12 @@ class TestInsterAnglePIG6(OpenpilotTestCase):
     assert Params().get_bool("LateralJerkTorqueController")
 
   def test_log_version(self):
-    # PI drives are identifiable in the logs: torqueState.version 6464105 (PI-30Oct base 105 + 1000 x (freeze-rule bit 64 | fixed-factor
-    # bit 256 | parameter set 11 Nov bit 2048 | full scale 409 bit 4096; 2368105 until 12 Nov, 320105 until 11 Nov 2026); G6: 64103 on
+    # PI drives are identifiable in the logs: torqueState.version 14656105 (PI-30Oct base 105 + 1000 x (freeze-rule bit 64 | fixed-factor
+    # bit 256 | parameter set 11 Nov bit 2048 | full scale 409 bit 4096 | parameter set MPC 16 Nov bit 8192; 6464105 until 16 Nov, 2368105
+    # until 12 Nov, 320105 until 11 Nov 2026); G6: 64103 on
     # 29 Oct 2026, 103 before the freeze fix), 0 for v0 (upstream: 1); 102 (G2) is no longer produced
     assert ANGLE_PI_G6_LOG_VERSION == 103
-    for on, expected in ((INSTER_KEYS + (G6_KEY,), 6464105), ((ANGLE_PI_KEY, G6_KEY), 6464105), (INSTER_KEYS, 6464105), ((ANGLE_PI_KEY,), 6464105),
+    for on, expected in ((INSTER_KEYS + (G6_KEY,), 14656105), ((ANGLE_PI_KEY, G6_KEY), 14656105), (INSTER_KEYS, 14656105), ((ANGLE_PI_KEY,), 14656105),
                          (STEP2_KEYS + (G6_KEY,), 0), ((G6_KEY,), 0), (INSTER_KEYS + (G6_KEY, "NeuralNetworkLateralControl"), 0)):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on)
       for active in (True, False):
@@ -1241,7 +1244,7 @@ class TestInsterGainSets30Oct(OpenpilotTestCase):
     assert (ANGLE_PI_PI_BASE_VERSION, ANGLE_PI_PID_BASE_VERSION) == (105, 106)
     assert ANGLE_PI_PI_BASE_VERSION not in (ANGLE_PI_G6_LOG_VERSION, ANGLE_PI_P6_BASE_VERSION, 100, 101, 102)
     assert ANGLE_PI_PID_BASE_VERSION not in (ANGLE_PI_G6_LOG_VERSION, ANGLE_PI_P6_BASE_VERSION, 100, 101, 102)
-    expected = {(0, False): 6464105, (1, False): 6480106, (0, True): 6472105, (1, True): 6488106}   # + bit 2048 since 11 Nov, + bit 4096 since 12 Nov 2026
+    expected = {(0, False): 14656105, (1, False): 14672106, (0, True): 14664105, (1, True): 14680106}   # + bits 2048 / 4096 / 8192 since 11 / 12 / 16 Nov 2026
     for (ctrl, soft), version in expected.items():
       assert angle_pi_log_version(ctrl, soft) == version
 
@@ -1309,9 +1312,9 @@ class TestInsterLateralController(OpenpilotTestCase):
     # the UI's / manager's default: PID since the device-defaults change (owner, 10 Nov 2026; a fresh store gets it at manager start);
     # unset in the process (no manager start) the controller still falls back to the legacy selector / PI, as the cases above show
     assert params.get(CTRL_KEY, return_default=True) == LATERAL_PID
-    for ctrl, legacy_gains, kp, ki, kd, version in ((0, None, CAR_PI_KP, CAR_PI_KI, None, 6464105), (1, None, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD, 6480106),
-                                                    (None, None, CAR_PI_KP, CAR_PI_KI, None, 6464105), (None, 0, CAR_PI_KP, CAR_PI_KI, None, 6464105),
-                                                    (None, 2, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD, 6480106)):
+    for ctrl, legacy_gains, kp, ki, kd, version in ((0, None, CAR_PI_KP, CAR_PI_KI, None, 14656105), (1, None, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD, 14672106),
+                                                    (None, None, CAR_PI_KP, CAR_PI_KI, None, 14656105), (None, 0, CAR_PI_KP, CAR_PI_KI, None, 14656105),
+                                                    (None, 2, CAR_PID_KP, CAR_PID_KI, CAR_PID_KD, 14672106)):
       for on in ((ANGLE_PI_KEY,), INSTER_KEYS):
         c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl, legacy_gains=legacy_gains)
         assert c.inster_angle_pi and (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (kp, ki, kd)
@@ -1363,10 +1366,11 @@ class TestInsterLateralController(OpenpilotTestCase):
   def test_versions(self):
     # base versions (before the freeze fix the logged values); logged now with the freeze-rule bit 64 and the fixed-factor bit 256:
     # PI 320105, PID 336106 (gain sets PI-30Oct / PID-30Oct); since 11 Nov 2026 + bit 2048 (parameter set 11 Nov): 2368105 / 2384106;
-    # since 12 Nov 2026 + bit 4096 (A7, full scale 1.0 = 409 raw): 6464105 / 6480106
+    # since 12 Nov 2026 + bit 4096 (A7, full scale 1.0 = 409 raw): 6464105 / 6480106; since 16 Nov 2026 + bit 8192 (parameter set MPC 16 Nov):
+    # 14656105 / 14672106
     assert (ANGLE_PI_G6_LOG_VERSION, ANGLE_PI_P6_LOG_VERSION) == (103, 16104)
     assert ANGLE_PI_P6_LOG_VERSION == ANGLE_PI_P6_BASE_VERSION + 1000 * ANGLE_PI_VERSION_D_BIT and ANGLE_PI_VERSION_D_BIT == 16
-    for on, ctrl, expected in ((INSTER_KEYS, 1, 6480106), ((ANGLE_PI_KEY,), 1, 6480106), (INSTER_KEYS, 0, 6464105), (INSTER_KEYS, None, 6464105),
+    for on, ctrl, expected in ((INSTER_KEYS, 1, 14672106), ((ANGLE_PI_KEY,), 1, 14672106), (INSTER_KEYS, 0, 14656105), (INSTER_KEYS, None, 14656105),
                                (STEP2_KEYS, 1, 0), ((), 1, 0), (INSTER_KEYS + ("NeuralNetworkLateralControl",), 1, 0)):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=ctrl)
       for active in (True, False):
@@ -1524,11 +1528,13 @@ class TestInsterSoftSmallErrorP(OpenpilotTestCase):
 
   def test_versions(self):
     assert ANGLE_PI_VERSION_SOFT_P_BIT == 8 and ANGLE_PI_VERSION_D_BIT == 16
-    # incl. the freeze-rule bit 64, the fixed-factor bit 256, the parameter-set-11-Nov bit 2048 and the full-scale-409 bit 4096 (128 = the MPC)
-    expected = {(0, False): 6464105, (1, False): 6480106, (0, True): 6472105, (1, True): 6488106}   # + bit 2048 since 11 Nov, + bit 4096 since 12 Nov 2026
+    # incl. the freeze-rule bit 64, the fixed-factor bit 256, the parameter-set-11-Nov bit 2048, the full-scale-409 bit 4096 and the
+    # parameter-set-MPC-16-Nov bit 8192 (128 = the MPC)
+    expected = {(0, False): 14656105, (1, False): 14672106, (0, True): 14664105, (1, True): 14680106}   # + bits 2048 / 4096 / 8192 since 11 / 12 / 16 Nov 2026
     for (ctrl, soft), version in expected.items():
       assert angle_pi_log_version(ctrl, soft) == version, (ctrl, soft)
-    always = ANGLE_PI_VERSION_FREEZE_DIR_BIT | ANGLE_PI_VERSION_FIXED_FACTOR_BIT | ANGLE_PI_VERSION_SET_11NOV_BIT | ANGLE_PI_VERSION_FULL_SCALE_409_BIT
+    always = (ANGLE_PI_VERSION_FREEZE_DIR_BIT | ANGLE_PI_VERSION_FIXED_FACTOR_BIT | ANGLE_PI_VERSION_SET_11NOV_BIT | ANGLE_PI_VERSION_FULL_SCALE_409_BIT |
+              ANGLE_PI_VERSION_SET_16NOV_BIT)
     assert angle_pi_log_version(LATERAL_PID, True) == ANGLE_PI_PID_BASE_VERSION + 1000 * (ANGLE_PI_VERSION_D_BIT | ANGLE_PI_VERSION_SOFT_P_BIT
                                                                                          | always)
     assert angle_pi_log_version(LATERAL_PID, False) == ANGLE_PI_PID_BASE_VERSION + 1000 * (ANGLE_PI_VERSION_D_BIT | always)
@@ -2035,7 +2041,7 @@ class TestInsterMPC(OpenpilotTestCase):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=on, ctrl=1)
       assert c.inster_mpc is not None
       assert c.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | ANGLE_PI_VERSION_MPC_BIT | 256 |
-                                                                               ANGLE_PI_VERSION_MPC_FIXED_BIT | 2048 | 4096)
+                                                                               ANGLE_PI_VERSION_MPC_FIXED_BIT | 2048 | 4096 | 8192)
       assert c.inster_fixed is MPC_FIXED
     for car_name, on, ctrl in ((HYUNDAI.HYUNDAI_INSTER, INSTER_KEYS, 0), (HYUNDAI.HYUNDAI_INSTER, STEP2_KEYS, 1),
                                (HYUNDAI.HYUNDAI_INSTER, (ANGLE_PI_KEY,), 1),
@@ -2045,13 +2051,13 @@ class TestInsterMPC(OpenpilotTestCase):
       c, VM = _make_v0(car_name, on=on + (MPC_KEY,), ctrl=ctrl)
       assert c.inster_mpc is None
       assert _run(c, VM) == _run(*_make_v0(car_name, on=on, ctrl=ctrl)), (car_name, on, ctrl)
-    assert angle_pi_log_version(LATERAL_PID, True, True) == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 8 | 64 | 128 | 256 | 2048 | 4096)
+    assert angle_pi_log_version(LATERAL_PID, True, True) == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 8 | 64 | 128 | 256 | 2048 | 4096 | 8192)
     # owner 1 Nov 2026: Soft Small-Error P is off while the MPC runs (version without the Soft-P bit; the run equals MPC without Soft-P);
     # without the MPC (switch off, or the MPC set-up failed) Soft-P stays as selected
     sp_mpc, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (O5_KEY, MPC_KEY), ctrl=1)
     assert sp_mpc.inster_mpc is not None and not sp_mpc.inster_soft_p
     assert sp_mpc.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | ANGLE_PI_VERSION_MPC_BIT | 256 |
-                                                                                ANGLE_PI_VERSION_MPC_FIXED_BIT | 2048 | 4096)
+                                                                                ANGLE_PI_VERSION_MPC_FIXED_BIT | 2048 | 4096 | 8192)
     def mdl(ay):
       return _MVM(int(ay * 1000), 0.0, 15.0)
     assert _run(sp_mpc, VM, extension_model=mdl) == _run(*_make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1),
@@ -2191,21 +2197,31 @@ class TestInsterMPC(OpenpilotTestCase):
     assert c.inster_mpc.n_solve > 100
 
   def test_gain_set(self):
-    # car review 1, change 2: the MPC variant's own PID gains and D filter, selected only when the MPC is in use. Parameter set MPC 11 Nov
-    # (fitted at ramp 3 / 6 with the ramp-aware MPC on, on the joint-fit feed-forward table x 0.95, summer and winter) is pinned here, its
-    # ramp-aware parameters included; it differs from PID-30Oct. Unpatched: the MPC uses it. (MPC 7 Nov until 11 Nov 2026.)
+    # car review 1, change 2: the MPC variant's own PID gains and D filter, selected only when the MPC is in use. Parameter set MPC 16 Nov
+    # (the tuning round's candidate "final 1": fitted at ramp 3 / 6 with the ramp-aware MPC on, on the feed-forward table joint fit d31 x 1.00,
+    # summer and winter) is pinned here, its ramp-aware parameters included; it differs from PID-30Oct. Unpatched: the MPC uses it.
+    # (MPC 11 Nov until 16 Nov 2026, MPC 7 Nov until 11 Nov 2026.)
     assert (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD, ANGLE_PI_MPC_D_TAU) == (
-      (1.190859156488378, 0.6758686070047979, -0.011033469480174404), (-0.3173593295080285, 2.504047318684433, -0.06391789776183339),
-      (-0.4187312142480444, 0.049049588286649445, -0.00038912116593913096), 0.9395176649192107)
-    assert MPC_PARAMS == {'g': 0.24904231631222715, 'g_lo': 0.407151427781796, 'g_vlo': 0.031453772040196726, 'wy': 0.5167014477912737,
-                          'wpsi': 1.9488175405472, 'wdu': 7.776907967981213, 'wu': 7.205549294493615, 'tau_vlo': 1.4681135029991168,
-                          'tau_lo': 0.5259044466169603, 'tau_hi': 0.5918330423708914, 'v_on': 39.98938116414386}
-    assert MPC_RAMP_PARAMS == {'ra_in_lo': 0.6366800074413821, 'ra_in': 0.8047902275045123, 'ra_v0': 115.50503377218267,
-                               'ra_out_lo': 0.020080860987339636, 'ra_out': 0.014029555874718797, 'ra_v0_out': 159.87249223026686,
-                               'ra_st': 0.06106149583776907, 'ra_lead': 0.0, 'ra_pd': 0.0, 'ra_pd_t': 0.051058342512113705}
-    # the D gain's constant term is negative: D is 0 below 9.21 m/s (33.2 km/h), the I gain 0 above 39.05 m/s (140.6 km/h); P never clipped
-    assert angle_pi_gain(ANGLE_PI_MPC_KD, 9.15) == 0.0 < angle_pi_gain(ANGLE_PI_MPC_KD, 9.3)
-    assert angle_pi_gain(ANGLE_PI_MPC_KI, 39.0) > 0.0 == angle_pi_gain(ANGLE_PI_MPC_KI, 39.1)
+      (1.8199668304414598, 0.33339106685916153, -0.002398250973265501), (0.8722440264929658, 2.749409665008769, -0.0715840399867188),
+      (-0.5169236354858001, 0.06818415680457855, -0.0007080717813811476), 0.6558229212588982)
+    assert MPC_PARAMS == {'g': 0.2686201669884946, 'g_lo': 0.43586811426626626, 'g_vlo': 0.010662091320919055, 'wy': 0.3736743269794651,
+                          'wpsi': 1.9499513055835962, 'wdu': 7.665039432279762, 'wu': 6.881644795672081, 'tau_vlo': 1.404447801720307,
+                          'tau_lo': 0.4767127050379273, 'tau_hi': 0.5291962164955547, 'v_on': 35.09361097817012}
+    assert MPC_RAMP_PARAMS == {'ra_in_lo': 0.6739738085037419, 'ra_in': 0.8497412274274787, 'ra_v0': 113.56048010452663,
+                               'ra_out_lo': 0.04537143266834667, 'ra_out': 0.008252515995994372, 'ra_v0_out': 156.77739117565358,
+                               'ra_st': 0.08268633598068, 'ra_lead': 0.012945664842366103, 'ra_pd': 0.0, 'ra_pd_t': 0.06908020155905367}
+    # the D gain's constant term is negative: D is 0 below 8.30 m/s (29.9 km/h); the I gain is 0 above 38.72 m/s (139.4 km/h) and, unlike
+    # MPC 11 Nov, positive from standstill; P never clipped
+    assert angle_pi_gain(ANGLE_PI_MPC_KD, 8.25) == 0.0 < angle_pi_gain(ANGLE_PI_MPC_KD, 8.35)
+    assert angle_pi_gain(ANGLE_PI_MPC_KI, 38.7) > 0.0 == angle_pi_gain(ANGLE_PI_MPC_KI, 38.75)
+    assert angle_pi_gain(ANGLE_PI_MPC_KI, 0.0) == ANGLE_PI_MPC_KI[0] > 0.0
+    # the set is not MPC 11 Nov (the set before, values below): none of these eight values is equal
+    mpc_11nov = (1.190859156488378, -0.3173593295080285, -0.4187312142480444, 0.9395176649192107, 0.24904231631222715, 39.98938116414386,
+                 0.6366800074413821, 0.0)
+    assert all(x != y for x, y in zip((ANGLE_PI_MPC_KP[0], ANGLE_PI_MPC_KI[0], ANGLE_PI_MPC_KD[0], ANGLE_PI_MPC_D_TAU, MPC_PARAMS['g'],
+                                       MPC_PARAMS['v_on'], MPC_RAMP_PARAMS['ra_in_lo'], MPC_RAMP_PARAMS['ra_lead']), mpc_11nov, strict=True))
+    # the release-step lead is on for the first time in a shipped set (ra_lead > 0, inside its range), the pre-drop stays off
+    assert 0.0 < MPC_RAMP_PARAMS['ra_lead'] <= 0.5 and MPC_RAMP_PARAMS['ra_pd'] == 0.0 and MPC_RAMP_PARAMS['ra_st'] > 0.0
     assert all(angle_pi_gain(ANGLE_PI_MPC_KP, v) > 0.0 for v in np.linspace(0.0, 45.0, 451))
     assert (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD) != (ANGLE_PI_PID_KP, ANGLE_PI_PID_KI, ANGLE_PI_PID_KD)
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
@@ -2216,17 +2232,17 @@ class TestInsterMPC(OpenpilotTestCase):
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY, MPC_RAMP_KEY), ctrl=1)
     assert c.inster_mpc is not None and c.inster_mpc.p == MPC_PARAMS and c.inster_mpc.ra == MPC_RAMP_PARAMS
     assert (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (ANGLE_PI_MPC_KP, ANGLE_PI_MPC_KI, ANGLE_PI_MPC_KD)
-    # 976106 + the held learned values (bit 1024, 9 Nov 2026) + set 11 Nov (2048) + full scale 409 (4096, 12 Nov 2026)
-    assert c.inster_angle_pi_version == 8144106
+    # 976106 + the held learned values (bit 1024, 9 Nov 2026) + set 11 Nov (2048) + full scale 409 (4096, 12 Nov 2026) + set MPC 16 Nov (8192)
+    assert c.inster_angle_pi_version == 16336106
     # the default configuration (6 Nov 2026): InsterMPCRampAware defaults to on, so turning on InsterMPC alone gives the fitted
     # controller; off stays as an A/B option (the plain MPC with these settings, not fitted)
     assert Params().get_default_value(MPC_RAMP_KEY) is True
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1, defaults=(MPC_RAMP_KEY,))
-    assert c.inster_mpc is not None and c.inster_mpc.ra == MPC_RAMP_PARAMS and c.inster_angle_pi_version == 8144106
+    assert c.inster_mpc is not None and c.inster_mpc.ra == MPC_RAMP_PARAMS and c.inster_angle_pi_version == 16336106
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=1, defaults=(MPC_RAMP_KEY,))
     assert c.inster_mpc is None                                       # without InsterMPC the default-on sub-switch does nothing
     c, _ = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
-    assert c.inster_mpc is not None and c.inster_mpc.ra is None and c.inster_angle_pi_version == 7632106   # 464106 + bit 1024 + bit 2048 + bit 4096
+    assert c.inster_mpc is not None and c.inster_mpc.ra is None and c.inster_angle_pi_version == 15824106   # 464106 + bit 1024 + bit 2048 + bit 4096 + bit 8192
     # distinct values patched in to see which set is taken
     mkp, mki, mkd, mtau = (3.0, 0.4, -0.01), (0.8, 0.3, -0.008), (0.3, 0.001, 0.0), 0.05
     with mock.patch.multiple(latcontrol_torque_v0, ANGLE_PI_MPC_KP=mkp, ANGLE_PI_MPC_KI=mki, ANGLE_PI_MPC_KD=mkd, ANGLE_PI_MPC_D_TAU=mtau):
@@ -2251,7 +2267,7 @@ class TestInsterMPC(OpenpilotTestCase):
     with mock.patch.object(latcontrol_torque_v0, 'InsterMPC', side_effect=RuntimeError('gain rows')):
       c, VM = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS + (MPC_KEY,), ctrl=1)
     assert c.inster_mpc is None and c.inster_fixed is MPC_FIXED
-    assert c.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | 256 | ANGLE_PI_VERSION_MPC_FIXED_BIT | 2048 | 4096) == 7504106
+    assert c.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | 256 | ANGLE_PI_VERSION_MPC_FIXED_BIT | 2048 | 4096 | 8192) == 15696106
     assert (c.pid.kp_coeffs, c.pid.ki_coeffs, c.pid.kd_coeffs) == (ANGLE_PI_PID_KP, ANGLE_PI_PID_KI, ANGLE_PI_PID_KD)
     ref, VM_ref = _make_v0(HYUNDAI.HYUNDAI_INSTER, on=INSTER_KEYS, ctrl=1)
     ref_update = ref.update_torque_parameters
@@ -2385,7 +2401,7 @@ class TestInsterMPCRampAware(OpenpilotTestCase):
     assert on.inster_mpc.ra == strong
     assert on.inster_angle_pi_version == ANGLE_PI_PID_BASE_VERSION + 1000 * (16 | 64 | ANGLE_PI_VERSION_MPC_BIT | 256 |
                                                                              ANGLE_PI_VERSION_MPC_RAMP_BIT | ANGLE_PI_VERSION_MPC_FIXED_BIT | 2048 |
-                                                                             4096) == 8144106
+                                                                             4096 | 8192) == 16336106
     assert angle_pi_log_version(LATERAL_PID, False, False, True) == angle_pi_log_version(LATERAL_PID, False)   # only with the MPC
     run_on = _run(on, VM, extension_model=mdl)
     assert run_on != base
