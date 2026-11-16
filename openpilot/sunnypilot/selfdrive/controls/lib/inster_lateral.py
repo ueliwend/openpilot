@@ -92,18 +92,31 @@ def max_lateral_accel_no_roll(CP, default: float) -> float:
 A_NODES = (0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 3.5)       # m/s^2
 V_NODES = tuple(x / 3.6 for x in (22.0, 32.0, 48.0, 76.0, 111.0))          # m/s
 CMD_RAW = (                                                                # rows: V_NODES, columns: A_NODES
-  (0.0, 21.470, 45.315, 92.340, 165.680, 257.450, 299.915, 356.820, 388.550, 388.550, 388.550),   # 22 km/h
-  (0.0, 21.470, 45.315, 92.340, 135.660, 164.065, 198.075, 291.270, 348.650, 388.550, 388.550),   # 32 km/h
-  (0.0, 18.335, 45.315, 92.340, 127.300, 158.080, 186.485, 245.670, 300.200, 344.375, 370.405),   # 48 km/h
-  (0.0, 18.335, 37.810, 60.990, 93.385, 120.460, 149.340, 235.220, 287.280, 322.050, 351.215),    # 76 km/h
-  (0.0, 18.335, 36.100, 54.815, 81.035, 107.635, 137.085, 217.550, 279.775, 315.590, 343.520),    # 111 km/h
+  (0.0, 22.600, 47.900, 98.600, 174.800, 270.900, 316.000, 375.700, 409.000, 409.000, 409.000),   # 22 km/h
+  (0.0, 22.600, 47.900, 97.500, 142.800, 172.700, 208.300, 306.700, 366.400, 409.000, 409.000),   # 32 km/h
+  (0.0, 19.200, 47.900, 97.500, 133.900, 166.500, 196.400, 258.500, 316.200, 362.000, 389.600),   # 48 km/h
+  (0.0, 19.200, 40.100, 64.100, 97.900, 126.500, 157.200, 246.900, 302.000, 338.200, 368.100),    # 76 km/h
+  (0.0, 19.200, 38.000, 57.600, 85.000, 112.700, 143.300, 226.600, 293.500, 331.300, 360.300),    # 111 km/h
 )
-# 11 Nov 2026: ONE table for summer and winter (owner): the shape of the joint summer + winter refit over 29 drives (9 Nov 2026; option-b
-# joint fit on hybrid points with per-drive offsets and a regime factor for the winter drives, k_w = 0.897; the shape is the fit's summer
-# table) times one factor s = 0.95, the compromise between summer (k = 1) and winter (k ~ 0.9). Every cell is the exact product
-# (0.001 raw) of the joint-fit cell and 0.95, the table the MPC parameter set below was fitted and scored on in the simulator. The
-# joint-fit cells at 409 become 388.55, so the feed-forward tops out at 388.55 raw; the steering limit stays 409 (INSTER_STEER_MAX), the
-# PID / MPC can still use the rest. SIM only, not validated on the car. The table of 7 Nov 2026 (26-drive refit, below) is replaced.
+# 16 Nov 2026 (owner's go for the feed-forward table only): the table of the joint summer + winter refit over 34 drives (10 Nov 2026,
+# fit d31: the 29 drives of the 9 Nov refit plus five more; hybrid points, per-drive offsets, winter factor k_w = 0.899; the table is
+# the fit's shared shape, the summer reference k = 1) times the factor s = 1.00: every cell is the joint-fit cell as fitted (0.1 raw;
+# inster-dev tools/fit/ff_joint/d31/table_joint.json, sha256 4c1ed393bd98...). Raw units (LKAS11), so the cells do not depend on the
+# full scale (1.0 = 409 raw); as a fraction of full scale a cell is cell / 409. The feed-forward tops out at 409 raw again (22 and 32
+# km/h rows; 389.6 / 368.1 / 360.3 at 48 / 76 / 111 km/h), which is the steering limit (INSTER_STEER_MAX), unchanged. Against the table
+# before (below): every cell higher, by 4.2-6.8 %, 0.9-20.45 raw (most at the top of the 22 and 32 km/h rows); the 0.95 factor
+# is 5.3 % of it, the rest (at most 2.4 raw) the refit. Only the table changes: the MPC parameter set below (MPC 11 Nov) and every other
+# value stay as they are. That set was fitted on the table before; on this table it is scored in the simulator, not refitted (round
+# rtk100, candidate "FF table only" = MPC 11 Nov on d31 x 1.00). SIM only, not validated on the car.
+# 11 Nov 2026 - 16 Nov 2026 (the shape of the joint refit over 29 drives of 9 Nov 2026, fit d30, k_w = 0.897, times s = 0.95, the
+# compromise between summer (k = 1) and winter (k ~ 0.9); every cell the exact product (0.001 raw) of the joint-fit cell and 0.95; top
+# 409 x 0.95 = 388.55 raw; the table the MPC parameter set below was fitted and scored on in the simulator):
+#   (0.0, 21.470, 45.315, 92.340, 165.680, 257.450, 299.915, 356.820, 388.550, 388.550, 388.550),   # 22 km/h
+#   (0.0, 21.470, 45.315, 92.340, 135.660, 164.065, 198.075, 291.270, 348.650, 388.550, 388.550),   # 32 km/h
+#   (0.0, 18.335, 45.315, 92.340, 127.300, 158.080, 186.485, 245.670, 300.200, 344.375, 370.405),   # 48 km/h
+#   (0.0, 18.335, 37.810, 60.990, 93.385, 120.460, 149.340, 235.220, 287.280, 322.050, 351.215),    # 76 km/h
+#   (0.0, 18.335, 36.100, 54.815, 81.035, 107.635, 137.085, 217.550, 279.775, 315.590, 343.520),    # 111 km/h
+# 11 Nov 2026: ONE table for summer and winter (owner). The table of 7 Nov 2026 (26-drive refit, below) was replaced by it.
 # 7 Nov 2026 - 11 Nov 2026 (fb352a1):
 #   (0.0, 22.6, 48.9, 102.1, 183.3, 275.8, 321.2, 387.9, 409.0, 409.0, 409.0),   # 22 km/h  (data-driven to 1.5 m/s^2)
 #   (0.0, 22.6, 48.9, 96.9, 139.9, 167.6, 201.0, 303.3, 370.6, 409.0, 409.0),    # 32 km/h  (data-driven to 2.5)
@@ -459,7 +472,8 @@ ANGLE_PI_VERSION_FIXED_FACTOR_BIT = 256   # 30 Oct 2026: fixed factor F0 on the 
 # 11 Nov 2026: parameter set 11 Nov (feed-forward table CMD_RAW = joint-fit shape x 0.95 for summer and winter, MPC_PARAMS /
 # ANGLE_PI_MPC_* / MPC_RAMP_PARAMS set MPC 11 Nov), always set with F on, so drives on this set are told apart in the logs from drives on
 # the 7 Nov set (earlier table and parameter-set changes did not change the version; this one does, owner 11 Nov). No behaviour hangs
-# on the bit.
+# on the bit. 16 Nov 2026: the feed-forward table changed (joint fit d31 x 1.00, CMD_RAW above) while the MPC / PID parameter set
+# stays the set of 11 Nov; the bit stays set and from then on marks the parameter set only, not the table.
 ANGLE_PI_VERSION_SET_11NOV_BIT = 2048
 # 12 Nov 2026 (A7, owner): full scale actuators.torque 1.0 = 409 raw (was 384), always set with F on, so drives on the new unit are told
 # apart in controlsState too (the unit also shows in every rlog as CarParams latAccelFactor 3.94 vs 3.70, and as torqueOutputCan /
@@ -626,7 +640,8 @@ class InsterWheelRateFilter:
 MPC_PARAM = "InsterMPC"
 ANGLE_PI_VERSION_MPC_BIT = 128
 # Parameter set MPC 11 Nov (11 Nov 2026, owner: one controller for summer and winter), SIM: Nelder-Mead on the simulator with the
-# feed-forward table above (joint-fit shape x 0.95), the car-side ramp 3 / 6 and the ramp-aware MPC, all MPC, PID and ra_* parameters
+# feed-forward table of 11 - 16 Nov 2026 (joint-fit shape x 0.95; since 16 Nov 2026 the car's table is the joint fit d31 x 1.00,
+# CMD_RAW above, and this parameter set is unchanged), the car-side ramp 3 / 6 and the ramp-aware MPC, all MPC, PID and ra_* parameters
 # fitted jointly, in two stages: 227 evaluations from MPC 7 Nov (oscillation weight 3.5, smoothness 0.188), then 207 evaluations from
 # that point on the final objective (objective 13.010 -> 12.939 on the 12 tuning variants; stopped by wall clock, not converged).
 # Final objective: 0.5 x summer + 0.5 x winter, each the per-step ideal-controller objective from 6 km/h + low-frequency oscillation
@@ -887,8 +902,8 @@ def mpc_gain_matrix(p: dict):
 
 def ff_table_inverse(raw: float, v_ego: float) -> float:
   """exact inverse of ff_raw (raw units in, signed lateral acceleration out, m/s^2): the acceleration whose table command is raw; on
-  the table's plateau (its top, 388.55 raw since 11 Nov 2026) the first acceleration that reaches it; beyond the top the same as the
-  top"""
+  the table's plateau (its top: 409 raw at <= 32 km/h, falling to 360.3 raw at >= 111 km/h since 16 Nov 2026; 388.55 at <= 32 km/h
+  before) the first acceleration that reaches it; beyond the top the same as the top"""
   if raw == 0.0:
     return 0.0
   r = abs(raw)

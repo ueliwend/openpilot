@@ -105,6 +105,66 @@ class TestInsterTable(OpenpilotTestCase):
         assert table_raw(a, v) == CMD_RAW[j][i]                       # raw table: the cells exactly
         assert abs(table_torque(a, v) * STEER_MAX_RAW - CMD_RAW[j][i]) < 1e-9
 
+  def test_table_is_joint_fit_d31(self):
+    # 16 Nov 2026 (owner's go for the feed-forward table only): the car's table is the joint refit over 34 drives (fit d31) x 1.00,
+    # cell for cell the values of inster-dev tools/fit/ff_joint/d31/table_joint.json (sha256 4c1ed393bd98..., 0.1 raw), in raw units
+    # on the unchanged grid; as a fraction of full scale (1.0 = 409 raw) a cell is cell / 409. The table before it (the 29-drive
+    # joint shape x 0.95, PLATEAU_TABLES['d30x95']) is 4.2-6.8 % lower in every cell and is no longer the car's.
+    d31 = (
+      (0.0, 22.6, 47.9, 98.6, 174.8, 270.9, 316.0, 375.7, 409.0, 409.0, 409.0),
+      (0.0, 22.6, 47.9, 97.5, 142.8, 172.7, 208.3, 306.7, 366.4, 409.0, 409.0),
+      (0.0, 19.2, 47.9, 97.5, 133.9, 166.5, 196.4, 258.5, 316.2, 362.0, 389.6),
+      (0.0, 19.2, 40.1, 64.1, 97.9, 126.5, 157.2, 246.9, 302.0, 338.2, 368.1),
+      (0.0, 19.2, 38.0, 57.6, 85.0, 112.7, 143.3, 226.6, 293.5, 331.3, 360.3),
+    )
+    assert CMD_RAW == d31 == self.PLATEAU_TABLES['d31']
+    assert A_NODES == (0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 3.5)
+    assert V_NODES == tuple(x / 3.6 for x in (22.0, 32.0, 48.0, 76.0, 111.0))
+    before = self.PLATEAU_TABLES['d30x95']
+    assert CMD_RAW != before
+    for j, v in enumerate(V_NODES):
+      for i, a in enumerate(A_NODES):
+        assert table_raw(a, v) == d31[j][i] and ff_raw(-a, v) == -d31[j][i]
+        assert table_torque(a, v) == d31[j][i] / 409.0                 # fraction of full scale: raw / 409
+        if i:
+          assert 1.04 < d31[j][i] / before[j][i] < 1.07, (j, i)
+    # between the nodes: bilinear in the d31 cells (22 -> 32 km/h at 27 km/h, 1.0 -> 1.25 m/s^2 at 1.1 m/s^2), not the table before
+    c0 = 0.5 * 174.8 + 0.5 * 142.8
+    c1 = 0.5 * 270.9 + 0.5 * 172.7
+    assert abs(table_raw(1.1, 27.0 / 3.6) - (c0 + (c1 - c0) * 0.4)) < 1e-9
+    assert abs(ff_raw(1.1, 27.0 / 3.6) - 184.0) < 1e-9                 # the table before gave 174.705 here
+    # the plateau: 409 raw (the cap) up to 32 km/h, 360.3 raw from 111 km/h; ff_torque 1.0 at the top, never above
+    assert ff_raw(3.5, 5.0) == ff_raw(9.0, 32.0 / 3.6) == 409.0 == INSTER_STEER_MAX and ff_torque(3.5, 5.0) == 1.0
+    assert ff_raw(3.5, 111.0 / 3.6) == ff_raw(9.0, 45.0) == 360.3
+    assert ff_table_top(409.0, 6.0) and not ff_table_top(408.999, 6.0)
+
+  def test_table_request_inside_the_limits(self):
+    # the feed-forward request of the whole table stays inside the unchanged limits: 0 <= raw <= 409 (INSTER_STEER_MAX, the cap and
+    # full scale), |ff_torque| <= 1.0, never falling with |a| at any speed, never rising with speed at a given |a|, the steepest
+    # slope 384.4 raw per m/s^2 (22 km/h, 1.0 -> 1.25 m/s^2; 367.08 on the table before, the same cell x 0.95 and the refit).
+    # Dense: 0-160 km/h in 1 km/h steps, |a| 0-6 m/s^2 in 0.02 steps.
+    assert INSTER_STEER_MAX == 409 and STEER_MAX_RAW == 409.0
+    top_slope = 0.0
+    hi = 0.0
+    for k in range(161):
+      v = k / 3.6
+      prev = 0.0
+      for n in range(301):
+        a = n * 0.02
+        raw = ff_raw(a, v)
+        assert 0.0 <= raw <= INSTER_STEER_MAX and ff_raw(-a, v) == -raw, (v, a, raw)
+        assert abs(ff_torque(a, v)) <= 1.0 and abs(ff_torque(-a, v)) <= 1.0
+        assert raw >= prev - 1e-9, (v, a)
+        if n:
+          top_slope = max(top_slope, (raw - prev) / 0.02)
+        hi = max(hi, raw)
+        prev = raw
+    assert hi == 409.0
+    cell_slopes = [(row[i + 1] - row[i]) / (A_NODES[i + 1] - A_NODES[i]) for row in CMD_RAW for i in range(len(A_NODES) - 1)]
+    assert abs(max(cell_slopes) - 384.4) < 1e-9 and min(cell_slopes) == 0.0 and top_slope <= max(cell_slopes) + 1e-6
+    assert all(row[i] <= row[i + 1] for row in CMD_RAW for i in range(len(A_NODES) - 1))
+    assert all(CMD_RAW[j][i] >= CMD_RAW[j + 1][i] for j in range(len(V_NODES) - 1) for i in range(len(A_NODES)))
+
   def test_raw_and_fraction_agree(self):
     # ff_torque is ff_raw / STEER_MAX_RAW; the raw table equals the former fraction-of-384 table (x 384) to rounding
     old_tab = tuple(tuple(c / 384.0 for c in row) for row in CMD_RAW)
@@ -156,8 +216,9 @@ class TestInsterTable(OpenpilotTestCase):
     assert n > 10000 and n_old_missed > 0
 
   # Plateau-test tables (A7 plateau fix, 12 Nov 2026). Sources (inster-dev, sha256 of the file):
-  #   d30x95  tools/fit/ff_joint/d30/table_summer.json (80a4150a0c8d...) x 0.95, rounded to 0.001 = the car's CMD_RAW (asserted below)
-  #   d31     tools/fit/ff_joint/d31/table_joint.json  (4c1ed393bd98...) x 1.00 (rtk100's table, top 409)
+  #   d30x95  tools/fit/ff_joint/d30/table_summer.json (80a4150a0c8d...) x 0.95, rounded to 0.001 (the car's CMD_RAW 11 - 16 Nov 2026)
+  #   d31     tools/fit/ff_joint/d31/table_joint.json  (4c1ed393bd98...) x 1.00 (rtk100's table, top 409) = the car's CMD_RAW since
+  #           16 Nov 2026 (asserted below and in test_table_is_joint_fit_d31)
   #   d26     tools/fit/ff_joint/d26/table_new.json    (28894b55b6cc...) (the table of fb352a1, top 409)
   #   c19a1b0 tools/simkit/sim/candidates.py CMD_RAW_CAR (759de6e32c86...) (the table of b7704b3 / c19a1b0, top 409)
   PLATEAU_TABLES = {
@@ -234,9 +295,10 @@ class TestInsterTable(OpenpilotTestCase):
 
   def test_plateau_test_exact_on_tables_all_speeds(self):
     # A7 plateau fix (12 Nov 2026): the plateau test on the command _ramp_shift tests (ff_raw clipped to 409) equals the exact answer at
-    # every speed 0-160 km/h (0.01 km/h steps and the node speeds) for the car's table (d30x95) and the tables that reach 409 at the top
-    # (d31 = rtk100's, d26, c19a1b0). Before the fix 2.4-2.5 % of the plateau evaluations of the 409 tables tested False.
-    assert self.PLATEAU_TABLES['d30x95'] == CMD_RAW
+    # every speed 0-160 km/h (0.01 km/h steps and the node speeds) for the car's table (d31 since 16 Nov 2026, top 409), the table
+    # before it (d30x95, top 388.55) and the other tables that reach 409 at the top (d26, c19a1b0). Before the fix 2.4-2.5 % of the
+    # plateau evaluations of the 409 tables tested False.
+    assert self.PLATEAU_TABLES['d31'] == CMD_RAW
     speeds = [k / 100.0 / 3.6 for k in range(16001)] + list(inster_lateral.V_NODES)
     for name, tbl in self.PLATEAU_TABLES.items():
       n = self._check_plateau(tbl, speeds, [3.5, 3.5000001, 4.0, 6.0, 100.0], [])
@@ -317,8 +379,8 @@ class TestInsterTable(OpenpilotTestCase):
 
   def test_smooth_in_lateral_accel(self):
     # the rule the table is built and refit by (t2_table409): below the cap, neighbouring slopes in a differ by at most x2.5 up and
-    # x0.4 down (0.01 tolerance: the cells are rounded to 0.1 raw). 11 Nov 2026: the cap of the table is its top cell, 409 x 0.95 =
-    # 388.55 (the joint fit's 409 cells scaled with the rest; a common factor leaves every slope ratio unchanged)
+    # x0.4 down (0.01 tolerance: the cells are rounded to 0.1 raw). The cap of the table is its top cell: 409 since 16 Nov 2026 (the
+    # joint fit d31 as fitted); 11 - 16 Nov 2026 it was 409 x 0.95 = 388.55 (a common factor leaves every slope ratio unchanged)
     top = max(c for row in CMD_RAW for c in row)
     for row in CMD_RAW:
       s = [(row[i + 1] - row[i]) / (A_NODES[i + 1] - A_NODES[i]) for i in range(len(row) - 1)]
@@ -654,9 +716,9 @@ class TestInsterSteerCap(OpenpilotTestCase):
 
   def test_feedforward_and_friction_bounded(self):
     # neither step-2 contribution alone can ask for more than the cap: no table cell above INSTER_STEER_MAX, the friction term at most
-    # 200 raw; the controller's limit decides the rest. 11 Nov 2026: the table tops out at 388.55 (joint fit's 409 x 0.95); the steering
-    # limit stays 409
-    assert max(c for row in CMD_RAW for c in row) == 388.55 < INSTER_STEER_MAX
+    # 200 raw; the controller's limit decides the rest. 16 Nov 2026: the table tops out at 409 raw (joint fit d31 x 1.00), exactly the
+    # steering limit, which stays 409 (11 - 16 Nov 2026: 388.55, the joint fit's 409 x 0.95)
+    assert max(c for row in CMD_RAW for c in row) == 409.0 == INSTER_STEER_MAX
     assert all(0.0 <= c <= INSTER_STEER_MAX for row in CMD_RAW for c in row)
     for v in SPEEDS:
       for a in ACCELS + [10.0]:
@@ -2289,7 +2351,7 @@ class TestInsterMPCRampAware(OpenpilotTestCase):
     for v in SPEEDS[::4]:
       for a in np.linspace(0.01, 3.4, 40):
         raw = ff_raw(float(a), v)
-        if raw < max(c for row in CMD_RAW for c in row) - 0.1:           # below the table's top plateau (388.55 since 11 Nov 2026) exact
+        if raw < max(c for row in CMD_RAW for c in row) - 0.1:           # below the table's top plateau (409 since 16 Nov 2026) exact
           assert abs(ff_table_inverse(raw, v) - a) < 1e-9, (v, a)
           assert abs(ff_table_inverse(-raw, v) + a) < 1e-9
       assert ff_table_inverse(0.0, v) == 0.0
