@@ -1141,11 +1141,17 @@ class TestRev8ObjectBound:
     return rl, logs
 
   def test_moving_vehicle_in_the_own_lane_is_ignored_and_the_same_object_standing_binds(self):
+    # rev 9 item 1a (part 2 round 2): a lead (closing slower than 0.5 m/s, in the car's path) is ignored; the same vehicle beside the path, a
+    # cyclist the car closes on (rev 8: both ignored) and the same object standing bind
     look = 1.5 * self.V
     _, base = self.run(lambda i: [])
     t0 = float(np.interp(look, X, base[-1]['t4']))
-    _, cyc = self.run(lambda i: [(1, 12.0, -1.30, 20 / 3.6 - self.V)])  # a cyclist at 20 km/h, 0.45 m inside the right line
-    assert abs(float(np.interp(look, X, cyc[-1]['t4'])) - t0) < 1e-9 and cyc[-1]['radar'].moving == 1
+    _, lead = self.run(lambda i: [(1, 12.0, -0.6, -0.4)])  # a vehicle at almost our speed in the car's path (0.6 m right of its centre)
+    assert abs(float(np.interp(look, X, lead[-1]['t4'])) - t0) < 1e-9 and lead[-1]['radar'].moving == 1
+    _, beside = self.run(lambda i: [(1, 12.0, -1.30, -0.4)])  # the same 0.45 m inside the right line, beyond the car's path width: binds
+    assert float(np.interp(look, X, beside[-1]['t4'])) < t0 - 0.3
+    _, cyc = self.run(lambda i: [(1, 12.0, -1.30, 20 / 3.6 - self.V)])  # a cyclist at 20 km/h, the same place
+    assert float(np.interp(look, X, cyc[-1]['t4'])) < t0 - 0.3 and cyc[-1]['radar'].moving == 1 and cyc[-1]['radar'].bound_objects == 1
     _, std = self.run(lambda i: [(1, 12.0, -1.30, -self.V)])  # the same place, standing
     assert float(np.interp(look, X, std[-1]['t4'])) < t0 - 0.3
 
@@ -1405,8 +1411,8 @@ class TestRev8DetectorToTheModelPath:
 class TestRev9ClearanceIgnoresTheOwnLaneVehicle:
   """Rev 9 item 1a (owner 20 Nov 11:56): the clearance check ignores moving vehicles in the own lane, as the object bound does (rev 8 item 1a):
   with a usable right reference, a corridor object at least 10 cm inside it that the radial test classifies moving, only while the car is
-  not closing on it faster than CLOSING_SPEED 1 m/s (-vRel; part 2's review, 1c8c0488): the lead.  A slower rider or vehicle the car runs
-  up on counts.  Objects moving sideways toward the lane still count; without a usable reference every object counts, as before."""
+  closing on it slower than CLOSING_SPEED 0.5 m/s (the largest -vRel over 1 s) and its point is within the car's path width (part 2 round
+  2, aa333d42 / review be680b1e): the lead.  A slower rider or vehicle the car runs up on, or one beside the car's path, counts.  Objects moving sideways toward the lane still count; without a usable reference every object counts, as before."""
   V = 40 / 3.6
 
   def run(self, tracks_fn, frames=80, scene=None, gap=0.5):
@@ -1418,19 +1424,21 @@ class TestRev9ClearanceIgnoresTheOwnLaneVehicle:
       logs.append(res.log)
     return logs
 
-  @pytest.mark.parametrize("y_right,v_rel", [(0.2, 0.0), (0.2, -0.9), (0.2, 2.0), (0.6, 0.0), (1.0, 0.0)])
+  @pytest.mark.parametrize("y_right,v_rel", [(0.2, 0.0), (0.2, -0.4), (0.2, 2.0), (0.6, 0.0), (0.8, 0.0)])
   def test_a_lead_in_the_own_lane_starts_no_yield(self, y_right, v_rel):
-    # the car ahead 0.2 m right of the car at our speed, 0.9 m/s slower, pulling away at 2 m/s; and steady leads 0.6 / 1.0 m right of the car:
+    # the car ahead 0.2 m right of the car at our speed, 0.4 m/s slower, pulling away at 2 m/s; and steady leads 0.6 / 0.8 m right of the car:
     # the deficit would be 0.7 - (y - 0.81) > 0 (rev 8: a clearance yield, Keep Right's strength faded to zero); now it does not count
     logs = self.run(lambda i: [(1, 15.0, -y_right, v_rel)] if i >= 40 else [])
     assert logs[-1]['q_R'] > br.REF_USABLE_Q and logs[-1]['radar'].objects == 1 and logs[-1]['radar'].moving == 1
     assert not any(lg['radar'].yield_active for lg in logs) and logs[-1]['radar'].deficit < -1.0
     assert all(lg['f_yl'] == 1.0 for lg in logs)
 
-  @pytest.mark.parametrize("kmh,x,y_right,v_obj_kmh", [(40, 29.0, 1.30, 26), (40, 15.0, 1.30, 20), (50, 25.0, 0.6, 40), (40, 15.0, 0.2, 30)])
+  @pytest.mark.parametrize("kmh,x,y_right,v_obj_kmh", [(40, 29.0, 1.30, 26), (40, 15.0, 1.30, 20), (50, 25.0, 0.6, 40), (40, 15.0, 0.2, 30),
+                                                       (40, 20.0, 0.2, 38), (40, 15.0, 1.0, 40), (40, 15.0, 1.3, 40)])
   def test_a_moving_object_the_car_closes_on_still_yields(self, kmh, x, y_right, v_obj_kmh):
     # part 2's review (1c8c0488): a rider near the kerb at 26 km/h first counted 29 m ahead, the car at 40 km/h (as the labelled cyclist on
-    # 00000044 T 531.8-538.0); a cyclist at 20 km/h; a slower vehicle 0.6 m right of the car; a slower vehicle ahead (closing 2.8 m/s): all count
+    # 00000044 T 531.8-538.0); a cyclist at 20 km/h; a slower vehicle 0.6 m right of the car; slower vehicles ahead (closing 2.8 / 0.56 m/s);
+    # vehicles at our speed beside the car's path (1.0 / 1.3 m right of its centre, beyond its half width 0.81 m): all count
     # (closed loop with the rule that ignored every moving object in the own lane: the cyclist was passed at -0.01 m)
     v = kmh / 3.6
     rl = RightLineBlendful()
@@ -1457,6 +1465,18 @@ class TestRev9ClearanceIgnoresTheOwnLaneVehicle:
       return [(2, 10.0, -(1.6 - 1.2 * DT_MDL * (i - 40)), 0.0)] if i >= 40 else []
     logs = self.run(mover, frames=60)
     assert any(lg['radar'].toward == 1 and lg['radar'].yield_active for lg in logs[40:])
+
+  def test_a_closing_flicker_counts_for_one_second_from_its_first_message(self):
+    # a lead at our speed whose vRel reads -1 m/s in one message: it counts from that message (never later than the instantaneous rule) and
+    # for the 1 s window after it, then it is a lead again (a continuous maximum over 20 messages, no hysteresis)
+    rcl = RadarClearance()
+    yr = np.full(br.NX, 1.75)
+    counts = []
+    for i in range(80):
+      v_rel = -1.0 if i == 40 else 0.0
+      res = TestRadarClearanceUnit().step(rcl, [(1, 15.0, -0.2, v_rel)], y_ref=yr)
+      counts.append(res.clearance_objects)
+    assert counts[39] == 0 and all(c == 1 for c in counts[40:60]) and all(c == 0 for c in counts[60:])
 
   def test_a_young_track_is_classified_by_its_share_of_moving_votes(self):
     # rev 9: the clearance check counts a track from its 6th message, the radial test needed 8 votes: a moving car counted as standing for two

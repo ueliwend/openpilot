@@ -714,7 +714,7 @@ struct BlendfulInster @0xa4f1eb3323f5f582 {
   blendfulDetectorAway @89 :Float32;  # swerve minus the car-departure term, m (hand-over latch above the detector's upper level; rev 7.2: 0.2)
   # rev 8 (owner 15 Nov 2026; inster-dev results/2026-11-15_a8_rev8/DESIGN.md)
   blendfulDetectorStrength @90 :Float32;  # factor on the strength target from the detector's swerve value: 1 at <= lower level, 0 at >= upper level
-  blendfulRadarBoundObjects @91 :UInt8;  # corridor objects the object bound counts (>= 10 cm inside the right reference, not moving, confirmed for the bound)
+  blendfulRadarBoundObjects @91 :UInt8;  # corridor objects the object bound counts (>= 10 cm inside the right reference, not moving (rev 9: not a lead), confirmed for the bound)
   blendfulRadarTowardObjects @92 :UInt8;  # corridor objects moving sideways toward the lane (count for the clearance deficit from outside too)
   blendfulRadarNearestTowardSpeed @93 :Float32;  # sideways speed toward the lane of the object with the largest deficit, m/s (> 0 toward)
   blendfulDetectorGain @94 :Float32;  # rev 8 review B1 / S3: the detector factor through its own 1 s low-pass; multiplies Keep Right's share in Right line

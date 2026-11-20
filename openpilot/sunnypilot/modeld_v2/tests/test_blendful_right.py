@@ -1414,7 +1414,8 @@ class TestLogging:
     br.fill_log(msg, ctl, MODE_RIGHT, 13.0)
     rc = ctl.result.log['radar']
     assert abs(msg.blendfulDetectorStrength - ctl.result.log['det_strength']) < 1e-6 and msg.blendfulDetectorStrength < 1.0
-    assert msg.blendfulRadarBoundObjects == rc.bound_objects == 0  # moving (travels with the car) in the own lane: not for the bound
+    # rev 9 item 1a: moving at our speed but 1.2 m right of the car's centre, beyond its path width (0.81 m): no lead, the bound counts it
+    assert msg.blendfulRadarBoundObjects == rc.bound_objects == 1
     assert msg.blendfulRadarTowardObjects == rc.toward == 0 and msg.blendfulRadarObjects == 1
     assert abs(msg.blendfulRadarNearestTowardSpeed - rc.nearest_toward) < 1e-6
     fields = custom.BlendfulInster.schema.fields_list
@@ -1422,11 +1423,10 @@ class TestLogging:
                                                    'blendfulRadarNearestTowardSpeed', 'blendfulDetectorGain', 'blendfulRadarClearanceObjects',
                                                    'blendfulTargetReference', 'blendfulTargetReferenceLineWeight']
     assert abs(msg.blendfulDetectorGain - ctl.result.log['det_gain']) < 1e-6
-    # rev 9 (@95-@97): the clearance check's object count (the object moving at our speed is a lead: not counted); the target's reference
-    # and its line weight
+    # rev 9 (@95-@97): the clearance check's object count (the same object: counted); the target's reference and its line weight
     assert abs(msg.blendfulTargetReference - ctl.result.log['target_reference']) < 1e-6
     assert abs(msg.blendfulTargetReferenceLineWeight - ctl.result.log['target_reference_line_weight']) < 1e-6
-    assert msg.blendfulRadarClearanceObjects == rc.clearance_objects == 0
+    assert msg.blendfulRadarClearanceObjects == rc.clearance_objects == 1
     assert [f.proto.ordinal.explicit for f in fields] == list(range(98))  # field numbers stable, the new ones appended
 
   def test_fill_log_writes_the_episode_and_cue_fields(self):
