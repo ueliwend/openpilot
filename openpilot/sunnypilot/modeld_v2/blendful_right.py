@@ -1449,6 +1449,7 @@ def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
   builder.blendfulRadarNearest = [float(x) for x in rc.nearest]
   builder.blendfulRadarBoundObjects = int(min(rc.bound_objects, 255))
   builder.blendfulRadarTowardObjects = int(min(rc.toward, 255))
+  builder.blendfulRadarClearanceObjects = int(min(rc.clearance_objects, 255))
   builder.blendfulRadarNearestTowardSpeed = float(rc.nearest_toward)
   builder.blendfulObjectBound = float(rc.t_obj)
   builder.blendfulObjectBoundHold = float(rc.hold)

@@ -1396,3 +1396,60 @@ class TestRev8DetectorToTheModelPath:
     yg, _ = self.wander_loop(MODE_REGULAR, kmh)
     assert (fd < 1.0).mean() > 0.2
     assert np.abs(yr - yg).max() < 1e-9
+
+
+class TestRev9ClearanceIgnoresTheOwnLaneVehicle:
+  """Rev 9 item 1a (owner 20 Nov 11:56): the clearance check ignores moving vehicles in the own lane, as the object bound does (rev 8 item 1a):
+  with a usable right reference, a corridor object at least 10 cm inside it that the radial test classifies moving counts for neither.
+  Objects moving sideways toward the lane still count; without a usable reference every object counts, as before."""
+  V = 40 / 3.6
+
+  def run(self, tracks_fn, frames=80, scene=None, gap=0.5):
+    rl = RightLineBlendful()
+    logs = []
+    for i in range(frames):
+      res = rl.update((scene or Scene(v=self.V)).model_output(), self.V, True, 0.0, 0.0,
+                      inputs(radar=frame(tracks_fn(i)), gap_low=gap, gap_high=gap))
+      logs.append(res.log)
+    return logs
+
+  @pytest.mark.parametrize("y_right,v_rel", [(0.2, 0.0), (0.2, -3.0), (1.3, 20 / 3.6 - 40 / 3.6)])
+  def test_a_moving_vehicle_in_the_own_lane_starts_no_yield(self, y_right, v_rel):
+    # the car ahead 0.2 m right of the car (at our speed, or 3 m/s slower) and a cyclist at 20 km/h 0.45 m inside the right line: the deficit
+    # would be 0.7 - (y - 0.81) > 0 (rev 8: a clearance yield, Keep Right's strength faded to zero); now neither counts, the strength stays
+    logs = self.run(lambda i: [(1, 15.0, -y_right, v_rel)] if i >= 40 else [])
+    assert logs[-1]['q_R'] > br.REF_USABLE_Q and logs[-1]['radar'].objects == 1 and logs[-1]['radar'].moving == 1
+    assert not any(lg['radar'].yield_active for lg in logs) and logs[-1]['radar'].deficit < -1.0
+    assert all(lg['f_yl'] == 1.0 for lg in logs)
+
+  def test_the_same_object_standing_still_yields(self):
+    # guard (also rev 8): standing at the cyclist's place it is a lane obstacle for the clearance check
+    logs = self.run(lambda i: [(1, 15.0, -1.30, -self.V)] if i >= 40 else [])
+    assert logs[-1]['radar'].moving == 0 and any(lg['radar'].yield_active for lg in logs)
+
+  def test_without_a_usable_right_reference_the_moving_vehicle_counts(self):
+    # guard (also rev 8): no usable right line, so "inside" is not the own lane and every corridor object counts
+    logs = self.run(lambda i: [(1, 15.0, -0.2, 0.0)] if i >= 40 else [], scene=Scene(v=self.V, pr=0.0))
+    assert logs[-1]['q_R'] <= br.REF_USABLE_Q and logs[-1]['radar'].yield_active
+
+  def test_a_vehicle_moving_toward_the_lane_still_counts(self):
+    # guard (also rev 8): a moving vehicle inside the lane whose sideways speed toward the lane is 1.2 m/s counts once that speed is known
+    def mover(i):
+      return [(2, 10.0, -(1.6 - 1.2 * DT_MDL * (i - 40)), 0.0)] if i >= 40 else []
+    logs = self.run(mover, frames=60)
+    assert any(lg['radar'].toward == 1 and lg['radar'].yield_active for lg in logs[40:])
+
+  def test_a_young_track_is_classified_by_its_share_of_moving_votes(self):
+    # rev 9: the clearance check counts a track from its 6th message, the radial test needed 8 votes: a moving car counted as standing for two
+    # messages and latched a yield of at least 1 s.  Now the share of the votes so far (80 %), the same as 8 of 10 from the 10th message on
+    tr = rc.Track(x=10.0, y=0.2, d_rel=8.5, y_rel=-0.2, v_rel=0.0)
+    for _ in range(10):
+      tr.moving_votes.append(True)
+      assert tr.moving
+    tr.moving_votes.extend([False, False])
+    assert tr.moving  # 8 of the last 10
+    tr.moving_votes.append(False)
+    assert not tr.moving  # 7 of 10
+    young = rc.Track(x=10.0, y=0.2, d_rel=8.5, y_rel=-0.2, v_rel=0.0)
+    young.moving_votes.extend([True] * 4 + [False] * 2)
+    assert not young.moving  # 4 of 6 < 80 %

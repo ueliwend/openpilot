@@ -11,6 +11,7 @@ import pytest
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.modeld_v2 import blendful_right as br
+from openpilot.sunnypilot.modeld_v2 import radar_clearance as rc_mod
 from openpilot.sunnypilot.modeld_v2.blendful import Blendful
 from openpilot.sunnypilot.modeld_v2.blendful_right import (MODE_OFF, MODE_REGULAR, MODE_RIGHT, BlendfulCorrection, ConfGate, GroundTarget,
                                                            InputFilter, JumpDetector, JunctionEpisodes, RightLineBlendful, RoadClass,
@@ -496,16 +497,29 @@ def swerve_run(side=+1, k0_up=0.0, frames_hold=100, frames_total=260, depth=0.8,
   return ctl, rows
 
 
+def standing(tid, d_rel, y_right, v=13.0):
+  """A radar track of a standing object (vRel = -v: the radial test classifies it standing) y_right m right of the car."""
+  return (tid, d_rel, -float(y_right), -v)
+
+
+@pytest.fixture
+def no_object_bound(monkeypatch):
+  """Rev 9 item 1a: a moving vehicle in the own lane is ignored by the clearance check as well as by the object bound, so the cap tests use a
+  standing object; this keeps the object bound out of the way (its confirmation out of reach), so the target stays right and the cap rules
+  are what limits the correction (as the moving object of rev 8 did)."""
+  monkeypatch.setattr(rc_mod, 'BOUND_CONFIRM_MESSAGES', 10 ** 9)
+
+
 def radar_cap_run(y_of_t, frames_hold=100, frames_total=260, v=13.0):
   """Rev 8: the no-growth / cap rules are triggered only by the radar clearance check (the detector scales the strength instead).  Controller
-  in Right line mode, the car held at the lane centre and pulled right; from frame frames_hold a radar object 6 m ahead travels with the car
-  (moving: the object bound ignores it in the own lane, so the target stays right) at the lateral position y_of_t(t) (m right of the car).
+  in Right line mode, the car held at the lane centre and pulled right; from frame frames_hold a standing radar object 6 m ahead (rev 9: use
+  with the fixture no_object_bound) at the lateral position y_of_t(t) (m right of the car).
   At <= 50 km/h the margin is 0.5 + 0.2 = 0.7 m, so the clearance deficit is d = 0.7 - (y - 0.81) = 1.51 - y."""
   ctl = BlendfulCorrection()
   rows = []
   for i in range(frames_total):
     t = (i - frames_hold) * DT_MDL
-    tracks = [(5, 6.0, -float(y_of_t(t)), 0.0)] if t >= 0 else []
+    tracks = [standing(5, 6.0, y_of_t(t), v)] if t >= 0 else []
     radar = br.RadarFrame(tracks=tracks, age=0.0, fault=False, new=True, config_ok=True)
     ctl.update(Scene(v=v).model_output(), v, True, 0.0, LAT_T, MODE_RIGHT, RightInputs(radar=radar))
     rows.append((ctl.c, ctl.result.yield_q, ctl.result.yield_side, ctl.result.yield_active, ctl.cap_active, ctl.release_window, i,
@@ -517,6 +531,7 @@ def ramp(y0, y1, T):
   return lambda t: y0 + (y1 - y0) * min(1.0, max(t, 0.0) / T)
 
 
+@pytest.mark.usefixtures("no_object_bound")
 class TestYieldCap:
   """The B6 cap rules, rev 8: triggered by the radar clearance check only (obstacle side right)."""
   def test_no_correction_toward_the_obstacle_inside_a_yield(self):
@@ -573,7 +588,7 @@ class TestYieldCap:
     in_ramp = 0
     for i in range(400):
       t = (i - 100) * DT_MDL
-      tracks = [(5, 6.0, -ramp(1.56, 1.40, 10.0)(t), 0.0)] if t >= 0 else []
+      tracks = [standing(5, 6.0, ramp(1.56, 1.40, 10.0)(t))] if t >= 0 else []
       radar = br.RadarFrame(tracks=tracks, age=0.0, fault=False, new=True, config_ok=True)
       ctl.update(Scene(v=13.0).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs(radar=radar))
       if i == 99:
@@ -1122,12 +1137,12 @@ class TestYieldRules:
     assert q[-1][1] == 2 and q[-1][2] and max(x[0] for x in q) > upper and not any(x[2] for x in q[:150])
     assert all(x[3] == 0.0 for x in q if x[0] >= upper)
 
-  def test_cap_memory_lives_with_the_yield_and_never_grows(self):
+  def test_cap_memory_lives_with_the_yield_and_never_grows(self, no_object_bound):
     ctl2 = BlendfulCorrection()
     mems = []
     for i in range(700):
       t = (i - 100) * DT_MDL
-      tracks = [(5, 6.0, -ramp(1.62, 1.30, 3.0)(t), 0.0)] if 0 <= t < 15.0 else []  # the object leaves after 15 s
+      tracks = [standing(5, 6.0, ramp(1.62, 1.30, 3.0)(t))] if 0 <= t < 15.0 else []  # the object leaves after 15 s
       radar = br.RadarFrame(tracks=tracks, age=0.0, fault=False, new=True, config_ok=True)
       ctl2.update(Scene(v=13.0).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs(radar=radar))
       mems.append(ctl2.cap_mem.get(br.SIDE_RIGHT))
@@ -1135,7 +1150,7 @@ class TestYieldRules:
     assert m and all(b <= a + 1e-15 for a, b in zip(m[:-1], m[1:], strict=True))  # non-increasing for as long as it lives
     assert ctl2.cap_mem == {}  # released with the yield once the object is gone
 
-  def test_no_growth_toward_the_obstacle_between_q_0_1_and_0_2(self):
+  def test_no_growth_toward_the_obstacle_between_q_0_1_and_0_2(self, no_object_bound):
     # the object comes in to a deficit of 0.05 m and goes back out to -0.05 m: the yield stays latched (release needs d < -0.1 m for 1 s)
     # with q = 0.1 (no growth only); the correction toward the right never grows during the phase
     ctl = BlendfulCorrection()
@@ -1145,7 +1160,7 @@ class TestYieldRules:
     for i in range(500):
       t = (i - 100) * DT_MDL
       y = 1.56 if t < 2.0 else (1.46 if t < 6.0 else 1.56)
-      tracks = [(5, 6.0, -y, 0.0)] if t >= 0 else []
+      tracks = [standing(5, 6.0, y)] if t >= 0 else []
       radar = br.RadarFrame(tracks=tracks, age=0.0, fault=False, new=True, config_ok=True)
       ctl.update(Scene(v=13.0).model_output(), 13.0, True, 0.0, LAT_T, MODE_RIGHT, RightInputs(radar=radar))
       if ctl.result.no_growth and prev is not None and ctl.result.yield_q < br.Q_CAP_FULL:
@@ -1403,10 +1418,12 @@ class TestLogging:
     assert msg.blendfulRadarTowardObjects == rc.toward == 0 and msg.blendfulRadarObjects == 1
     assert abs(msg.blendfulRadarNearestTowardSpeed - rc.nearest_toward) < 1e-6
     fields = custom.BlendfulInster.schema.fields_list
-    assert [f.proto.name for f in fields[-5:]] == ['blendfulDetectorStrength', 'blendfulRadarBoundObjects', 'blendfulRadarTowardObjects',
-                                                   'blendfulRadarNearestTowardSpeed', 'blendfulDetectorGain']
+    assert [f.proto.name for f in fields[-6:]] == ['blendfulDetectorStrength', 'blendfulRadarBoundObjects', 'blendfulRadarTowardObjects',
+                                                   'blendfulRadarNearestTowardSpeed', 'blendfulDetectorGain', 'blendfulRadarClearanceObjects']
     assert abs(msg.blendfulDetectorGain - ctl.result.log['det_gain']) < 1e-6
-    assert [f.proto.ordinal.explicit for f in fields] == list(range(95))  # field numbers stable, the new ones appended
+    # rev 9 (@95): the clearance check's object count (the moving car in the own lane: 0)
+    assert msg.blendfulRadarClearanceObjects == rc.clearance_objects == 0
+    assert [f.proto.ordinal.explicit for f in fields] == list(range(96))  # field numbers stable, the new ones appended
 
   def test_fill_log_writes_the_episode_and_cue_fields(self):
     from openpilot.cereal import custom

@@ -718,4 +718,6 @@ struct BlendfulInster @0xa4f1eb3323f5f582 {
   blendfulRadarTowardObjects @92 :UInt8;  # corridor objects moving sideways toward the lane (count for the clearance deficit from outside too)
   blendfulRadarNearestTowardSpeed @93 :Float32;  # sideways speed toward the lane of the object with the largest deficit, m/s (> 0 toward)
   blendfulDetectorGain @94 :Float32;  # rev 8 review B1 / S3: the detector factor through its own 1 s low-pass; multiplies Keep Right's share in Right line
+  # rev 9 (owner 20 Nov 2026; inster-dev results/2026-11-20_a8_rev9/DESIGN.md)
+  blendfulRadarClearanceObjects @95 :UInt8;  # corridor objects the clearance deficit counts (lane obstacles, not moving vehicles in the own lane; and objects moving toward the lane)
 }

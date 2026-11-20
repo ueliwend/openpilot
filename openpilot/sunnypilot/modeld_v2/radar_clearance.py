@@ -21,9 +21,10 @@ the filtered references, the centre limit, the speed and the B2 motion inputs, n
   passed in); falls at once, rises after 1 s without a fall at the car's move speed (MOVE_SPEED of blendful_right, passed in as rise).
 - Clearance deficit (item 3) from the car's actual position: the car keeps its present offset from the centre limit along the lane, so its
   path is P(x) = T_C'(x) - T_C'(0) (P(0) = 0, the car where it is now); d = m - min (y - w_R - dc - P(x)) over the corridor objects that
-  are inside or toward.  d > 0 starts the clearance yield (obstacle side right), released when d < -0.1 m for 1 s (or the object is gone);
-  the cap ramps over d 0 .. 0.05 m.
-- Stationary / moving (radial test over 8 of 10 messages): selects the bound's objects (rev 8); pop-ups are logged only.
+  are inside and not a moving vehicle in the own lane (rev 9 item 1a, the object bound's rule), or toward.  d > 0 starts the clearance
+  yield (obstacle side right), released when d < -0.1 m for 1 s (or the object is gone); the cap ramps over d 0 .. 0.05 m.
+- Stationary / moving (radial test over 8 of 10 messages, the same share of fewer while a track is younger, rev 9): selects the objects the
+  bound and the clearance deficit count (rev 8 / rev 9); pop-ups are logged only.
 - Health: no message, a message older than 0.3 s, an invalid message, any RadarData.errors flag, a non-finite dRel / yRel in the message,
   or a car radar configuration that publishes no side tracks (review R3-B1: radarUnavailable, or a Hyundai without RADAR_FULL_RADAR, whose
   messages are valid but empty or lead-only) -> unhealthy; healthy again 1 s after healthy messages return.  The caller turns unhealthy into
@@ -140,7 +141,11 @@ class Track:
 
   @property
   def moving(self) -> bool:
-    return sum(self.moving_votes) >= MOVING_MIN
+    """Radial test: at least MOVING_MIN of the last MOVING_WINDOW messages; rev 9: while fewer messages are there, the same share of those
+    seen (a track is confirmed for the clearance check after 6, so a moving car in the own lane is classified moving from its first counted
+    message instead of counting as standing for two; identical from the 10th message, so the object bound's 20 are unchanged)."""
+    n = len(self.moving_votes)
+    return n > 0 and sum(self.moving_votes) * MOVING_WINDOW >= MOVING_MIN * n
 
   @property
   def toward_speed(self) -> float:
@@ -164,6 +169,7 @@ class ClearanceResult:
   objects: int = 0  # confirmed objects in the corridor
   bound_objects: int = 0  # rev 8: of them the ones the object bound counts (inside, not moving, confirmed for the bound)
   toward: int = 0  # rev 8: of them the ones moving sideways toward the lane (moving, >= TOWARD_LANE_SPEED)
+  clearance_objects: int = 0  # rev 9: of them the ones the clearance deficit counts (lane obstacles and objects moving toward the lane)
   nearest_toward: float = 0.0  # rev 8: sideways speed toward the lane of the object with the largest deficit, m/s (log)
   memory: int = 0  # of them remembered beside the car
   moving: int = 0  # of them classified moving
@@ -295,13 +301,17 @@ class RadarClearance:
       inside = y_ref is None or tr.y <= float(np.interp(xq, x_idxs, y_ref)) - LINE_INSIDE
       toward = tr.moving and tr.toward_speed >= TOWARD_LANE_SPEED  # only on the moving vote (measurement adaea0f4)
       res.toward += int(toward)
-      # object bound (item 1a): inside, not a moving vehicle in the own lane (with a usable reference "inside" is the own lane), confirmed
-      # for the bound's longer confirmation
-      if inside and not (y_ref is not None and tr.moving) and tr.count >= BOUND_CONFIRM_MESSAGES:
+      # rev 8 item 1a, rev 9 item 1a (owner 15 Nov / 20 Nov 11:56): with a usable reference "inside" is the own lane, and a moving object in
+      # it is a vehicle in the own lane (e.g. the car ahead): ignored by the object bound AND by the clearance deficit (one rule for both)
+      lane_obstacle = inside and not (y_ref is not None and tr.moving)
+      # object bound (item 1a): a lane obstacle confirmed for the bound's longer confirmation
+      if lane_obstacle and tr.count >= BOUND_CONFIRM_MESSAGES:
         res.bound_objects += 1
         t_raw = min(t_raw, tr.y - w_r - m - dc)
-      # clearance deficit (item 3): from the car's actual position carried along the lane, P(x) = T_C'(x) - T_C'(0)
-      if inside or toward:
+      # clearance deficit (item 3): from the car's actual position carried along the lane, P(x) = T_C'(x) - T_C'(0); counts lane obstacles
+      # and objects moving toward the lane (the latter also when moving inside the lane)
+      if lane_obstacle or toward:
+        res.clearance_objects += 1
         d_i = m - (tr.y - w_r - dc - (ctr - ctr0))
         if d_i > d:
           d, nearest = d_i, tr
