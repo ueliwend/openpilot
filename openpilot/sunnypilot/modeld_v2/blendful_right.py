@@ -165,8 +165,8 @@ class ReferenceFilter:
   motion-model error cannot build up a bias: a full motion-compensated low-pass of the whole reference sat 0.3 m off at L in a 100 m curve
   under the 5 % distance-scale hypothesis of design check 21 (inster-dev results/2026-11-20_a8_rev9/DESIGN.md).  Returns the filtered
   reference and its own switch part (the released part, for the move-speed limit).  tau = 0 passes the reference through."""
-  def __init__(self, tau: float = TARGET_REF_TAU):
-    self.tau = tau
+  def __init__(self, tau: float | None = None):
+    self.tau = TARGET_REF_TAU if tau is None else tau  # read at construction (not at import), like the module's other constants
     self.pending = np.zeros(NX)  # the combination's change not yet released, m (> 0: the reference has moved right and the target not yet)
     self.started = False
 
