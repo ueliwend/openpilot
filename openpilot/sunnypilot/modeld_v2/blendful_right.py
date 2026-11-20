@@ -48,7 +48,8 @@ SOFTMIN_TAU = 0.05  # m, the reference the limits read (centre limit, line bound
 # rev 9 item 3 (owner 20 Nov 11:56 "Do it", 12:03 "This needs to be fixed"): the reference Keep Right's TARGET follows is formed more gently.
 # Values: part 2 (inster-dev results/2026-11-20_keepright_calm/part2_interim, REV9_VALUES.md at 00366139 and its independent review
 # REVIEW_rev9_values.md at 1c8c0488: V7e on, V7d 0.20 m).
-# (a) Gradual confidence push (replaces the two-threshold ConfGate, both references): the push factor c of a candidate is linear in its
+# (a) Gradual confidence push (replaces the two-threshold ConfGate for the RIGHT candidates, as simulated; the left reference keeps ConfGate):
+#     the push factor c of a candidate is linear in its
 #     confidence q between CONF_PUSH_Q[0] (c = 0, pushed PUSH outward) and CONF_PUSH_Q[1] (c = 1, not pushed); no hysteresis, no memory.
 #     Part 2's V7e is push = (1 - q) PUSH, i.e. (0, 1); the full end is set to 0.8 instead, the most an edge's confidence can be (the edge
 #     std 0.3 m maps to 0.8): with (0, 1) a fully clear edge is always pushed 0.3 m, so an absent line (q 0) up to about 1.2 m inside it takes
@@ -154,6 +155,17 @@ def motion_predict(y_prev: np.ndarray, vx0: float, yaw_rate: float, dt: float, s
   scale = vEgo / v_x(0): the lines' x axis carries the model's distance scale (x_model = x_true v_x(0) / vEgo), so the rotation acts at the
   true distance x_model * scale + l_d + vEgo dt / 2 (DESIGN check 19; for scale = 1 this is the formula of B2 verbatim)."""
   return quad_interp(X_IDXS + vx0 * dt, X_IDXS, y_prev) - yaw_rate * dt * (X_IDXS * scale + L_D + vx0 * scale * dt / 2)
+
+
+class ConfGate:
+  """Confidence gate with hysteresis: rising branch ss((q - 0.4) / 0.2), falling branch ss((q - 0.3) / 0.2) (B3).  Rev 9: the left reference
+  only (the right candidates use push_factor)."""
+  def __init__(self):
+    self.c = 0.0
+
+  def update(self, q: float) -> float:
+    self.c = float(ss((q - 0.4) / 0.2) if self.c < 0.5 else ss((q - 0.3) / 0.2))
+    return self.c
 
 
 def push_factor(q: float) -> float:
@@ -854,6 +866,7 @@ class RightLineBlendful:
     self.rotation_scale = FILTER_ROTATION_SCALE if rotation_scale is None else rotation_scale
     assert self.rotation_scale in ROTATION_SCALES, self.rotation_scale
     self.filters = [InputFilter() for _ in range(4)]  # left line, left edge, right line, right edge
+    self.gates = [ConfGate() for _ in range(2)]  # left line, left edge (rev 9: the right candidates use push_factor)
     self.reset()
 
   def reset(self):
@@ -881,6 +894,8 @@ class RightLineBlendful:
     like a 0.37 m left swerve, a different lane width like a widening)."""
     for f in self.filters:
       f.__init__()
+    for g in self.gates:
+      g.c = 0.0
     self.line_probs = FirstOrderFilter(np.zeros(2), 0.5, DT_MDL)
     self.edge_q = FirstOrderFilter(np.zeros(2), 0.5, DT_MDL)
     self.ground = GroundTarget()
@@ -984,7 +999,7 @@ class RightLineBlendful:
     cands_r = np.stack([filt[2], filt[3] - EDGE_EXTRA])
     cands_l = np.stack([filt[0], filt[1] + EDGE_EXTRA])
     c_r = [push_factor(qf[2]), push_factor(qf[3])]  # rev 9 item 3a: gradual push, no hysteresis
-    c_l = [push_factor(qf[0]), push_factor(qf[1])]
+    c_l = [self.gates[0].update(qf[0]), self.gates[1].update(qf[1])]
     y_r, qa_r, w_r = self._reference(cands_r, [qf[2], qf[3]], c_r, +1)
     y_l, qa_l, w_l = self._reference(cands_l, [qf[0], qf[1]], c_l, -1)
     # rev 9 items 3b / 3c: the right reference Keep Right's target follows: the softer combination of the same candidates, filtered after the

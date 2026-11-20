@@ -1370,8 +1370,13 @@ class TestTransitions:
     assert _glide_ok(rows, 13.0)
 
   def test_detectors_at_their_thresholds(self):
-    lo, hi = br.CONF_PUSH_Q  # rev 9 item 3a: the push factor is linear between the two levels, the same rising and falling (no memory)
+    lo, hi = br.CONF_PUSH_Q  # rev 9 item 3a: the right candidates' push factor is linear between the two levels (no memory)
     assert br.push_factor(lo) == 0.0 and br.push_factor(hi) == 1.0 and br.push_factor((lo + hi) / 2) == pytest.approx(0.5)
+    g = br.ConfGate()  # the left reference keeps the gate
+    assert g.update(0.4) == 0.0 and g.update(0.6) == 1.0  # rising branch: 0 at 0.4, full at 0.6
+    assert g.update(0.3) == 0.0  # falling branch (entered from above 0.5): 0 at 0.3
+    g.c = 1.0
+    assert g.update(0.5) == 1.0  # ... and full at 0.5
     # bend detector: nothing below the thresholds, full above
     mo = Scene(pl=1.0, pr=1.0, widen=0.0).model_output()
     assert bend_score(X, mo['lane_lines'][0, 2, :, 0], mo['lane_lines'][0, 1, :, 0], 13.0)[3] == 0.0
