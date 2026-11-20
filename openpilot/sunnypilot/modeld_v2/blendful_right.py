@@ -44,7 +44,21 @@ MEAS_TAU = 0.5  # s
 COAST_Q, COAST_MAX, REINIT_Q = 0.3, 1.0, 0.5
 # reference formation (B3)
 PUSH = 1.5  # m, outward push of an unconfident candidate (weights only)
-SOFTMIN_TAU = 0.05  # m
+SOFTMIN_TAU = 0.05  # m, the reference the limits read (centre limit, line bound, radar line filters, detectors): sharp, the inner candidate
+# rev 9 item 3 (owner 20 Nov 11:56 "Do it", 12:03 "This needs to be fixed"): the reference Keep Right's TARGET follows is formed more gently.
+# (a) Gradual confidence push (replaces the two-threshold ConfGate, both references): the push factor c of a candidate is linear in its
+#     confidence q between CONF_PUSH_Q[0] (c = 0, pushed PUSH outward) and CONF_PUSH_Q[1] (c = 1, not pushed); no hysteresis, no memory.
+#     PROVISIONAL (0.3, 0.6) = the band the old gate switched in (falling branch from 0.3, rising branch full at 0.6), until part 2's values
+#     (inster-dev results/2026-11-20_keepright_calm/part2, variant V7e) are posted.
+CONF_PUSH_Q = (0.3, 0.6)
+# (b) Softer blend: the target's right reference is the soft minimum with this softness (the limits keep SOFTMIN_TAU).  The blend sits
+#     outward of the inner candidate by up to 0.28 x the softness (two confident candidates about 1.3 x the softness apart), so the gap held
+#     can be that much smaller than set.  PROVISIONAL 0.1 m = the lowest value of part 2's variant V7d (0.1 / 0.2 / 0.3 m): at most 0.028 m.
+TARGET_SOFTMIN_TAU = 0.1  # m
+# (c) Filter after the combination: what the combination adds to the target's right reference (its switch part: weight changes, input
+#     re-initialisation steps) is released through a first-order low-pass with this time constant, carried along the lane (ReferenceFilter).
+#     PROVISIONAL 1.0 s = the middle of part 2's variant V7c (0.5 / 1 / 2 s).
+TARGET_REF_TAU = 1.0  # s
 PLAUS_TOL, WIDTH_RANGE = 0.3, (2.0, 8.0)
 # correction (B4, B11)
 STRENGTH_RIGHT_ONLY = 0.8
@@ -136,14 +150,35 @@ def motion_predict(y_prev: np.ndarray, vx0: float, yaw_rate: float, dt: float, s
   return quad_interp(X_IDXS + vx0 * dt, X_IDXS, y_prev) - yaw_rate * dt * (X_IDXS * scale + L_D + vx0 * scale * dt / 2)
 
 
-class ConfGate:
-  """Confidence gate with hysteresis: rising branch ss((q - 0.4) / 0.2), falling branch ss((q - 0.3) / 0.2) (B3)."""
-  def __init__(self):
-    self.c = 0.0
+def push_factor(q: float) -> float:
+  """rev 9 item 3a: a candidate's push factor c from its confidence q, linear between CONF_PUSH_Q (c = 0: pushed PUSH outward, c = 1: not
+  pushed); replaces the two-threshold confidence gate (B3: rising branch ss((q - 0.4) / 0.2), falling branch ss((q - 0.3) / 0.2))."""
+  return float(np.clip((q - CONF_PUSH_Q[0]) / (CONF_PUSH_Q[1] - CONF_PUSH_Q[0]), 0.0, 1.0))
 
-  def update(self, q: float) -> float:
-    self.c = float(ss((q - 0.4) / 0.2) if self.c < 0.5 else ss((q - 0.3) / 0.2))
-    return self.c
+
+class ReferenceFilter:
+  """rev 9 item 3c: the filter after the line / edge combination.  What the combination itself adds to the change of the combined right
+  reference, its switch part (candidate weights changing, an input filter re-initialised; B5 amendment 1), is released through a first-order
+  low-pass (time constant tau): the part not yet released is carried along the lane with the model's travel (the move-speed limit's own
+  motion model for lane-fixed quantities) and alpha = dt / (dt + tau) of it is released per frame; the filtered reference is the combined
+  reference minus the part not yet released.  The road geometry itself passes unchanged (it is filtered once, by the input filters), so a
+  motion-model error cannot build up a bias: a full motion-compensated low-pass of the whole reference sat 0.3 m off at L in a 100 m curve
+  under the 5 % distance-scale hypothesis of design check 21 (inster-dev results/2026-11-20_a8_rev9/DESIGN.md).  Returns the filtered
+  reference and its own switch part (the released part, for the move-speed limit).  tau = 0 passes the reference through."""
+  def __init__(self, tau: float = TARGET_REF_TAU):
+    self.tau = tau
+    self.pending = np.zeros(NX)  # the combination's change not yet released, m (> 0: the reference has moved right and the target not yet)
+    self.started = False
+
+  def update(self, y_ref: np.ndarray, switch_part: np.ndarray, vx0: float, dt: float = DT_MDL) -> tuple[np.ndarray, np.ndarray]:
+    if not self.started:  # the first frame (start, lane-tracking restart): no earlier reference, so nothing to release (the input filters'
+      self.started = True  # first initialisation step is not a change of the reference)
+      return np.array(y_ref, dtype=float), np.zeros(NX)
+    alpha = dt / (dt + self.tau)
+    pending = np.interp(X_IDXS + vx0 * dt, X_IDXS, self.pending) + switch_part
+    released = alpha * pending
+    self.pending = pending - released
+    return y_ref - self.pending, released
 
 
 class InputFilter:
@@ -813,7 +848,6 @@ class RightLineBlendful:
     self.rotation_scale = FILTER_ROTATION_SCALE if rotation_scale is None else rotation_scale
     assert self.rotation_scale in ROTATION_SCALES, self.rotation_scale
     self.filters = [InputFilter() for _ in range(4)]  # left line, left edge, right line, right edge
-    self.gates = [ConfGate() for _ in range(4)]
     self.reset()
 
   def reset(self):
@@ -834,15 +868,13 @@ class RightLineBlendful:
     self.mode_on = True  # the first frame after a (re)start is a re-entry of the move-speed limit
 
   def restart_lane_tracking(self):
-    """Everything that describes the lane the car is in: the input filters and their confidence gates, the probability filters, the
+    """Everything that describes the lane the car is in: the input filters, the probability filters, the target reference filter, the
     ground-fixed target, the jump counters, the candidate weights, the left-limit formula, the width memory (re-measured) and the yield
     state.  Restarted on the first active frame after a lane change (review S2): the lines re-index during the change, and filters or
     references carried across it would compare the old lane with the new one (a re-indexed right line converging over about a second looks
     like a 0.37 m left swerve, a different lane width like a widening)."""
     for f in self.filters:
       f.__init__()
-    for g in self.gates:
-      g.c = 0.0
     self.line_probs = FirstOrderFilter(np.zeros(2), 0.5, DT_MDL)
     self.edge_q = FirstOrderFilter(np.zeros(2), 0.5, DT_MDL)
     self.ground = GroundTarget()
@@ -855,6 +887,8 @@ class RightLineBlendful:
     self.centre_src = CentreLimitSource()
     self.w_prev = None
     self.w_r_prev = None
+    self.target_ref = ReferenceFilter()  # rev 9 item 3c
+    self.w_rt_prev = None  # rev 9: last frame's candidate weights of the target's (soft) right reference
     self.width_mem.remeasure()
     self.reset_yields()
 
@@ -871,10 +905,13 @@ class RightLineBlendful:
 
   # ----------------------------------------------------------------------------------------------------------------------------
   @staticmethod
-  def _reference(ys, qs, cs, side: int):
-    """B3: soft minimum of the (confidence pushed) candidates gives the weights, the reference is the weighted mean of the TRUE positions."""
-    pushed = side * (ys + side * (1.0 - np.asarray(cs))[:, None] * PUSH)
-    w = np.exp(-(pushed - pushed.min(axis=0)) / SOFTMIN_TAU)
+  def _reference(ys, qs, cs, side: int, tau: float = SOFTMIN_TAU):
+    """B3: soft minimum (softness tau) of the (confidence pushed) candidates gives the weights, the reference is the weighted mean of the
+    TRUE positions.  Rev 9 item 3b: the push grows with the softness (PUSH at SOFTMIN_TAU), so an unconfident candidate is kept out of a
+    softer combination as firmly as out of the sharp one (an absent line 1.15 m inside a clear edge would otherwise pull a 0.2 m soft
+    combination 0.17 m inward); the softness only blends confident candidates more gently."""
+    pushed = side * (ys + side * (1.0 - np.asarray(cs))[:, None] * PUSH * tau / SOFTMIN_TAU)
+    w = np.exp(-(pushed - pushed.min(axis=0)) / tau)
     w /= w.sum(axis=0)
     return (w * ys).sum(axis=0), (w * np.asarray(qs)[:, None]).sum(axis=0), w
 
@@ -942,10 +979,17 @@ class RightLineBlendful:
     # --- B3: references; the edge counts EDGE_EXTRA further in
     cands_r = np.stack([filt[2], filt[3] - EDGE_EXTRA])
     cands_l = np.stack([filt[0], filt[1] + EDGE_EXTRA])
-    c_r = [self.gates[2].update(qf[2]), self.gates[3].update(qf[3])]
-    c_l = [self.gates[0].update(qf[0]), self.gates[1].update(qf[1])]
+    c_r = [push_factor(qf[2]), push_factor(qf[3])]  # rev 9 item 3a: gradual push, no hysteresis
+    c_l = [push_factor(qf[0]), push_factor(qf[1])]
     y_r, qa_r, w_r = self._reference(cands_r, [qf[2], qf[3]], c_r, +1)
     y_l, qa_l, w_l = self._reference(cands_l, [qf[0], qf[1]], c_l, -1)
+    # rev 9 items 3b / 3c: the right reference Keep Right's target follows: the softer combination of the same candidates, filtered after the
+    # combination.  The limits (centre limit, line bound, radar, detectors, cues) keep reading y_r
+    y_rt_raw, _, w_rt = self._reference(cands_r, [qf[2], qf[3]], c_r, +1, TARGET_SOFTMIN_TAU)
+    sw_t = (w_rt - self.w_rt_prev) * cands_r if self.w_rt_prev is not None else np.zeros_like(cands_r)
+    self.w_rt_prev = w_rt.copy()
+    y_rt, switch_t = self.target_ref.update(y_rt_raw, sw_t.sum(axis=0) + w_rt[0] * self.filters[2].step + w_rt[1] * self.filters[3].step,
+                                            vx0, dt)
     q_R, q_L = float(np.interp(iL, X_IDXS, qa_r)), float(np.interp(iL, X_IDXS, qa_l))
     # --- plausibility (B3)
     bad = False
@@ -1019,7 +1063,7 @@ class RightLineBlendful:
     k_ref = 2.0 * float(np.polyfit(X_IDXS[win_ref], y_r[win_ref], 2)[0])
     off_track = L_D ** 2 * max(k_ref, 0.0) / 2
     dc = p.c_set - p.c_applied
-    t_r_line = y_r - W_R - g - off_track - dc
+    t_r_line = y_rt - W_R - g - off_track - dc  # rev 9 item 3: the smoothed reference
     t_raw = np.maximum(t_r_line, c_ctr)
     t_lim = self.ground.update(t_raw, vx0, yaw_rate, dt, scale, reseed_x=RESEED_LOOKAHEADS * look)
     lag_L = float(np.interp(iL, X_IDXS, self.ground.lag))
@@ -1071,7 +1115,7 @@ class RightLineBlendful:
     f_yl = 0.0 if (yield_active and SIDE_RIGHT in caps) else 1.0
     f_det = detector_strength(q_y, det_lower, det_upper)  # rev 8 item 2 (1 while fading: q_y = 0)
     # --- authority (B5)
-    qa = strength_from_confidence(q_R)  # rev 7: replaces the confidence gate's on / off curve (ConfGate kept for the reference selection)
+    qa = strength_from_confidence(q_R)  # rev 7: replaces the confidence gate's on / off curve
     a_star = float(qa)
     f_ep = 0.0 if jn_active else 1.0
     a_star *= f_bend_t * f_jump_t * f_plaus_t * self.f_blink * f_yl * f_ep * f_radar  # these factors hand back to Regular
@@ -1112,7 +1156,7 @@ class RightLineBlendful:
     reasons = (a <= 0.0, was_episode and not in_episode, yield_ended, present and not self.ref_present_prev, self.mode_on,
                self.move.created, w_rl <= 1e-9)
     self.ref_present_prev, self.mode_on = present, False
-    t_rl = self.move.update(y_r, t4, w_rl, switch_part, vx0, dt, self.move.created)
+    t_rl = self.move.update(y_rt, t4, w_rl, switch_t, vx0, dt, self.move.created)  # rev 9 item 3: the smoothed reference, its switch part
     target = self.safety_bounds(t_rl, t_bound_line, t_bound_edge, w_e)  # T_RL <= T4 already holds the object bound and the bounds
     # --- correction (B4)
     d_rl, k0_rl, k_fit, d_clipped = self._correction(target, plan_x, plan_y, v, s_r)
@@ -1161,6 +1205,7 @@ class RightLineBlendful:
       'cand_conf': np.array([c_l[0], c_l[1], c_r[0], c_r[1]]),
       'cand_weight': np.array([float(np.interp(iL, X_IDXS, w_l[0])), float(np.interp(iL, X_IDXS, w_l[1])), w_at[0], w_at[1]]),
       'reference': np.array([np.interp(iL, X_IDXS, y_l), np.interp(iL, X_IDXS, y_r)]), 'target': target,
+      'target_reference': float(np.interp(iL, X_IDXS, y_rt)), 'target_reference_line_weight': float(np.interp(iL, X_IDXS, w_rt[0])),
       'episode': in_episode, 'episode_ended': em.ended, 'episode_dist': em.dist if in_episode else 0.0, 'model_alone_time': em.model_alone_time,
       'cues': cue_bits, 'cue_values': np.array([c1 if c1 is not None else 0.0, c2 if c2 is not None else 0.0, ed_g if ed_ok else 0.0, ed_a if ed_ok else 0.0,
                                                  gore_min if gore_min is not None else 0.0, kink, b]),
@@ -1168,7 +1213,8 @@ class RightLineBlendful:
       'width_mem': wm.w if wm.armed else 0.0, 'width_age': wm.age, 'width_state': int(wm.armed) | (int(wm.stale) << 1) | (int(not wm.armed) << 2),
       'road_class': road, 'frame_dt': dt, 'plan_speed': vx0, 'target_lag': lag_L,
       'yield_side': log_side(caps), 'yield_source': src, 'centre_source': centre_src,
-      't_raw': t_raw, 't_lim': t_lim, 't4': t4, 'y_edge_r': filt[3], 'c_ctr': c_ctr, 'y_r': y_r, 'y_l': y_l, 'beta': beta, 'jump_inno': np.array(inno),
+      't_raw': t_raw, 't_lim': t_lim, 't4': t4, 'y_edge_r': filt[3], 'c_ctr': c_ctr, 'y_r': y_r, 'y_rt': y_rt, 'y_l': y_l, 'beta': beta,
+      'jump_inno': np.array(inno),
       'approach': float(np.interp(iL, X_IDXS, mv.a_lim)), 'gap_reset': float(np.interp(iL, X_IDXS, mv.g0)),
       'authority_limited': authority_limited,
       'car_left': self.car_left, 'bound_left_in_window': bound_left_in_window,
@@ -1432,6 +1478,8 @@ def fill_log(builder, ctl: BlendfulCorrection, mode: int, v_ego: float) -> None:
   builder.blendfulDetectorAway = float(lg['det_away'])
   builder.blendfulDetectorStrength = float(lg['det_strength'])
   builder.blendfulDetectorGain = float(lg['det_gain'])
+  builder.blendfulTargetReference = float(lg['target_reference'])
+  builder.blendfulTargetReferenceLineWeight = float(lg['target_reference_line_weight'])
   builder.blendfulAuthorityLimited = bool(lg['authority_limited'])
   builder.blendfulDeliveredSource = int(lg['delivered'])
   builder.blendfulTargetMinusCentre = float(lg['trl_minus_centre'])

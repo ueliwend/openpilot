@@ -650,7 +650,7 @@ struct BlendfulInster @0xa4f1eb3323f5f582 {
   blendfulFilterOffset @31 :List(Float32);  # filtered minus raw at x = L, per input
   blendfulInputConfidence @32 :List(Float32);
   blendfulInputState @33 :List(UInt8);  # bit 0 coasting, bit 1 re-initialised this frame
-  blendfulCandidateConfidence @34 :List(Float32);  # c_i per input (hysteresis gate)
+  blendfulCandidateConfidence @34 :List(Float32);  # c_i per input (push factor; rev 9: linear in the confidence, was a hysteresis gate)
   blendfulCandidateWeight @35 :List(Float32);  # softmin weight w_i per input at x = L
   blendfulReference @36 :List(Float32);  # [left, right] reference at x = L
   blendfulTarget @37 :List(Float32);  # target lateral position per model x index (right line mode)
@@ -720,4 +720,6 @@ struct BlendfulInster @0xa4f1eb3323f5f582 {
   blendfulDetectorGain @94 :Float32;  # rev 8 review B1 / S3: the detector factor through its own 1 s low-pass; multiplies Keep Right's share in Right line
   # rev 9 (owner 20 Nov 2026; inster-dev results/2026-11-20_a8_rev9/DESIGN.md)
   blendfulRadarClearanceObjects @95 :UInt8;  # corridor objects the clearance deficit counts (lane obstacles, not moving vehicles in the own lane; and objects moving toward the lane)
+  blendfulTargetReference @96 :Float32;  # the right reference Keep Right's target follows (softer combination, the combination's changes filtered), at L, m
+  blendfulTargetReferenceLineWeight @97 :Float32;  # weight of the right line in that softer combination, at L (1 - it: the edge)
 }

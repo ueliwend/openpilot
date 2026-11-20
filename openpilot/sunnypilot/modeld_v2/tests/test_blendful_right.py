@@ -13,7 +13,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.modeld_v2 import blendful_right as br
 from openpilot.sunnypilot.modeld_v2 import radar_clearance as rc_mod
 from openpilot.sunnypilot.modeld_v2.blendful import Blendful
-from openpilot.sunnypilot.modeld_v2.blendful_right import (MODE_OFF, MODE_REGULAR, MODE_RIGHT, BlendfulCorrection, ConfGate, GroundTarget,
+from openpilot.sunnypilot.modeld_v2.blendful_right import (MODE_OFF, MODE_REGULAR, MODE_RIGHT, BlendfulCorrection, GroundTarget,
                                                            InputFilter, JumpDetector, JunctionEpisodes, RightLineBlendful, RoadClass,
                                                            WidthMemory, bend_score, junction_policy, mode_from_params, selection_to_params)
 from openpilot.sunnypilot.modeld_v2.constants import ModelConstants, Plan
@@ -228,18 +228,13 @@ class TestMeasurementFilter:
 
 
 class TestReferences:
-  @staticmethod
-  def gates(q_list):
-    g = ConfGate()
-    return [g.update(q) for q in q_list]
-
   @pytest.mark.parametrize("side,y_true", [(+1, 1.6), (-1, -1.9)])
   def test_lone_candidate_sits_at_its_true_position(self, side, y_true):
     worst = 0.0
     for q in np.linspace(0.3, 0.7, 41):
-      for c in (float(br.ss((q - 0.4) / 0.2)), float(br.ss((q - 0.3) / 0.2))):  # both hysteresis branches
+      for tau in (br.SOFTMIN_TAU, br.TARGET_SOFTMIN_TAU):  # rev 9: the limits' and the target's softness
         ys = np.array([[y_true] * 33, [y_true + side * 3.0] * 33])
-        y, qa, _ = RightLineBlendful._reference(ys, [q, 0.0], [c, 0.0], side)
+        y, qa, _ = RightLineBlendful._reference(ys, [q, 0.0], [br.push_factor(q), 0.0], side, tau)
         worst = max(worst, float(np.max(np.abs(y - y_true))))
     assert worst < 0.01
 
@@ -1372,11 +1367,8 @@ class TestTransitions:
     assert _glide_ok(rows, 13.0)
 
   def test_detectors_at_their_thresholds(self):
-    g = ConfGate()
-    assert g.update(0.4) == 0.0 and g.update(0.6) == 1.0  # rising branch: 0 at 0.4, full at 0.6
-    assert g.update(0.3) == 0.0  # falling branch (entered from above 0.5): 0 at 0.3
-    g.c = 1.0
-    assert g.update(0.5) == 1.0  # ... and full at 0.5
+    lo, hi = br.CONF_PUSH_Q  # rev 9 item 3a: the push factor is linear between the two levels, the same rising and falling (no memory)
+    assert br.push_factor(lo) == 0.0 and br.push_factor(hi) == 1.0 and br.push_factor((lo + hi) / 2) == pytest.approx(0.5)
     # bend detector: nothing below the thresholds, full above
     mo = Scene(pl=1.0, pr=1.0, widen=0.0).model_output()
     assert bend_score(X, mo['lane_lines'][0, 2, :, 0], mo['lane_lines'][0, 1, :, 0], 13.0)[3] == 0.0
@@ -1418,12 +1410,15 @@ class TestLogging:
     assert msg.blendfulRadarTowardObjects == rc.toward == 0 and msg.blendfulRadarObjects == 1
     assert abs(msg.blendfulRadarNearestTowardSpeed - rc.nearest_toward) < 1e-6
     fields = custom.BlendfulInster.schema.fields_list
-    assert [f.proto.name for f in fields[-6:]] == ['blendfulDetectorStrength', 'blendfulRadarBoundObjects', 'blendfulRadarTowardObjects',
-                                                   'blendfulRadarNearestTowardSpeed', 'blendfulDetectorGain', 'blendfulRadarClearanceObjects']
+    assert [f.proto.name for f in fields[-8:]] == ['blendfulDetectorStrength', 'blendfulRadarBoundObjects', 'blendfulRadarTowardObjects',
+                                                   'blendfulRadarNearestTowardSpeed', 'blendfulDetectorGain', 'blendfulRadarClearanceObjects',
+                                                   'blendfulTargetReference', 'blendfulTargetReferenceLineWeight']
     assert abs(msg.blendfulDetectorGain - ctl.result.log['det_gain']) < 1e-6
-    # rev 9 (@95): the clearance check's object count (the moving car in the own lane: 0)
+    # rev 9 (@95-@97): the clearance check's object count (the moving car in the own lane: 0); the target's reference and its line weight
+    assert abs(msg.blendfulTargetReference - ctl.result.log['target_reference']) < 1e-6
+    assert abs(msg.blendfulTargetReferenceLineWeight - ctl.result.log['target_reference_line_weight']) < 1e-6
     assert msg.blendfulRadarClearanceObjects == rc.clearance_objects == 0
-    assert [f.proto.ordinal.explicit for f in fields] == list(range(96))  # field numbers stable, the new ones appended
+    assert [f.proto.ordinal.explicit for f in fields] == list(range(98))  # field numbers stable, the new ones appended
 
   def test_fill_log_writes_the_episode_and_cue_fields(self):
     from openpilot.cereal import custom
@@ -1705,3 +1700,78 @@ class TestLagBoundUnderFarFieldErrors:
       gt.update(raw, 20.0, 0.01, DT_MDL, reseed_x=60.0)
       worst = max(worst, float(np.abs(np.interp(30.0, X, gt.lag))))
     assert worst <= br.LAG_BOUND + br.LAG_RATE * DT_MDL + 1e-6
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# rev 9 item 3 (owner 20 Nov 2026 11:56 / 12:03): the right reference Keep Right's target follows is formed gently: gradual confidence push
+# without the two-threshold gate, a softer blend, and the combination's own changes filtered after it.  The limits keep the sharp reference.
+def target_reference_run(pr_fn, edge_right, frames=400, v=13.0):
+  """RightLineBlendful on a straight lane (right line at 1.75 m) with a clear right edge at edge_right, the right line's probability pr_fn(i).
+  Per frame: the reference the target follows at L (rev 9 log 'target_reference'; before rev 9 the target followed the one reference), the
+  sharp reference at L, the line's push factor and filtered confidence, the target at L and the line bound at L from the sharp reference."""
+  rl = RightLineBlendful()
+  look = 1.5 * v
+  out = []
+  for i in range(frames):
+    lg = rl.update(Scene(v=v, edges=True, edge_right=edge_right, pr=pr_fn(i)).model_output(), v, True, 0.0, 0.0, RightInputs()).log
+    out.append((lg.get('target_reference', lg['reference'][1]), lg['reference'][1], lg['cand_conf'][2], lg['confidence'][2],
+                float(np.interp(look, X, lg['target'])), float(np.interp(look, X, lg['y_r'] - W_R - br.LINE_BOUND))))
+  return np.array(out)
+
+
+class TestRev9TargetReference:
+  def test_the_push_factor_follows_the_confidence_without_memory(self):
+    # item 3a: the line's confidence swings through the old gate's band (0.25 .. 0.75, period 4 s); its push factor is the same function of
+    # the confidence rising and falling (before: rising branch 0.4 .. 0.6, falling 0.3 .. 0.5: up to 0.73 apart at the same confidence)
+    r = target_reference_run(lambda i: 0.5 + 0.25 * np.sin(2 * np.pi * i * DT_MDL / 4), 2.15, frames=600)[100:]
+    np.testing.assert_allclose(r[:, 2], [br.push_factor(q) for q in r[:, 3]], atol=1e-12)
+    lo, hi = br.CONF_PUSH_Q
+    assert br.push_factor(lo - 0.01) == 0.0 and br.push_factor(hi + 0.01) == 1.0
+
+  def test_a_confidence_drop_moves_the_target_reference_gradually(self):
+    # item 3c: the confident inner line (1.75 m) is lost at frame 100, the edge counts at 2.05 m: the sharp reference steps 0.3 m within a few
+    # frames (the line coasts, its push factor falls); the target's reference releases that step at dt / (dt + tau) per frame
+    r = target_reference_run(lambda i: 0.9 if i < 100 else 0.0, 2.15)
+    step = 0.3
+    alpha = DT_MDL / (DT_MDL + br.TARGET_REF_TAU)
+    assert np.abs(np.diff(r[100:, 1])).max() > 0.2  # the sharp reference steps
+    assert np.abs(np.diff(r[100:, 0])).max() <= alpha * step + 1e-3  # before rev 9: 0.28 m in one frame
+    assert abs(r[-1, 0] - 2.05) < 1e-3  # then on the edge
+
+  def test_a_flickering_line_moves_the_target_reference_less(self):
+    # the line's probability swings 0.25 .. 0.75 every 4 s with a clear edge 0.3 m further out: the reference the target follows swings by
+    # less than two thirds of the step, with a standard deviation below half of it (before rev 9: the whole 0.3 m, std 0.15 m)
+    r = target_reference_run(lambda i: 0.5 + 0.25 * np.sin(2 * np.pi * i * DT_MDL / 4), 2.15, frames=800)[200:]
+    assert np.ptp(r[:, 0]) < 0.2 + 1e-3 and r[:, 0].std() < 0.07
+
+  def test_the_road_itself_passes_without_lag(self):
+    # guard (also before rev 9): without a change of the combination (one candidate, no edges) the target's reference is the combined reference
+    # in every frame, also while the lane moves sideways (the filter acts on the combination's own changes only, so no motion-model error
+    # builds up; a low-pass of the whole reference sat 0.3 m off at L in design check 21's 100 m curve)
+    # (the line filter's initialisation once its confidence passes 0.5 is a switch of 1 frame of the lane's sideways motion, released at once
+    # afterwards: at most 0.02 m, gone after a few seconds)
+    rl = RightLineBlendful()
+    diff = []
+    for i in range(400):
+      lg = rl.update(Scene(v=13.0, center=0.3 * np.sin(i * DT_MDL)).model_output(), 13.0, True, 0.0, 0.0, RightInputs()).log
+      diff.append(abs(lg.get('target_reference', lg['reference'][1]) - lg['reference'][1]))
+    assert max(diff) < 0.02 and max(diff[300:]) < 1e-4
+
+  def test_the_line_bound_reads_the_sharp_reference(self):
+    # guard: a confident line appears 0.5 m inside a clear edge; the sharp reference moves in with it, the target's reference follows only
+    # gradually, and the target never comes nearer to the sharp reference than the line bound (0.2 m) in any frame
+    r = target_reference_run(lambda i: 0.0 if i < 100 else 0.9, 2.35)
+    assert np.all(r[:, 4] <= r[:, 5] + 1e-9)
+
+  def test_the_softer_blend_stays_within_its_stated_outward_shift(self):
+    # item 3b: two confident candidates d apart; the blend the target follows sits outward of the inner one by at most 0.28 x the softness
+    for d in (0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5):
+      ys = np.array([[1.6] * 33, [1.6 + d] * 33])
+      y, _, _ = RightLineBlendful._reference(ys, [0.9, 0.8], [1.0, 1.0], +1, br.TARGET_SOFTMIN_TAU)
+      assert 0.0 <= y[5] - 1.6 <= 0.28 * br.TARGET_SOFTMIN_TAU + 1e-6
+
+  def test_an_absent_line_stays_out_of_the_softer_blend(self):
+    # item 3b: the push grows with the softness, so a line of confidence 0 well inside a clear edge gets no weight in the softer blend either
+    ys = np.array([[1.75] * 33, [2.9] * 33])
+    y, _, w = RightLineBlendful._reference(ys, [0.0, 0.8], [0.0, 1.0], +1, br.TARGET_SOFTMIN_TAU)
+    assert w[0, 5] < 1e-3 and abs(y[5] - 2.9) < 1e-3
