@@ -1409,10 +1409,11 @@ class TestRev8DetectorToTheModelPath:
 
 
 class TestRev9ClearanceIgnoresTheOwnLaneVehicle:
-  """Rev 9 item 1a (owner 20 Nov 11:56): the clearance check ignores moving vehicles in the own lane, as the object bound does (rev 8 item 1a):
-  with a usable right reference, a corridor object at least 10 cm inside it that the radial test classifies moving, only while the car is
-  closing on it slower than CLOSING_SPEED 0.5 m/s (the largest -vRel over 1 s) and its point is within the car's path width (part 2 round
-  2, aa333d42 / review be680b1e): the lead.  A slower rider or vehicle the car runs up on, or one beside the car's path, counts.  Objects moving sideways toward the lane still count; without a usable reference every object counts, as before."""
+  """Rev 9 item 1a (owner 20 Nov 11:56): the clearance check and the object bound ignore the lead: with a usable right reference, a corridor
+  object at least 10 cm inside it that the radial test classifies moving, only while the car closes on it slower than CLOSING_SPEED 0.5 m/s
+  (the largest -vRel over 1 s) and its point is within the car's path width (part 2 round 2, aa333d42 / review be680b1e).  A slower rider or
+  vehicle the car runs up on, or one beside the car's path, counts.  Objects moving sideways toward the lane still count; without a usable
+  reference every object counts, as before."""
   V = 40 / 3.6
 
   def run(self, tracks_fn, frames=80, scene=None, gap=0.5):
