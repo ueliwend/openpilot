@@ -312,7 +312,10 @@ class TestReferences:
     for v, expected in ((50 / 3.6, gap50), (120 / 3.6, gap120)):
       rl, res = steady(v=v, pl=0.0, pr=0.0, edges=True, edge_half=width / 2, edge_std=0.3, frames=300)
       gap_edge = width / 2 - (target_at(res.log, v) + W_R)
-      assert abs(gap_edge - expected) < 0.03, (width, v, gap_edge)
+      if width < 5.5:
+        assert abs(gap_edge - expected) < 0.03, (width, v, gap_edge)
+      else:  # rev 9 item 3b (softness 0.20 m): the absent line 1.15 m inside the edge gets some weight: more gap than set, never less
+        assert expected - 0.03 < gap_edge < expected + 0.2, (width, v, gap_edge)
 
   def test_unclipped_width_between_references(self):
     # lane width 6 m (upstream would clip its half width to 2.25 m): the centre stays the middle between the references
@@ -1414,11 +1417,11 @@ class TestLogging:
                                                    'blendfulRadarNearestTowardSpeed', 'blendfulDetectorGain', 'blendfulRadarClearanceObjects',
                                                    'blendfulTargetReference', 'blendfulTargetReferenceLineWeight']
     assert abs(msg.blendfulDetectorGain - ctl.result.log['det_gain']) < 1e-6
-    # rev 9 (@95-@97): the clearance check's object count (the moving object 1.2 m right of the car is no lead: it counts); the target's
-    # reference and its line weight
+    # rev 9 (@95-@97): the clearance check's object count (the object moving at our speed is a lead: not counted); the target's reference
+    # and its line weight
     assert abs(msg.blendfulTargetReference - ctl.result.log['target_reference']) < 1e-6
     assert abs(msg.blendfulTargetReferenceLineWeight - ctl.result.log['target_reference_line_weight']) < 1e-6
-    assert msg.blendfulRadarClearanceObjects == rc.clearance_objects == 1
+    assert msg.blendfulRadarClearanceObjects == rc.clearance_objects == 0
     assert [f.proto.ordinal.explicit for f in fields] == list(range(98))  # field numbers stable, the new ones appended
 
   def test_fill_log_writes_the_episode_and_cue_fields(self):
@@ -1730,12 +1733,12 @@ class TestRev9TargetReference:
     assert br.push_factor(lo - 0.01) == 0.0 and br.push_factor(hi + 0.01) == 1.0
 
   def test_a_confidence_drop_moves_the_target_reference_gradually(self):
-    # item 3c: the confident inner line (1.75 m) is lost at frame 100, the edge counts at 2.05 m: the sharp reference steps 0.3 m within a few
-    # frames (the line coasts, its push factor falls); the target's reference releases that step at dt / (dt + tau) per frame
+    # item 3c: the confident inner line (1.75 m) is lost at frame 100, the edge counts at 2.05 m: the sharp reference moves 0.3 m within a few
+    # frames (the line coasts, its push factor falls; up to 0.15 m in one frame); the target's reference releases it at dt / (dt + tau) per frame
     r = target_reference_run(lambda i: 0.9 if i < 100 else 0.0, 2.15)
     step = 0.3
     alpha = DT_MDL / (DT_MDL + br.TARGET_REF_TAU)
-    assert np.abs(np.diff(r[100:, 1])).max() > 0.2  # the sharp reference steps
+    assert np.abs(np.diff(r[100:, 1])).max() > 0.1  # the sharp reference steps
     assert np.abs(np.diff(r[100:, 0])).max() <= alpha * step + 1e-3  # before rev 9: 0.28 m in one frame
     assert abs(r[-1, 0] - 2.05) < 1e-3  # then on the edge
 
@@ -1771,8 +1774,11 @@ class TestRev9TargetReference:
       y, _, _ = RightLineBlendful._reference(ys, [0.9, 0.8], [1.0, 1.0], +1, br.TARGET_SOFTMIN_TAU)
       assert 0.0 <= y[5] - 1.6 <= 0.28 * br.TARGET_SOFTMIN_TAU + 1e-6
 
-  def test_an_absent_line_stays_out_of_the_softer_blend(self):
-    # item 3b: the push grows with the softness, so a line of confidence 0 well inside a clear edge gets no weight in the softer blend either
-    ys = np.array([[1.75] * 33, [2.9] * 33])
-    y, _, w = RightLineBlendful._reference(ys, [0.0, 0.8], [0.0, 1.0], +1, br.TARGET_SOFTMIN_TAU)
-    assert w[0, 5] < 1e-3 and abs(y[5] - 2.9) < 1e-3
+  def test_an_absent_line_only_pulls_the_softer_blend_inward_within_its_stated_amount(self):
+    # item 3b (part 2's V7e push (1 - q) x 1.5 m with V7d 0.20 m): a line of confidence 0 that lies d inside a clear edge (confidence 0.8) gets
+    # some weight once d is large: the reference moves inward only (more gap than set), 0.17 m at d = 1.15 m (a 6 m road without lines), less
+    # than 1 cm at d <= 0.65 m (a 5 m road)
+    for d, most in ((0.3, 0.01), (0.65, 0.01), (1.15, 0.18)):
+      ys = np.array([[2.9 - d] * 33, [2.9] * 33])
+      y, _, _ = RightLineBlendful._reference(ys, [0.0, 0.8], [br.push_factor(0.0), br.push_factor(0.8)], +1, br.TARGET_SOFTMIN_TAU)
+      assert 0.0 <= 2.9 - y[5] <= most

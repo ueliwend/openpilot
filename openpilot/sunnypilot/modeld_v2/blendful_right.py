@@ -46,18 +46,24 @@ COAST_Q, COAST_MAX, REINIT_Q = 0.3, 1.0, 0.5
 PUSH = 1.5  # m, outward push of an unconfident candidate (weights only)
 SOFTMIN_TAU = 0.05  # m, the reference the limits read (centre limit, line bound, radar line filters, detectors): sharp, the inner candidate
 # rev 9 item 3 (owner 20 Nov 11:56 "Do it", 12:03 "This needs to be fixed"): the reference Keep Right's TARGET follows is formed more gently.
+# Values: part 2 (inster-dev results/2026-11-20_keepright_calm/part2_interim, REV9_VALUES.md at 00366139 and its independent review
+# REVIEW_rev9_values.md at 1c8c0488: V7e on, V7d 0.20 m).
 # (a) Gradual confidence push (replaces the two-threshold ConfGate, both references): the push factor c of a candidate is linear in its
 #     confidence q between CONF_PUSH_Q[0] (c = 0, pushed PUSH outward) and CONF_PUSH_Q[1] (c = 1, not pushed); no hysteresis, no memory.
-#     PROVISIONAL (0.3, 0.6) = the band the old gate switched in (falling branch from 0.3, rising branch full at 0.6), until part 2's values
-#     (inster-dev results/2026-11-20_keepright_calm/part2, variant V7e) are posted.
-CONF_PUSH_Q = (0.3, 0.6)
-# (b) Softer blend: the target's right reference is the soft minimum with this softness (the limits keep SOFTMIN_TAU).  The blend sits
-#     outward of the inner candidate by up to 0.28 x the softness (two confident candidates about 1.3 x the softness apart), so the gap held
-#     can be that much smaller than set.  PROVISIONAL 0.1 m = the lowest value of part 2's variant V7d (0.1 / 0.2 / 0.3 m): at most 0.028 m.
-TARGET_SOFTMIN_TAU = 0.1  # m
+#     Part 2's V7e is push = (1 - q) PUSH, i.e. (0, 1); the full end is set to 0.8 instead, the most an edge's confidence can be (the edge
+#     std 0.3 m maps to 0.8): with (0, 1) a fully clear edge is always pushed 0.3 m, so an absent line (q 0) up to about 1.2 m inside it takes
+#     a large weight (6 m road without lines: gap to the edge 1.10 m instead of 0.60 m at 50 km/h, and the limits' reference moves in too;
+#     TEST test_narrow_roads_without_lines_table).  So push = (1 - q / 0.8) PUSH, nothing above q 0.8.
+CONF_PUSH_Q = (0.0, 0.8)
+# (b) Softer blend (right reference of the target only; the left reference and the limits keep SOFTMIN_TAU): part 2's V7d.  The blend sits
+#     outward of the inner candidate by up to 0.28 x the softness (two confident candidates about 1.3 x the softness apart: up to 0.056 m less
+#     gap than set), and a candidate of confidence 0 that lies more than about PUSH - 4 x the softness inside the other gets some weight (an
+#     absent line 1.15 m inside a clear edge: the reference 0.17 m inward, more gap than set).
+TARGET_SOFTMIN_TAU = 0.2  # m
 # (c) Filter after the combination: what the combination adds to the target's right reference (its switch part: weight changes, input
 #     re-initialisation steps) is released through a first-order low-pass with this time constant, carried along the lane (ReferenceFilter).
-#     PROVISIONAL 1.0 s = the middle of part 2's variant V7c (0.5 / 1 / 2 s).
+#     The road geometry is not filtered, so it has no lag in bends (part 2's V7c, a low-pass of the whole reference, lagged in bends and is
+#     off).  PROVISIONAL 1.0 s (no part 2 measurement of this form); 0 passes the reference through exactly.
 TARGET_REF_TAU = 1.0  # s
 PLAUS_TOL, WIDTH_RANGE = 0.3, (2.0, 8.0)
 # correction (B4, B11)
@@ -907,10 +913,8 @@ class RightLineBlendful:
   @staticmethod
   def _reference(ys, qs, cs, side: int, tau: float = SOFTMIN_TAU):
     """B3: soft minimum (softness tau) of the (confidence pushed) candidates gives the weights, the reference is the weighted mean of the
-    TRUE positions.  Rev 9 item 3b: the push grows with the softness (PUSH at SOFTMIN_TAU), so an unconfident candidate is kept out of a
-    softer combination as firmly as out of the sharp one (an absent line 1.15 m inside a clear edge would otherwise pull a 0.2 m soft
-    combination 0.17 m inward); the softness only blends confident candidates more gently."""
-    pushed = side * (ys + side * (1.0 - np.asarray(cs))[:, None] * PUSH * tau / SOFTMIN_TAU)
+    TRUE positions."""
+    pushed = side * (ys + side * (1.0 - np.asarray(cs))[:, None] * PUSH)
     w = np.exp(-(pushed - pushed.min(axis=0)) / tau)
     w /= w.sum(axis=0)
     return (w * ys).sum(axis=0), (w * np.asarray(qs)[:, None]).sum(axis=0), w

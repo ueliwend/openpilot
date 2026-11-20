@@ -329,11 +329,15 @@ class TestClosedLoop:
   @pytest.mark.parametrize("kmh", SPEEDS)
   def test_right_reference_switch_line_to_edge_through_the_weights(self, kmh):
     # 5 s into the move the inner right line (1.75) fades over 1 s and the edge (2.15, counted 2.05) takes over.  Without the switch part
-    # in G0 the switch would add its own speed to the move (check 20b); rev 8: the car stays within the move speed + 0.02 m/s
+    # in G0 the switch would add its own speed to the move (check 20b); rev 8: the car stays within the move speed + 0.02 m/s.  Rev 9: from the
+    # switch on (the softer blend starts the move 0.055 m further out, toward the edge 0.3 m beyond the line, and in this loop the car's peak
+    # before the switch then reaches 0.23 m/s, the known overshoot of the 0.2 m/s move, MOVE_SPEED_DYNAMICS), and the target itself moves at
+    # the move speed over the whole run
     def scene(t):
       return {'right_edge': 2.15, 'right_line_prob': float(np.clip(0.9 - 0.9 * (t - 5.0), 0.0, 0.9)) if t > 5.0 else 0.9}
-    t, y, vs, _, _ = closed_loop(kmh / 3.6, scene, seconds=60.0)
-    assert vs[t >= 0].max() <= br.MOVE_SPEED + 0.02
+    t, y, vs, tg, _ = closed_loop(kmh / 3.6, scene, seconds=60.0)
+    assert vs[t >= 5.0].max() <= br.MOVE_SPEED + 0.02
+    assert np.nanmax(np.diff(tg[t >= 0.5]) / DT_MDL) <= br.MOVE_SPEED + 0.01
     assert abs(y[-1] - (2.15 - br.EDGE_EXTRA - br.W_R - 0.44)) < 0.01  # ends at the edge-referenced position, no false yield on the way
 
   @pytest.mark.parametrize("kmh", SPEEDS)
@@ -1400,10 +1404,9 @@ class TestRev8DetectorToTheModelPath:
 
 class TestRev9ClearanceIgnoresTheOwnLaneVehicle:
   """Rev 9 item 1a (owner 20 Nov 11:56): the clearance check ignores moving vehicles in the own lane, as the object bound does (rev 8 item 1a):
-  with a usable right reference, a corridor object at least 10 cm inside it that the radial test classifies moving.  Safety restriction
-  (coordinator 20 Nov, part 2's case 00000044 T 612.4): only while it is a lead, its point at most LEAD_PATH_OFFSET right of the car's path;
-  further right (a slower vehicle or a rider in the right part of the lane) it counts.  Objects moving sideways toward the lane still count;
-  without a usable reference every object counts, as before."""
+  with a usable right reference, a corridor object at least 10 cm inside it that the radial test classifies moving, only while the car is
+  not closing on it faster than CLOSING_SPEED 1 m/s (-vRel; part 2's review, 1c8c0488): the lead.  A slower rider or vehicle the car runs
+  up on counts.  Objects moving sideways toward the lane still count; without a usable reference every object counts, as before."""
   V = 40 / 3.6
 
   def run(self, tracks_fn, frames=80, scene=None, gap=0.5):
@@ -1415,20 +1418,20 @@ class TestRev9ClearanceIgnoresTheOwnLaneVehicle:
       logs.append(res.log)
     return logs
 
-  @pytest.mark.parametrize("y_right,v_rel", [(0.2, 0.0), (0.2, -3.0), (0.05, 0.0), (0.45, -3.0)])
+  @pytest.mark.parametrize("y_right,v_rel", [(0.2, 0.0), (0.2, -0.9), (0.2, 2.0), (0.6, 0.0), (1.0, 0.0)])
   def test_a_lead_in_the_own_lane_starts_no_yield(self, y_right, v_rel):
-    # the car ahead 0.2 m right of the car (at our speed, or 3 m/s slower), 0.05 m and 0.45 m right of it: the deficit would be
-    # 0.7 - (y - 0.81) > 0 (rev 8: a clearance yield, Keep Right's strength faded to zero); now it does not count, the strength stays
+    # the car ahead 0.2 m right of the car at our speed, 0.9 m/s slower, pulling away at 2 m/s; and steady leads 0.6 / 1.0 m right of the car:
+    # the deficit would be 0.7 - (y - 0.81) > 0 (rev 8: a clearance yield, Keep Right's strength faded to zero); now it does not count
     logs = self.run(lambda i: [(1, 15.0, -y_right, v_rel)] if i >= 40 else [])
     assert logs[-1]['q_R'] > br.REF_USABLE_Q and logs[-1]['radar'].objects == 1 and logs[-1]['radar'].moving == 1
     assert not any(lg['radar'].yield_active for lg in logs) and logs[-1]['radar'].deficit < -1.0
     assert all(lg['f_yl'] == 1.0 for lg in logs)
 
-  @pytest.mark.parametrize("kmh,x,y_right,v_obj_kmh", [(57, 41.0, 1.0, 49), (40, 15.0, 1.30, 20), (40, 15.0, 0.6, 30)])
-  def test_a_moving_vehicle_right_of_the_cars_path_still_yields(self, kmh, x, y_right, v_obj_kmh):
-    # safety restriction: part 2's logged case 00000044 T 612.4 (a vehicle at 49 km/h 41 m ahead, 1.0 m right of the car's centre, the car at
-    # 57 km/h: with the unrestricted rule its yield was lost, estimated clearance 0.14 -> -0.02 m), a cyclist at 20 km/h 0.45 m inside the right
-    # line (1.30 m right of the car; closed loop with the unrestricted rule: passed at -0.01 m), a slower vehicle 0.6 m right of the car
+  @pytest.mark.parametrize("kmh,x,y_right,v_obj_kmh", [(40, 29.0, 1.30, 26), (40, 15.0, 1.30, 20), (50, 25.0, 0.6, 40), (40, 15.0, 0.2, 30)])
+  def test_a_moving_object_the_car_closes_on_still_yields(self, kmh, x, y_right, v_obj_kmh):
+    # part 2's review (1c8c0488): a rider near the kerb at 26 km/h first counted 29 m ahead, the car at 40 km/h (as the labelled cyclist on
+    # 00000044 T 531.8-538.0); a cyclist at 20 km/h; a slower vehicle 0.6 m right of the car; a slower vehicle ahead (closing 2.8 m/s): all count
+    # (closed loop with the rule that ignored every moving object in the own lane: the cyclist was passed at -0.01 m)
     v = kmh / 3.6
     rl = RightLineBlendful()
     logs = []
