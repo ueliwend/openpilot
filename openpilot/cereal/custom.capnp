@@ -650,7 +650,7 @@ struct BlendfulInster @0xa4f1eb3323f5f582 {
   blendfulFilterOffset @31 :List(Float32);  # filtered minus raw at x = L, per input
   blendfulInputConfidence @32 :List(Float32);
   blendfulInputState @33 :List(UInt8);  # bit 0 coasting, bit 1 re-initialised this frame
-  blendfulCandidateConfidence @34 :List(Float32);  # c_i per input (push factor; rev 9: linear in the confidence, was a hysteresis gate)
+  blendfulCandidateConfidence @34 :List(Float32);  # c_i per input (left: hysteresis gate; right, rev 9: push factor linear in the confidence)
   blendfulCandidateWeight @35 :List(Float32);  # softmin weight w_i per input at x = L
   blendfulReference @36 :List(Float32);  # [left, right] reference at x = L
   blendfulTarget @37 :List(Float32);  # target lateral position per model x index (right line mode)
@@ -714,12 +714,12 @@ struct BlendfulInster @0xa4f1eb3323f5f582 {
   blendfulDetectorAway @89 :Float32;  # swerve minus the car-departure term, m (hand-over latch above the detector's upper level; rev 7.2: 0.2)
   # rev 8 (owner 15 Nov 2026; inster-dev results/2026-11-15_a8_rev8/DESIGN.md)
   blendfulDetectorStrength @90 :Float32;  # factor on the strength target from the detector's swerve value: 1 at <= lower level, 0 at >= upper level
-  blendfulRadarBoundObjects @91 :UInt8;  # corridor objects the object bound counts (>= 10 cm inside the right reference, not moving (rev 9: not a lead), confirmed for the bound)
+  blendfulRadarBoundObjects @91 :UInt8;  # corridor objects the object bound counts (>= 10 cm inside the right reference, not moving (rev 9b: not the car ahead), confirmed for the bound)
   blendfulRadarTowardObjects @92 :UInt8;  # corridor objects moving sideways toward the lane (count for the clearance deficit from outside too)
   blendfulRadarNearestTowardSpeed @93 :Float32;  # sideways speed toward the lane of the object with the largest deficit, m/s (> 0 toward)
   blendfulDetectorGain @94 :Float32;  # rev 8 review B1 / S3: the detector factor through its own 1 s low-pass; multiplies Keep Right's share in Right line
-  # rev 9 (owner 20 Nov 2026; inster-dev results/2026-11-20_a8_rev9/DESIGN.md)
-  blendfulRadarClearanceObjects @95 :UInt8;  # corridor objects the clearance deficit counts (lane obstacles, not moving vehicles in the own lane; and objects moving toward the lane)
-  blendfulTargetReference @96 :Float32;  # the right reference Keep Right's target follows (softer combination, the combination's changes filtered), at L, m
-  blendfulTargetReferenceLineWeight @97 :Float32;  # weight of the right line in that softer combination, at L (1 - it: the edge)
+  # rev 9 / 9b (owner 20 Nov 2026; inster-dev results/2026-11-20_a8_rev9b/DESIGN.md)
+  blendfulRadarClearanceObjects @95 :UInt8;  # corridor objects the clearance deficit counts (lane obstacles and road users not ignored as the car ahead; objects moving toward the lane)
+  blendfulRadarLeadObjects @96 :UInt8;  # corridor objects ignored as the car ahead in the own lane (moving, in the car's path, not near the right line, not closed on, headway >= 2 s)
+  blendfulRightLineHold @97 :Float32;  # factor holding the right reference at the right line where the line / edge blend lies outward of it (0 .. 1 from line confidence 0.3 .. 0.5)
 }

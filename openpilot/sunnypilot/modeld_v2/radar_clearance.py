@@ -15,16 +15,18 @@ the filtered references, the centre limit, the speed and the B2 motion inputs, n
   inside = y <= Y_R(x) - 0.10 m (at least 10 cm inside the right line or edge); toward = classified moving (radial test below) and the
   object's sideways ground speed toward the lane (leftward), mean of the last 10 messages, yaw-compensated with the B2 motion model,
   >= TOWARD_LANE_SPEED 1.0 m/s (a vehicle cut-in rule; a pedestrian or cyclist stepping sideways is classified standing and not seen).
-- Object bound (item 1): counts objects that are inside, not a lead (rev 9: with a usable reference, a moving vehicle in the own lane the car
-  closes on slower than CLOSING_SPEED within its path width, e.g. the car ahead; rev 8 ignored every moving one) and confirmed for
+- Object bound (item 1): counts objects that are inside, not a lead (rev 9b, below; rev 8 ignored every moving one) and confirmed for
   BOUND_CONFIRM_MESSAGES (20).
   T_obj = min (y - w_R - m - dc) over them; never further left than the centre limit (floor: the lowest centre limit in the fit window,
   passed in); falls at once, rises after 1 s without a fall at the car's move speed (MOVE_SPEED of blendful_right, passed in as rise).
 - Clearance deficit (item 3) from the car's actual position: the car keeps its present offset from the centre limit along the lane, so its
   path is P(x) = T_C'(x) - T_C'(0) (P(0) = 0, the car where it is now); d = m - min (y - w_R - dc - P(x)) over the corridor objects that
-  are inside and not a lead (rev 9 item 1a: a moving vehicle in the own lane within the car's path width that the car closes on slower than
-  CLOSING_SPEED 0.5 m/s, the largest -vRel over 1 s), or toward.  d > 0 starts the clearance
-  yield (obstacle side right), released when d < -0.1 m for 1 s (or the object is gone); the cap ramps over d 0 .. 0.05 m.
+  are inside and not a lead, or toward.  d > 0 starts the clearance yield (obstacle side right), released when d < -0.1 m for 1 s (or the
+  object is gone); the cap ramps over d 0 .. 0.05 m.
+- Lead (rev 9b, owner 20 Nov 2026 20:12; ignored by the bound and the clearance deficit): the car ahead in the own lane, i.e. with a usable
+  right reference an object that is classified moving, lies within the car's path width (|y - dc - P(x)| <= w_R), lies at least w_R left
+  of the right reference (never one near the right line: a cyclist or scooter there always counts), the car is not closing on it (closing
+  state below, with hysteresis) and it is not followed closely (headway state below: under LEAD_HEADWAY it always counts).
 - Stationary / moving (radial test over 8 of 10 messages, the same share of fewer while a track is younger, rev 9): selects the objects the
   bound and the clearance deficit count (rev 8 / rev 9); pop-ups are logged only.
 - Health: no message, a message older than 0.3 s, an invalid message, any RadarData.errors flag, a non-finite dRel / yRel in the message,
@@ -53,17 +55,23 @@ LINE_INSIDE = 0.10  # m
 # cut-ins flagged before the line, 1.0 other flags per km; standing clutter cannot trigger it); it cannot see a pedestrian or cyclist
 # stepping sideways (no radial speed: classified standing)
 TOWARD_LANE_SPEED = 1.0  # m/s
-# rev 9 item 1a (owner 20 Nov 11:56; part 2, inster-dev results/2026-11-20_keepright_calm/part2_interim REV9_VALUES.md round 2 at aa333d42,
-# reviewed at be680b1e): a moving vehicle in the own lane is a lead, ignored by the clearance check AND by the object bound, only while
-# (1) the car closes on it slower than CLOSING_SPEED, the closing speed being the largest -vRel over the track's last CLOSING_WINDOW messages
-#     (car.RadarData.RadarPoint.vRel: the radar's relative radial speed, m/s, > 0 moving away; a remembered track keeps its values): an object
-#     counts from the first message whose closing speed reaches the limit and stops counting only 1 s after the last one (a continuous maximum
-#     over a moving window, no hysteresis or dwell; against vRel flicker, which crossed 0.5 m/s about 7 times per minute behind a lead), and
-# (2) its point lies within the car's own path width: at most w_R (the car's half width) from the car's centre carried along the lane.
-# Otherwise it counts for both (a slower rider or vehicle the car runs up on: the labelled cyclist on 00000044, the slow object on 00000052; a
-# vehicle beside the car's path at equal speed).  Rev 8's bound ignored every moving vehicle in the own lane.
-CLOSING_SPEED = 0.5  # m/s
-CLOSING_WINDOW = 20  # messages = 1 s at the 20 Hz track rate
+# rev 9b lead rule (owner 20 Nov 2026 20:12, inster-dev docs/decisions/2026-11-20.md; design results/2026-11-20_a8_rev9b/DESIGN.md): a
+# moving vehicle in the own lane (the car ahead) is ignored by the clearance check and the object bound only while ALL of these hold:
+# (1) it is not near the right line: at least the car's half width w_R left of the right reference (a cyclist or scooter riding near the line
+#     always counts; objects less than LINE_INSIDE inside the reference or beyond it count only when moving toward the lane, as in rev 8);
+# (2) the car is not closing on it (closing state with hysteresis, part 2 round 3, reviewed AGREE): a message with closing speed -vRel
+#     >= CLOSING_ON sets the state at once (never later than the instantaneous rule); it clears only after CLOSING_OFF_MESSAGES consecutive
+#     messages (2 s at the 20 Hz track rate) with -vRel below CLOSING_OFF; a message between the two restarts that count; a new or
+#     re-associated track starts not closing and its first message applies (a standing object closes at about the car's speed);
+# (3) it is not followed closely: its distance (dRel, carried along for a remembered object) over the car's speed is at least LEAD_HEADWAY;
+#     below it always counts (review B1 of rev 9: a road user followed at about 1 s and then closed on was passed up to 0.6 m closer than
+#     today, because the yield started only at the closing onset); once counted for headway it stays counted until the headway exceeds
+#     LEAD_HEADWAY + LEAD_HEADWAY_BAND (a following distance drifting about 2 s does not switch the yield on and off);
+# (4) its point lies within the car's own path width: at most w_R from the car's centre carried along the lane (part 2 review be680b1e).
+# car.RadarData.RadarPoint.vRel: the radar's relative radial speed, m/s, > 0 moving away; a remembered track keeps its states.
+CLOSING_ON, CLOSING_OFF = 0.5, 0.2  # m/s
+CLOSING_OFF_MESSAGES = 40  # consecutive messages below CLOSING_OFF (2 s at 20 Hz)
+LEAD_HEADWAY, LEAD_HEADWAY_BAND = 2.0, 0.5  # s
 CONSISTENT_DIST, CONSISTENT_LAT = 1.0, 1.0  # m
 MEMORY_X, FORGET_X = 20.0, -3.3  # m: remembered when last seen nearer than this; forgotten 1 m behind the rear bumper
 CORRIDOR_TIME, CORRIDOR_MIN = 3.0, 15.0  # s, m
@@ -151,7 +159,9 @@ class Track:
   ghost_t: float = 0.0  # > 0: a track that lost its confirmation, kept as the remembered object for this long (B6a item 4, rev 6.8)
   moving_votes: deque = field(default_factory=lambda: deque(maxlen=MOVING_WINDOW))
   lat_steps: deque = field(default_factory=lambda: deque(maxlen=MOVING_WINDOW))  # rev 8: (yaw-compensated sideways step, message dt) pairs
-  closing: deque = field(default_factory=lambda: deque(maxlen=CLOSING_WINDOW))  # rev 9: -vRel of the last CLOSING_WINDOW consistent messages
+  closing: bool = False  # rev 9b: closing state (lead rule (2))
+  calm: int = 0  # rev 9b: consecutive messages with -vRel below CLOSING_OFF since the last one at or above it
+  near: bool = False  # rev 9b: headway state (lead rule (3)): followed closer than LEAD_HEADWAY, not yet beyond LEAD_HEADWAY + LEAD_HEADWAY_BAND
 
   @property
   def moving(self) -> bool:
@@ -161,10 +171,26 @@ class Track:
     n = len(self.moving_votes)
     return n > 0 and sum(self.moving_votes) * MOVING_WINDOW >= MOVING_MIN * n
 
-  @property
-  def closing_max(self) -> float:
-    """rev 9 item 1a: the largest closing speed (-vRel) over the last CLOSING_WINDOW consistent messages, m/s."""
-    return max(self.closing, default=-self.v_rel)
+  def closing_message(self, v_rel: float):
+    """rev 9b lead rule (2): one radar message's closing speed -vRel into the closing state (hysteresis)."""
+    c = -float(v_rel)
+    if c >= CLOSING_ON:
+      self.closing, self.calm = True, 0
+    elif c < CLOSING_OFF:
+      self.calm += 1
+      if self.calm >= CLOSING_OFF_MESSAGES:
+        self.closing = False
+    else:
+      self.calm = 0
+
+  def headway(self, v: float) -> bool:
+    """rev 9b lead rule (3): update and return the headway state from the object's distance (dRel = x - RADAR_TO_MODEL_X) at speed v."""
+    h = (self.x - RADAR_TO_MODEL_X) / max(v, 1.0)
+    if h < LEAD_HEADWAY:
+      self.near = True
+    elif h > LEAD_HEADWAY + LEAD_HEADWAY_BAND:
+      self.near = False
+    return self.near
 
   @property
   def toward_speed(self) -> float:
@@ -189,6 +215,7 @@ class ClearanceResult:
   bound_objects: int = 0  # rev 8: of them the ones the object bound counts (inside, not a lead (rev 9), confirmed for the bound)
   toward: int = 0  # rev 8: of them the ones moving sideways toward the lane (moving, >= TOWARD_LANE_SPEED)
   clearance_objects: int = 0  # rev 9: of them the ones the clearance deficit counts (lane obstacles and objects moving toward the lane)
+  lead_objects: int = 0  # rev 9b: of them the ones ignored as the car ahead in the own lane (lead rule)
   nearest_toward: float = 0.0  # rev 8: sideways speed toward the lane of the object with the largest deficit, m/s (log)
   memory: int = 0  # of them remembered beside the car
   moving: int = 0  # of them classified moving
@@ -238,18 +265,18 @@ class RadarClearance:
         count = tr.count + 1 if consistent else 1
         votes = tr.moving_votes if consistent else deque(maxlen=MOVING_WINDOW)
         lat = tr.lat_steps if consistent else deque(maxlen=MOVING_WINDOW)
-        clo = tr.closing if consistent else deque(maxlen=CLOSING_WINDOW)
+        states = (tr.closing, tr.calm, tr.near) if consistent else (False, 0, False)
         confirmed = tr.confirmed and consistent
         if consistent:  # rev 8: sideways ground step = the move against a ground-fixed point predicted with the B2 motion model
           lat.append(((y - tr.y) + yaw_rate * msg_dt * (x + l_d + vx0 * msg_dt / 2), msg_dt))
       else:
         count, votes, lat, confirmed = 1, deque(maxlen=MOVING_WINDOW), deque(maxlen=MOVING_WINDOW), False
-        clo = deque(maxlen=CLOSING_WINDOW)
+        states = (False, 0, False)
       az = np.arctan2(y_rel, max(d_rel, 1e-3))
       votes.append(abs(v_rel + v * np.cos(az)) >= MOVING_SPEED)
-      clo.append(-float(v_rel))
       new = Track(x=x, y=y, d_rel=float(d_rel), y_rel=float(y_rel), v_rel=float(v_rel), count=count, confirmed=confirmed, moving_votes=votes,
-                  lat_steps=lat, closing=clo)
+                  lat_steps=lat, closing=states[0], calm=states[1], near=states[2])
+      new.closing_message(v_rel)
       if not new.confirmed and new.count >= CONFIRM_MESSAGES:
         new.confirmed = True
         new.popup = x < POPUP_TIME * max(v, 1.0)
@@ -266,7 +293,8 @@ class RadarClearance:
 
   def _remember(self, tr: Track):
     self.ghosts.append(Track(x=tr.x, y=tr.y, d_rel=tr.d_rel, y_rel=tr.y_rel, v_rel=tr.v_rel, count=tr.count, confirmed=True, seen=False,
-                             ghost_t=GHOST_TIME, moving_votes=tr.moving_votes, lat_steps=tr.lat_steps, closing=tr.closing))
+                             ghost_t=GHOST_TIME, moving_votes=tr.moving_votes, lat_steps=tr.lat_steps, closing=tr.closing, calm=tr.calm,
+                             near=tr.near))
 
   def _move_memory(self, vx0: float, yaw_rate: float, dt: float, l_d: float):
     """Remembered objects are ground-fixed: moved with the B2 motion model into the new car frame (and forgotten behind the car)."""
@@ -307,6 +335,7 @@ class RadarClearance:
     ctr0 = float(c_ctr[0])
     t_raw, d, nearest = NO_BOUND, -NO_BOUND, None
     for tr in list(self.tracks.values()) + self.ghosts:
+      followed = tr.headway(v)  # rev 9b lead rule (3): every track, every frame (remembered ones by their carried distance)
       if not tr.confirmed or tr.x > x_h or tr.x < FORGET_X:
         continue
       xq = min(max(tr.x, x_idxs[0]), x_idxs[-1])
@@ -323,16 +352,18 @@ class RadarClearance:
       inside = y_ref is None or tr.y <= float(np.interp(xq, x_idxs, y_ref)) - LINE_INSIDE
       toward = tr.moving and tr.toward_speed >= TOWARD_LANE_SPEED  # only on the moving vote (measurement adaea0f4)
       res.toward += int(toward)
-      # rev 8 / rev 9 item 1a: with a usable reference "inside" is the own lane and a moving object in it a vehicle in the own lane; it is a
-      # lead (e.g. the car ahead), ignored by the bound and the clearance deficit, while the car closes on it slower than CLOSING_SPEED (the
-      # largest over 1 s) and its point is within the car's own path width
-      lead = (y_ref is not None and tr.moving and tr.closing_max < CLOSING_SPEED and abs(tr.y - dc - (ctr - ctr0)) <= w_r)
+      # rev 9b lead rule: with a usable reference "inside" is the own lane and a moving object in it a vehicle in the own lane; it is the car
+      # ahead, ignored by the bound and the clearance deficit, only while it is not near the right line, not closed on, not followed closely
+      # and within the car's own path width (constants above)
+      near_line = y_ref is not None and tr.y > float(np.interp(xq, x_idxs, y_ref)) - w_r
+      lead = (y_ref is not None and tr.moving and not near_line and not tr.closing and not followed and abs(tr.y - dc - (ctr - ctr0)) <= w_r)
+      res.lead_objects += int(lead and inside)
       # object bound (item 1a): inside, not a lead, confirmed for the bound's longer confirmation
       if inside and not lead and tr.count >= BOUND_CONFIRM_MESSAGES:
         res.bound_objects += 1
         t_raw = min(t_raw, tr.y - w_r - m - dc)
-      # clearance deficit (item 3): from the car's actual position carried along the lane, P(x) = T_C'(x) - T_C'(0); a lead is ignored (rev 9
-      # item 1a); objects moving toward the lane count also when inside
+      # clearance deficit (item 3): from the car's actual position carried along the lane, P(x) = T_C'(x) - T_C'(0); a lead is ignored (rev
+      # 9b lead rule); objects moving toward the lane count also when inside
       if (inside and not lead) or toward:
         res.clearance_objects += 1
         d_i = m - (tr.y - w_r - dc - (ctr - ctr0))
