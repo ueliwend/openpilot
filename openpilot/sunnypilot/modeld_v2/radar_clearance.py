@@ -21,7 +21,8 @@ the filtered references, the centre limit, the speed and the B2 motion inputs, n
   passed in); falls at once, rises after 1 s without a fall at the car's move speed (MOVE_SPEED of blendful_right, passed in as rise).
 - Clearance deficit (item 3) from the car's actual position: the car keeps its present offset from the centre limit along the lane, so its
   path is P(x) = T_C'(x) - T_C'(0) (P(0) = 0, the car where it is now); d = m - min (y - w_R - dc - P(x)) over the corridor objects that
-  are inside and not a moving vehicle in the own lane (rev 9 item 1a, the object bound's rule), or toward.  d > 0 starts the clearance
+  are inside and not a lead (rev 9 item 1a: a moving vehicle in the own lane whose point is at most LEAD_PATH_OFFSET 0.5 m right of the car's
+  path P(x); further right it counts), or toward.  d > 0 starts the clearance
   yield (obstacle side right), released when d < -0.1 m for 1 s (or the object is gone); the cap ramps over d 0 .. 0.05 m.
 - Stationary / moving (radial test over 8 of 10 messages, the same share of fewer while a track is younger, rev 9): selects the objects the
   bound and the clearance deficit count (rev 8 / rev 9); pop-ups are logged only.
@@ -51,6 +52,13 @@ LINE_INSIDE = 0.10  # m
 # cut-ins flagged before the line, 1.0 other flags per km; standing clutter cannot trigger it); it cannot see a pedestrian or cyclist
 # stepping sideways (no radial speed: classified standing)
 TOWARD_LANE_SPEED = 1.0  # m/s
+# rev 9 item 1a, safety restriction (coordinator 20 Nov, part 2's case 00000044 T 612.4: a slower vehicle 41 m ahead 1.0 m right of the car's
+# centre lost its yield, estimated clearance 0.14 -> -0.02 m): the clearance check ignores a moving vehicle in the own lane only while it is a
+# lead ahead of the car, its point no further right of the car's own predicted path (the car's centre carried along the lane) than this.
+# Further right, its body covers the car's right-hand clearance zone and it counts as before (a slower vehicle or a rider in the right part
+# of the lane).  PROVISIONAL (EST): about half the car's width (W_R 0.81 m); a vehicle body (>= 1.6 m wide) whose point is within it covers
+# the car's whole path, so it is followed, not passed beside.
+LEAD_PATH_OFFSET = 0.5  # m
 CONSISTENT_DIST, CONSISTENT_LAT = 1.0, 1.0  # m
 MEMORY_X, FORGET_X = 20.0, -3.3  # m: remembered when last seen nearer than this; forgotten 1 m behind the rear bumper
 CORRIDOR_TIME, CORRIDOR_MIN = 3.0, 15.0  # s, m
@@ -301,16 +309,18 @@ class RadarClearance:
       inside = y_ref is None or tr.y <= float(np.interp(xq, x_idxs, y_ref)) - LINE_INSIDE
       toward = tr.moving and tr.toward_speed >= TOWARD_LANE_SPEED  # only on the moving vote (measurement adaea0f4)
       res.toward += int(toward)
-      # rev 8 item 1a, rev 9 item 1a (owner 15 Nov / 20 Nov 11:56): with a usable reference "inside" is the own lane, and a moving object in
-      # it is a vehicle in the own lane (e.g. the car ahead): ignored by the object bound AND by the clearance deficit (one rule for both)
-      lane_obstacle = inside and not (y_ref is not None and tr.moving)
-      # object bound (item 1a): a lane obstacle confirmed for the bound's longer confirmation
-      if lane_obstacle and tr.count >= BOUND_CONFIRM_MESSAGES:
+      # rev 8 item 1a (owner 15 Nov): with a usable reference "inside" is the own lane, and a moving object in it is a vehicle in the own lane
+      # (e.g. the car ahead): the object bound ignores it
+      lane_vehicle = y_ref is not None and tr.moving
+      # object bound (item 1a): inside, not a vehicle in the own lane, confirmed for the bound's longer confirmation
+      if inside and not lane_vehicle and tr.count >= BOUND_CONFIRM_MESSAGES:
         res.bound_objects += 1
         t_raw = min(t_raw, tr.y - w_r - m - dc)
-      # clearance deficit (item 3): from the car's actual position carried along the lane, P(x) = T_C'(x) - T_C'(0); counts lane obstacles
-      # and objects moving toward the lane (the latter also when moving inside the lane)
-      if lane_obstacle or toward:
+      # clearance deficit (item 3): from the car's actual position carried along the lane, P(x) = T_C'(x) - T_C'(0).  Rev 9 item 1a (owner
+      # 20 Nov 11:56): a vehicle in the own lane is ignored as well while it is a lead ahead of the car (its point at most LEAD_PATH_OFFSET right
+      # of the car's path; safety restriction); objects moving toward the lane count also when inside
+      lead = lane_vehicle and tr.y - dc - (ctr - ctr0) <= LEAD_PATH_OFFSET
+      if (inside and not lead) or toward:
         res.clearance_objects += 1
         d_i = m - (tr.y - w_r - dc - (ctr - ctr0))
         if d_i > d:

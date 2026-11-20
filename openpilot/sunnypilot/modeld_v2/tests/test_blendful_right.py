@@ -1414,10 +1414,11 @@ class TestLogging:
                                                    'blendfulRadarNearestTowardSpeed', 'blendfulDetectorGain', 'blendfulRadarClearanceObjects',
                                                    'blendfulTargetReference', 'blendfulTargetReferenceLineWeight']
     assert abs(msg.blendfulDetectorGain - ctl.result.log['det_gain']) < 1e-6
-    # rev 9 (@95-@97): the clearance check's object count (the moving car in the own lane: 0); the target's reference and its line weight
+    # rev 9 (@95-@97): the clearance check's object count (the moving object 1.2 m right of the car is no lead: it counts); the target's
+    # reference and its line weight
     assert abs(msg.blendfulTargetReference - ctl.result.log['target_reference']) < 1e-6
     assert abs(msg.blendfulTargetReferenceLineWeight - ctl.result.log['target_reference_line_weight']) < 1e-6
-    assert msg.blendfulRadarClearanceObjects == rc.clearance_objects == 0
+    assert msg.blendfulRadarClearanceObjects == rc.clearance_objects == 1
     assert [f.proto.ordinal.explicit for f in fields] == list(range(98))  # field numbers stable, the new ones appended
 
   def test_fill_log_writes_the_episode_and_cue_fields(self):

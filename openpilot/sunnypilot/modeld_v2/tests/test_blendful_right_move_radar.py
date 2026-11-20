@@ -1400,8 +1400,10 @@ class TestRev8DetectorToTheModelPath:
 
 class TestRev9ClearanceIgnoresTheOwnLaneVehicle:
   """Rev 9 item 1a (owner 20 Nov 11:56): the clearance check ignores moving vehicles in the own lane, as the object bound does (rev 8 item 1a):
-  with a usable right reference, a corridor object at least 10 cm inside it that the radial test classifies moving counts for neither.
-  Objects moving sideways toward the lane still count; without a usable reference every object counts, as before."""
+  with a usable right reference, a corridor object at least 10 cm inside it that the radial test classifies moving.  Safety restriction
+  (coordinator 20 Nov, part 2's case 00000044 T 612.4): only while it is a lead, its point at most LEAD_PATH_OFFSET right of the car's path;
+  further right (a slower vehicle or a rider in the right part of the lane) it counts.  Objects moving sideways toward the lane still count;
+  without a usable reference every object counts, as before."""
   V = 40 / 3.6
 
   def run(self, tracks_fn, frames=80, scene=None, gap=0.5):
@@ -1413,14 +1415,28 @@ class TestRev9ClearanceIgnoresTheOwnLaneVehicle:
       logs.append(res.log)
     return logs
 
-  @pytest.mark.parametrize("y_right,v_rel", [(0.2, 0.0), (0.2, -3.0), (1.3, 20 / 3.6 - 40 / 3.6)])
-  def test_a_moving_vehicle_in_the_own_lane_starts_no_yield(self, y_right, v_rel):
-    # the car ahead 0.2 m right of the car (at our speed, or 3 m/s slower) and a cyclist at 20 km/h 0.45 m inside the right line: the deficit
-    # would be 0.7 - (y - 0.81) > 0 (rev 8: a clearance yield, Keep Right's strength faded to zero); now neither counts, the strength stays
+  @pytest.mark.parametrize("y_right,v_rel", [(0.2, 0.0), (0.2, -3.0), (0.05, 0.0), (0.45, -3.0)])
+  def test_a_lead_in_the_own_lane_starts_no_yield(self, y_right, v_rel):
+    # the car ahead 0.2 m right of the car (at our speed, or 3 m/s slower), 0.05 m and 0.45 m right of it: the deficit would be
+    # 0.7 - (y - 0.81) > 0 (rev 8: a clearance yield, Keep Right's strength faded to zero); now it does not count, the strength stays
     logs = self.run(lambda i: [(1, 15.0, -y_right, v_rel)] if i >= 40 else [])
     assert logs[-1]['q_R'] > br.REF_USABLE_Q and logs[-1]['radar'].objects == 1 and logs[-1]['radar'].moving == 1
     assert not any(lg['radar'].yield_active for lg in logs) and logs[-1]['radar'].deficit < -1.0
     assert all(lg['f_yl'] == 1.0 for lg in logs)
+
+  @pytest.mark.parametrize("kmh,x,y_right,v_obj_kmh", [(57, 41.0, 1.0, 49), (40, 15.0, 1.30, 20), (40, 15.0, 0.6, 30)])
+  def test_a_moving_vehicle_right_of_the_cars_path_still_yields(self, kmh, x, y_right, v_obj_kmh):
+    # safety restriction: part 2's logged case 00000044 T 612.4 (a vehicle at 49 km/h 41 m ahead, 1.0 m right of the car's centre, the car at
+    # 57 km/h: with the unrestricted rule its yield was lost, estimated clearance 0.14 -> -0.02 m), a cyclist at 20 km/h 0.45 m inside the right
+    # line (1.30 m right of the car; closed loop with the unrestricted rule: passed at -0.01 m), a slower vehicle 0.6 m right of the car
+    v = kmh / 3.6
+    rl = RightLineBlendful()
+    logs = []
+    for i in range(80):
+      tracks = [(1, x - rc.RADAR_TO_MODEL_X, -y_right, (v_obj_kmh - kmh) / 3.6)] if i >= 40 else []
+      logs.append(rl.update(Scene(v=v).model_output(), v, True, 0.0, 0.0, inputs(radar=frame(tracks))).log)
+    assert logs[-1]['q_R'] > br.REF_USABLE_Q and logs[-1]['radar'].moving == 1 and logs[-1]['radar'].objects == 1
+    assert logs[-1]['radar'].yield_active and logs[-1]['radar'].deficit > 0.0
 
   def test_the_same_object_standing_still_yields(self):
     # guard (also rev 8): standing at the cyclist's place it is a lane obstacle for the clearance check
