@@ -475,8 +475,107 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   blendfulLeftProb @7 :Float32;
   blendfulRightProb @8 :Float32;
   blendfulLaneWidth @9 :Float32;
-  leftLaneChangeBlindspotBlock @10 :Bool;   # left lamp on now or within BSM_HOLD_TIME after it went off (blocks a left lane-change start)
-  rightLaneChangeBlindspotBlock @11 :Bool;  # same, right side
+
+  # @10-@96: right-line Blendful (A8) fields logged by the driven build 6469ef68e (13 Nov 2026, routes 0000001c-00000020),
+  # moved to BlendfulInster in rev 7.1. Kept with their old types so those logs decode correctly; never written. Do not reuse.
+  # Lists named "input" hold the four inputs in the order [left line, left edge, right line, right edge]; position lists hold
+  # x = 0, 0.5 L, L, 1.5 L per input (L = max(1.5 v, 10 m)).
+  deprecatedA8BlendfulMode @10 :UInt8;  # 0 off, 1 regular, 2 right line
+  deprecatedA8BlendfulRightApplied @11 :Bool;
+  deprecatedA8BlendfulRightGap @12 :Float32;  # g(v), m
+  deprecatedA8BlendfulRightGapNow @13 :Float32;  # right wheel to the right reference now, m
+  deprecatedA8BlendfulRightQuality @14 :Float32;  # q_R
+  deprecatedA8BlendfulLeftRefQuality @15 :Float32;
+  deprecatedA8BlendfulAuthority @16 :Float32;  # a
+  deprecatedA8BlendfulAuthorityTarget @17 :Float32;  # a*
+  deprecatedA8BlendfulFadeBend @18 :Float32;
+  deprecatedA8BlendfulFadeYieldLeft @19 :Float32;
+  deprecatedA8BlendfulFadeYieldRight @20 :Float32;
+  deprecatedA8BlendfulFadeJump @21 :Float32;
+  deprecatedA8BlendfulFadePlausibility @22 :Float32;
+  deprecatedA8BlendfulFadeBlinker @23 :Float32;
+  deprecatedA8BlendfulAwayCar @24 :Float32;  # car-referenced yield trigger quantity, m
+  deprecatedA8BlendfulStrength @25 :Float32;  # s_R
+  deprecatedA8BlendfulStrengthWeight @26 :Float32;  # w_c
+  deprecatedA8BlendfulRightOnly @27 :Bool;  # right-only episode: q_R from line or edge with left line quality < 0.3
+  deprecatedA8BlendfulCurveAccel @28 :Float32;  # |kappa_m| v^2, m/s^2
+  deprecatedA8BlendfulYieldActive @29 :Bool;
+  deprecatedA8BlendfulCapActive @30 :Bool;
+  deprecatedA8BlendfulBoundActive @31 :Bool;
+  deprecatedA8BlendfulKappaUp @32 :Float32;  # reference instance output (instantaneous)
+  deprecatedA8BlendfulKappaRL @33 :Float32;  # right-line part, profile amplitude
+  deprecatedA8BlendfulKappa0 @34 :Float32;  # delivered profile amplitude
+  deprecatedA8BlendfulGainF @35 :Float32;
+  deprecatedA8BlendfulProfileLength @36 :Float32;  # L_c, m
+  deprecatedA8BlendfulProfileShift @37 :Float32;  # D, m
+  deprecatedA8BlendfulFilterTime @38 :Float32;  # ms per frame, the four input filters only
+  deprecatedA8BlendfulInputFiltered @39 :List(Float32);
+  deprecatedA8BlendfulInputRaw @40 :List(Float32);
+  deprecatedA8BlendfulFilterOffset @41 :List(Float32);  # filtered minus raw at x = L, per input
+  deprecatedA8BlendfulInputConfidence @42 :List(Float32);
+  deprecatedA8BlendfulInputState @43 :List(UInt8);  # bit 0 coasting, bit 1 re-initialised this frame
+  deprecatedA8BlendfulCandidateConfidence @44 :List(Float32);  # c_i per input (hysteresis gate)
+  deprecatedA8BlendfulCandidateWeight @45 :List(Float32);  # softmin weight w_i per input at x = L
+  deprecatedA8BlendfulReference @46 :List(Float32);  # [left, right] reference at x = L
+  deprecatedA8BlendfulTarget @47 :List(Float32);  # target lateral position per model x index (right line mode)
+  deprecatedA8BlendfulJunctionEpisode @48 :Bool;
+  deprecatedA8BlendfulJunctionCues @49 :UInt8;  # bit 0 widening in frame, 1 widening over time, 2 edge divergence, 3 gore / kink, 4 sharp bend
+  deprecatedA8BlendfulJunctionCueValues @50 :List(Float32);  # [widening in frame m, width excess m, edge divergence m, edge angle deg, gore min separation m, kink deg, bend b]
+  deprecatedA8BlendfulJunctionEpisodeDistance @51 :Float32;  # m since the episode started
+  deprecatedA8BlendfulJunctionWidening @52 :Float32;  # the widening quantity of the episode end rule, m
+  deprecatedA8BlendfulWidthMemory @53 :Float32;  # m (0 while not armed)
+  deprecatedA8BlendfulWidthMemoryAge @54 :Float32;  # s since the last update
+  deprecatedA8BlendfulWidthMemoryState @55 :UInt8;  # bit 0 armed, 1 stale, 2 measuring
+  deprecatedA8BlendfulModelAloneTime @56 :Float32;  # s spent in junction episodes since the mode started
+  deprecatedA8BlendfulJunctionEnded @57 :UInt8;  # 0 no end this frame, 1 quiet (2 s and 30 m), 2 widening gone (1 s), 3 maximum length (300 m)
+  deprecatedA8BlendfulRoadClass @58 :UInt8;  # 0 edges only, 1 shared, 2 lanes, 3 motorway (hysteresis, 5 s dwell)
+  deprecatedA8BlendfulFrameDt @59 :Float32;  # true model frame interval used by the filters and the target, s
+  deprecatedA8BlendfulPlanSpeed @60 :Float32;  # the raw plan's own v_x(0), m/s
+  deprecatedA8BlendfulTargetLag @61 :Float32;  # raw target minus rate-limited target at x = L, m
+  deprecatedA8BlendfulDClipped @62 :Bool;  # the fitted amplitude was clipped at 1.0 m
+  deprecatedA8BlendfulYieldSide @63 :Int8;  # capped obstacle side(s) while a no-growth phase runs: +1 right, -1 left, 2 both (side not yet known, or triggers disagree), 0 none
+  deprecatedA8BlendfulYieldSource @64 :UInt8;  # reference of the endpoint-gap trigger: 0 plan alone, 1 right, 2 left
+  deprecatedA8BlendfulYieldMoving @65 :Bool;  # a move to the right is on (running minimum)
+  deprecatedA8BlendfulCapMemory @66 :Float32;  # toward-obstacle correction held at the no-growth point (1/m)
+  deprecatedA8BlendfulUpdateTime @67 :Float32;  # ms, the whole Blendful update of this frame (reference, right-line instance, cap, limiter); 0 when it did not run
+  deprecatedA8BlendfulNonFinite @68 :Bool;  # a non-finite input or result this frame: released toward 0, instances reset
+  deprecatedA8BlendfulCentreSource @69 :UInt8;  # left-limit form: 0 midpoint of both references, 1 right reference, 2 left reference (0.5 / 0.4, 0.5 s dwell)
+  # rev 6.5 final move-speed limit (B5 step 4b): values at x = L
+  deprecatedA8BlendfulApproach @70 :Float32;  # weighted approach A to the right reference since the last reset, m
+  deprecatedA8BlendfulGapReset @71 :Float32;  # G0, the gap to the right reference at the last reset (rebased by reference switches), m
+  deprecatedA8BlendfulStartFollowsCar @72 :Bool;  # the start followed the car this frame (car moving left of -0.02 m/s and left of the right-line target, rev 6.10)
+  deprecatedA8BlendfulMoveLimiting @73 :Bool;  # the 0.05 m/s limit binds somewhere in the window
+  deprecatedA8BlendfulMoveReset @74 :UInt8;  # reset reasons this frame: bit 0 a = 0, 1 junction end, 2 yield end, 3 right reference regained, 4 mode on, 5 limiter created, 6 w <= 0
+  deprecatedA8BlendfulSwitchPart @75 :Float32;  # switch part of the change of Y_R added to G0 this frame, m
+  deprecatedA8BlendfulRotationScale @76 :UInt8;  # FILTER_ROTATION_SCALE: 0 design, 1 model_axis
+  # radar right-side clearance check (B6a item 8)
+  deprecatedA8BlendfulRadarHealthy @77 :Bool;  # f_radar = 1 (tracks fresh, no error flags, 1 s since they returned)
+  deprecatedA8BlendfulRadarObjects @78 :UInt8;  # confirmed objects in the right corridor
+  deprecatedA8BlendfulRadarMemory @79 :UInt8;  # of them remembered beside the car
+  deprecatedA8BlendfulRadarMoving @80 :UInt8;  # of them classified moving (log only)
+  deprecatedA8BlendfulRadarPopups @81 :UInt8;  # confirmed this frame less than 2 s ahead (log only)
+  deprecatedA8BlendfulRadarNearest @82 :List(Float32);  # [x, y, clearance of the car's right side] of the corridor object with the largest deficit, m
+  deprecatedA8BlendfulObjectBound @83 :Float32;  # held object bound T_obj (1000 = none)
+  deprecatedA8BlendfulObjectBoundHold @84 :Float32;  # s since the object bound last fell
+  deprecatedA8BlendfulObjectBoundActive @85 :Bool;
+  deprecatedA8BlendfulClearanceDeficit @86 :Float32;  # d = m(v) - clearance at the centre limit, m (> 0 starts the clearance yield)
+  deprecatedA8BlendfulClearanceYield @87 :Bool;
+  deprecatedA8BlendfulClearanceMargin @88 :Float32;  # m(v) = g(v) + e(v), m
+  deprecatedA8BlendfulRightBlindspot @89 :Bool;
+  # rev 6.10 "Start and floor"
+  deprecatedA8BlendfulDeliveredSource @90 :UInt8;  # right-line share delivered: 0 right-line correction, 1 Regular's (larger of, target left of the centre), 2 right-line (larger of)
+  deprecatedA8BlendfulTargetMinusCentre @91 :Float32;  # T_RL - T_C' at x = L, m (< 0: the right-line target is left of the lane centre)
+  # rev 6.12
+  deprecatedA8BlendfulReseeded @92 :Bool;  # the start was re-seeded at the car this frame (once per reset, a at a steady a_cmd, B5 item 2)
+  deprecatedA8BlendfulAuthorityLimited @93 :Bool;  # Regular delivered while T_RL is right of the centre for > 2 s (model pull; with blendfulDClipped, blendfulStrength)
+  # hand-over to the model's path (owner 13 Nov 09:27): from the latch of Keep Right's own swerve trigger the whole correction goes to 0
+  deprecatedA8BlendfulHandOver @94 :Bool;  # the hand-over is active this frame
+  deprecatedA8BlendfulHandOverCorrection @95 :Float32;  # delivered correction c at the latch of the last hand-over, 1/m
+  deprecatedA8BlendfulHandOverTime @96 :Float32;  # s from the latch of the last hand-over until c reached 0, or until the hand-over ended if earlier (then kept)
+
+  # blind-spot hold (owner 21 Nov 2026): lamp on now or within BSM_HOLD_TIME after it went off (blocks a lane-change start that side)
+  leftLaneChangeBlindspotBlock @97 :Bool;
+  rightLaneChangeBlindspotBlock @98 :Bool;
 
 
   enum TurnDirection {

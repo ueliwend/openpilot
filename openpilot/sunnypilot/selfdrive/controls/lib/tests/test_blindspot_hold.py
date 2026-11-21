@@ -3,6 +3,11 @@ Blind-spot hold (owner, 21 Nov 2026): a side's blind spot counts as occupied unt
 when the lamp went off before the blinker. While held it blocks the start of a lane change toward that side like a lit lamp,
 in every lane-change mode, with "Delay with Blind Spot" on or off. The tests drive DesireHelper frame by frame (DT_MDL).
 """
+import os
+import tempfile
+
+import capnp
+
 from openpilot.cereal import custom
 from openpilot.common.params import Params
 from openpilot.common.parameterized import parameterized
@@ -18,6 +23,46 @@ TIMED_MODES = [AutoLaneChangeMode.NUDGELESS, AutoLaneChangeMode.HALF_SECOND, Aut
                AutoLaneChangeMode.TWO_SECONDS, AutoLaneChangeMode.THREE_SECONDS]
 ALL_MODES = [AutoLaneChangeMode.NUDGE] + TIMED_MODES
 MODE_X_DELAY = [(m, d) for m in ALL_MODES for d in (False, True)]
+
+
+# ModelDataV2SP @10-@96 as logged by the driven build 6469ef68e (13 Nov 2026, routes 0000001c-00000020; A8 right-line
+# Blendful fields, moved to BlendfulInster in rev 7.1). LF = List(Float32), LU = List(UInt8).
+OLD_A8_TYPES = """
+UInt8 Bool Float32 Float32 Float32 Float32 Float32 Float32 Float32 Float32 Float32 Float32 Float32 Float32
+Float32 Float32 Float32 Bool Float32 Bool Bool Bool Float32 Float32 Float32 Float32 Float32 Float32 Float32
+LF LF LF LF LU LF LF LF LF Bool UInt8 LF Float32 Float32 Float32 Float32 UInt8 Float32 UInt8 UInt8 Float32
+Float32 Float32 Bool Int8 UInt8 Bool Float32 Float32 Bool UInt8 Float32 Float32 Bool Bool UInt8 Float32 UInt8
+Bool UInt8 UInt8 UInt8 UInt8 LF Float32 Float32 Bool Float32 Bool Float32 Bool UInt8 Float32 Bool Bool Bool
+Float32 Float32
+""".split()
+
+
+def old_layout_message():
+  """A ModelDataV2SP message written with the 6469ef68e layout: every old Bool true, numbers non-zero, lists filled."""
+  head = ["laneTurnDirection @0 :UInt16;", "leftLaneChangeEdgeBlock @1 :Bool;", "rightLaneChangeEdgeBlock @2 :Bool;",
+          "blendfulCurvature @3 :Float32;", "blendfulTrust @4 :Float32;", "modelCurvature @5 :Float32;",
+          "blendfulGoingAround @6 :Bool;", "blendfulLeftProb @7 :Float32;", "blendfulRightProb @8 :Float32;",
+          "blendfulLaneWidth @9 :Float32;"]
+  full = {"LF": "List(Float32)", "LU": "List(UInt8)"}
+  body = head + [f"f{k} @{k} :{full.get(t, t)};" for k, t in enumerate(OLD_A8_TYPES, start=10)]
+  with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, "old_mdv2sp.capnp")
+    with open(path, "w") as f:
+      f.write("@0xd0e5a1b2c3d4e5f7;\nstruct OldModelDataV2SP {\n  " + "\n  ".join(body) + "\n}\n")
+    old = capnp.load(path)
+    msg = old.OldModelDataV2SP.new_message()
+    for k, t in enumerate(OLD_A8_TYPES, start=10):
+      name = f"f{k}"
+      if t == "Bool":
+        setattr(msg, name, True)
+      elif t in ("LF", "LU"):
+        lst = msg.init(name, 4)
+        for i in range(4):
+          lst[i] = 7
+      else:
+        setattr(msg, name, 7)
+    msg.leftLaneChangeEdgeBlock = True
+    return msg.to_bytes()
 
 
 class CS:
@@ -110,6 +155,16 @@ class TestBlindspotHold(OpenpilotTestCase):
   def test_schema_fields(self):
     msg = custom.ModelDataV2SP.new_message(leftLaneChangeBlindspotBlock=True, rightLaneChangeBlindspotBlock=False)
     assert msg.leftLaneChangeBlindspotBlock and not msg.rightLaneChangeBlindspotBlock
+
+  def test_old_layout_logs_decode_without_hold(self):
+    """Logs of the driven build 6469ef68e (ModelDataV2SP @10-@96 in use) must read both hold flags false; the old fields keep
+    their values under the deprecatedA8 names."""
+    with custom.ModelDataV2SP.from_bytes(old_layout_message()) as m:
+      assert not m.leftLaneChangeBlindspotBlock and not m.rightLaneChangeBlindspotBlock
+      assert m.deprecatedA8BlendfulRightApplied and m.deprecatedA8BlendfulRightOnly and m.deprecatedA8BlendfulHandOver
+      assert m.deprecatedA8BlendfulMode == 7 and m.deprecatedA8BlendfulHandOverTime == 7.0
+      assert list(m.deprecatedA8BlendfulInputState) == [7, 7, 7, 7]
+      assert m.leftLaneChangeEdgeBlock
 
   @parameterized.expand(MODE_X_DELAY)
   def test_clean_timing_unchanged(self, mode, bsm_delay):
