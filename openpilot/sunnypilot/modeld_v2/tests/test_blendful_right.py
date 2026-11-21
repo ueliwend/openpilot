@@ -355,8 +355,9 @@ class TestCorrectionLaw:
       assert res.log['a'] == 1.0 and abs(res.log['s_r'] - 0.8) < 0.005  # rev 9b: s_R reads the confidence part (5 s low-pass)
     # the rising variant (owner 17:24: for later): 0.8 -> 1.0 with |k_m| v^2
     for k, want in ((0.0, 0.8), (1 / 50, 1.0)):
-      _, res = run_rl([Scene(pl=0.0, pr=1.0, k=k)] * 260, rl=RightLineBlendful(strength_rising=True))
-      assert abs(res[-1].log['s_r'] - want) < 1e-9 and abs(res[-1].log['w_c'] - want) < 1e-9
+      _, res = run_rl([Scene(pl=0.0, pr=1.0, k=k)] * 600, rl=RightLineBlendful(strength_rising=True))
+      # rev 9b: s_R reads the confidence part (5 s low-pass from the first frame's confidence)
+      assert abs(res[-1].log['s_r'] - want) < 0.005 and abs(res[-1].log['w_c'] - want) < 1e-9
 
   def test_left_only_is_regular_upstream(self):
     k0_up = 0.0021
