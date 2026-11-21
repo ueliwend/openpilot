@@ -1424,10 +1424,10 @@ class TestRev9bLeadRule:
   """Rev 9b lead rule (owner 20 Nov 20:12): the clearance check and the object bound ignore the car ahead in the own lane only: with a usable
   right reference, a corridor object at least 10 cm inside it that is classified moving, lies within the car's path width, lies at least w_R
   left of the right reference (never one near the right line), is not closed on (closing state with hysteresis: on at -vRel >= 0.5 m/s at
-  once, off after 40 consecutive messages below 0.2 m/s) and is at least LEAD_HEADWAY 2 s ahead (counted below it until the headway exceeds
-  2.5 s).  Everything else counts, as on rev 8 for the clearance check."""
-  V = 40 / 3.6
-  FAR = 30.0  # m dRel: 2.7 s at 40 km/h
+  once, off after 40 consecutive messages below 0.2 m/s) and is at least LEAD_HEADWAY 2 s ahead, the headway taken at no less than 45 km/h
+  (so within 25 m always; counted until the headway exceeds 2.5 s).  Everything else counts, as on rev 8 for the clearance check."""
+  V = 50 / 3.6
+  FAR = 36.0  # m dRel: 2.6 s at 50 km/h
 
   def run(self, tracks_fn, frames=80, scene=None, gap=0.5, v=None):
     v = self.V if v is None else v
@@ -1439,7 +1439,7 @@ class TestRev9bLeadRule:
     return logs
 
   @staticmethod
-  def unit(tracks_seq, v=40 / 3.6, y_ref=1.75):
+  def unit(tracks_seq, v=50 / 3.6, y_ref=1.75):
     """RadarClearance alone (car at the lane centre, centre limit 0): per message the clearance check's object count and the lead count"""
     rcl = RadarClearance()
     yr = np.full(br.NX, y_ref)
@@ -1451,7 +1451,7 @@ class TestRev9bLeadRule:
 
   @pytest.mark.parametrize("y_right,v_rel", [(0.2, 0.0), (0.2, -0.4), (0.2, 2.0), (0.6, 0.0), (0.8, 0.0)])
   def test_the_car_ahead_beyond_two_seconds_starts_no_yield(self, y_right, v_rel):
-    # the car ahead 2.7 s away, 0.2 m right of the car at our speed, 0.4 m/s slower, pulling away at 2 m/s; and 0.6 / 0.8 m right of the car:
+    # the car ahead 2.6 s away, 0.2 m right of the car at our speed, 0.4 m/s slower, pulling away at 2 m/s; and 0.6 / 0.8 m right of the car:
     # the deficit would be 0.7 - (y - 0.81) > 0 (rev 8: a clearance yield, Keep Right's strength faded to zero); it is not counted
     logs = self.run(lambda i: [(1, self.FAR, -y_right, v_rel)] if i >= 40 else [])
     assert logs[-1]['q_R'] > br.REF_USABLE_Q and logs[-1]['radar'].objects == 1 and logs[-1]['radar'].moving == 1
@@ -1466,6 +1466,31 @@ class TestRev9bLeadRule:
     logs = self.run(lambda i: [(1, headway * self.V, -0.2, 0.0)] if i >= 40 else [])
     assert logs[-1]['radar'].moving == 1 and logs[-1]['radar'].lead_objects == 0
     assert logs[-1]['radar'].yield_active and logs[-1]['radar'].deficit > 0.0
+
+  @pytest.mark.parametrize("kmh,headway", [(20, 2.1), (20, 2.6), (30, 2.1), (30, 2.7), (40, 2.2)])
+  def test_within_25_m_a_road_user_followed_at_low_speed_counts(self, kmh, headway):
+    # review B1 of rev 9b: at 20-30 km/h a rider 0.9 m inside the line followed at our speed just beyond 2 s (11-17 m) was ignored, and a yield
+    # started at its closing onset could not finish before the pass (up to 0.36 m closer than today).  The headway is taken at no less than
+    # 45 km/h: within 25 m it always counts (f077b002d: ignored).  (The radar corridor itself ends at max(15 m, 3 s v): 2.7-2.8 s here.)
+    v = kmh / 3.6
+    d = headway * v
+    assert d < 25.0 and d + rc.RADAR_TO_MODEL_X <= max(rc.CORRIDOR_MIN, rc.CORRIDOR_TIME * v)
+    out, _ = self.unit([[(1, d, -0.2, 0.0)]] * 30, v=v)
+    assert out[-1, 0] == 1 and out[-1, 1] == 0 and out[-1, 2]
+
+  def test_the_distance_floor_releases_beyond_31_m(self):
+    # the headway state itself at 30 km/h: counted from below 25 m, released only beyond 31.25 m (2.0 / 2.5 s at 45 km/h); at 60 km/h the time
+    # rule (33.3 / 41.7 m) is the larger and acts
+    for v, on, off in ((30 / 3.6, 25.0, 31.25), (60 / 3.6, 2.0 * 60 / 3.6, 2.5 * 60 / 3.6)):
+      tr = rc.Track(x=on + rc.RADAR_TO_MODEL_X - 0.1, y=0.2, d_rel=on - 0.1, y_rel=-0.2, v_rel=0.0)
+      assert tr.headway(v)
+      for d in np.linspace(on, off - 0.05, 20):
+        tr.x = d + rc.RADAR_TO_MODEL_X
+        assert tr.headway(v)
+      tr.x = off + 0.05 + rc.RADAR_TO_MODEL_X
+      assert not tr.headway(v)
+      tr.x = on + 0.05 + rc.RADAR_TO_MODEL_X
+      assert not tr.headway(v)
 
   def test_the_headway_state_holds_until_two_and_a_half_seconds(self):
     # a car ahead at our speed drifting from 1.5 s to 3 s headway over 15 s: counted up to 2.5 s (not released at 2.0 s), then ignored; drifting
@@ -1556,17 +1581,18 @@ class TestRev9bLeadRule:
   @pytest.mark.parametrize("seed", [1, 2])
   def test_a_noisy_lead_switches_far_less(self, seed):
     # review S1 of rev 9: a steady lead whose vRel flickers (AR(1) noise around 0, sigma 0.2 m/s, 0.25 s: about 6 crossings of 0.5 m/s per
-    # minute, part 2's logged rate behind leads).  At 30 km/h 25 m behind (3 s) the closing state switches on at most 60 % as often as the
-    # vRel crosses 0.5 m/s (rev 9's 1 s window: every crossing; measured 9 of 17 and fewer); at 50 km/h the same distance is 1.8 s: counted
-    # throughout (no switching)
+    # minute, part 2's logged rate behind leads).  At 60 km/h 45 m behind (2.7 s) the closing state switches on at most 60 % as often as the
+    # vRel crosses 0.5 m/s (rev 9's 1 s window: every crossing); within 25 m (30 km/h at 25 m, the floor) and below 2 s (50 km/h at 25 m) it
+    # is counted throughout (no switching)
     n = int(180 / DT_MDL)
     vr = self.ar1(seed + 100, n, 0.2)
     crossings = int(np.sum(np.diff((-vr >= 0.5).astype(int)) > 0))
-    out, _ = self.unit([[(7, 25.0 - rc.RADAR_TO_MODEL_X, -0.2, float(x))] for x in vr], v=30 / 3.6)
+    out, _ = self.unit([[(7, 45.0 - rc.RADAR_TO_MODEL_X, -0.2, float(x))] for x in vr], v=60 / 3.6)
     starts = int(np.sum(np.diff(out[20:, 0]) > 0))
     assert crossings >= 10 and starts <= 0.6 * crossings
-    out, _ = self.unit([[(7, 25.0 - rc.RADAR_TO_MODEL_X, -0.2, float(x))] for x in vr], v=50 / 3.6)
-    assert out[20:, 0].all() and out[20:, 2].all()
+    for kmh in (30, 50):
+      out, _ = self.unit([[(7, 25.0 - rc.RADAR_TO_MODEL_X, -0.2, float(x))] for x in vr], v=kmh / 3.6)
+      assert out[20:, 0].all() and out[20:, 2].all()
 
   def test_a_young_track_is_classified_by_its_share_of_moving_votes(self):
     # rev 9: the clearance check counts a track from its 6th message, the radial test needed 8 votes: a moving car counted as standing for two

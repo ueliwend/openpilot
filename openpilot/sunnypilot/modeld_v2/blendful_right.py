@@ -319,12 +319,13 @@ STRENGTH_TAU = 1.0  # s, rev 7 (owner 13 Nov 11:55): the strength a is a first-o
 # rev 9b (owner 20:12 / 20:42 "especially the size of the partial swings is very uncomfortable"): the strength is split into its two parts.
 # (1) The confidence part: the right reference's confidence q_R that sets the line-confidence strength (STRENGTH_Q ramp) and the fit
 #     strength s_R passes a first-order low-pass with CONF_STRENGTH_TAU both ways, so a partial confidence dip moves Keep Right slowly in
-#     both directions (part 2's V1 on the confidence alone).  5 s: the smallest sideways movement from partial dips of 2 / 3 / 5 s in the
-#     closed loop on logged roads (inster-dev results/2026-11-20_a8_rev9b/RESULT.md, SIM), no loss in the safety columns.
+#     both directions (part 2's V1 on the confidence alone); it is held while the reference is unusable (review N1).  5 s makes the
+#     strength calmer (its range in a partial dip about a third smaller), but on the same dips the car's sideways movement equals rev 8's
+#     (review B2 of rev 9b, SIM: the target moves with line / edge reference changes and events in those windows); choice open to the owner.
 # (2) The event part: every hand-back factor (bend, line jump, plausibility, blinker, radar yield, radar health, junction, a right reference
 #     that is not usable (q_R at or below the ramp's zero point), lane change / below 5 m/s, Regular) passes the strength filter, which
 #     falls with STRENGTH_TAU_DOWN (today's 1 s: every fade-out as fast as before, not slowed by (1)) and rises with STRENGTH_TAU_UP
-#     ("slow in", part 2's C_R3_V2b).  a = strength(q_R filtered) x event filter.
+#     ("slow in", part 2's C_R3_V2b; 3 s committed default, 1 s the alternative reported for the owner).  a = strength(q_R filtered) x event filter.
 CONF_STRENGTH_TAU = 5.0  # s
 STRENGTH_TAU_UP = 3.0  # s
 STRENGTH_TAU_DOWN = STRENGTH_TAU  # s, today's fade speed (kept)
@@ -1141,7 +1142,7 @@ class RightLineBlendful:
     # rev 9b: the confidence part slow both ways; the event part falls at today's speed and rises slowly
     if self.q_strength is None or CONF_STRENGTH_TAU <= 0.0:
       self.q_strength = q_R
-    else:
+    elif qa_now > 0.0:  # review N1: held while the reference is unusable (that is an event already; counting it twice slowed the return)
       self.q_strength += (q_R - self.q_strength) * dt / (dt + CONF_STRENGTH_TAU)
     q_s = self.q_strength
     qa = strength_from_confidence(q_s)

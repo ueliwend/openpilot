@@ -26,7 +26,7 @@ the filtered references, the centre limit, the speed and the B2 motion inputs, n
 - Lead (rev 9b, owner 20 Nov 2026 20:12; ignored by the bound and the clearance deficit): the car ahead in the own lane, i.e. with a usable
   right reference an object that is classified moving, lies within the car's path width (|y - dc - P(x)| <= w_R), lies at least w_R left
   of the right reference (never one near the right line: a cyclist or scooter there always counts), the car is not closing on it (closing
-  state below, with hysteresis) and it is not followed closely (headway state below: under LEAD_HEADWAY it always counts).
+  state below, with hysteresis) and it is not followed closely (headway state below: under LEAD_HEADWAY, and within 25 m, it always counts).
 - Stationary / moving (radial test over 8 of 10 messages, the same share of fewer while a track is younger, rev 9): selects the objects the
   bound and the clearance deficit count (rev 8 / rev 9); pop-ups are logged only.
 - Health: no message, a message older than 0.3 s, an invalid message, any RadarData.errors flag, a non-finite dRel / yRel in the message,
@@ -66,12 +66,16 @@ TOWARD_LANE_SPEED = 1.0  # m/s
 # (3) it is not followed closely: its distance (dRel, carried along for a remembered object) over the car's speed is at least LEAD_HEADWAY;
 #     below it always counts (review B1 of rev 9: a road user followed at about 1 s and then closed on was passed up to 0.6 m closer than
 #     today, because the yield started only at the closing onset); once counted for headway it stays counted until the headway exceeds
-#     LEAD_HEADWAY + LEAD_HEADWAY_BAND (a following distance drifting about 2 s does not switch the yield on and off);
+#     LEAD_HEADWAY + LEAD_HEADWAY_BAND (a following distance drifting about 2 s does not switch the yield on and off).  The headway is
+#     taken at no less than LEAD_FLOOR_SPEED (review B1 of rev 9b: at 20-30 km/h 2 s is only 11-17 m, too short for a yield started at the
+#     closing onset to finish before the pass; a rider braking just beyond 2 s was passed up to 0.36 m closer than today): below 45 km/h
+#     anything nearer than 25 m always counts, released beyond 31.25 m;
 # (4) its point lies within the car's own path width: at most w_R from the car's centre carried along the lane (part 2 review be680b1e).
 # car.RadarData.RadarPoint.vRel: the radar's relative radial speed, m/s, > 0 moving away; a remembered track keeps its states.
 CLOSING_ON, CLOSING_OFF = 0.5, 0.2  # m/s
 CLOSING_OFF_MESSAGES = 40  # consecutive messages below CLOSING_OFF (2 s at 20 Hz)
 LEAD_HEADWAY, LEAD_HEADWAY_BAND = 2.0, 0.5  # s
+LEAD_FLOOR_SPEED = 12.5  # m/s (45 km/h): the headway's speed floor, so the distance floor is 2.0 s x 12.5 m/s = 25 m
 CONSISTENT_DIST, CONSISTENT_LAT = 1.0, 1.0  # m
 MEMORY_X, FORGET_X = 20.0, -3.3  # m: remembered when last seen nearer than this; forgotten 1 m behind the rear bumper
 CORRIDOR_TIME, CORRIDOR_MIN = 3.0, 15.0  # s, m
@@ -184,8 +188,9 @@ class Track:
       self.calm = 0
 
   def headway(self, v: float) -> bool:
-    """rev 9b lead rule (3): update and return the headway state from the object's distance (dRel = x - RADAR_TO_MODEL_X) at speed v."""
-    h = (self.x - RADAR_TO_MODEL_X) / max(v, 1.0)
+    """rev 9b lead rule (3): update and return the headway state from the object's distance (dRel = x - RADAR_TO_MODEL_X) at speed v, taken
+    at no less than LEAD_FLOOR_SPEED (counted within max(2 s v, 25 m), released beyond max(2.5 s v, 31.25 m))."""
+    h = (self.x - RADAR_TO_MODEL_X) / max(v, LEAD_FLOOR_SPEED)
     if h < LEAD_HEADWAY:
       self.near = True
     elif h > LEAD_HEADWAY + LEAD_HEADWAY_BAND:

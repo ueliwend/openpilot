@@ -1883,3 +1883,13 @@ class TestRev9bStrength:
     t_down = int(np.argmax(qs[600:1200] <= hi - 0.5 * (hi - lo))) * DT_MDL
     t_up = int(np.argmax(qs[1200:] >= lo + 0.5 * (q[-1] - lo))) * DT_MDL
     assert abs(t_down - t_up) <= 0.3 and abs(t_down - np.log(2) * br.CONF_STRENGTH_TAU) < 1.0
+
+  def test_the_confidence_part_is_held_while_the_reference_is_unusable(self):
+    # review N1: a 3 s line drop-out is an event (fast fade); the confidence part is not dragged down meanwhile (it was counted twice and slowed
+    # the return): after the line returns the confidence part starts where it was before the drop-out
+    _, r = strength_run(lambda i: 0.0 if 600 <= i < 660 else 0.9, 800)
+    unusable = r[:, 3] <= br.STRENGTH_Q[0]
+    assert unusable[600:660].any()
+    i0 = 600 + int(np.argmax(unusable[600:]))
+    i1 = i0 + int(np.argmax(~unusable[i0:]))
+    assert np.all(r[i0:i1, 4] == r[i0, 4]) and r[i0, 4] > 0.7
