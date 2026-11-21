@@ -352,7 +352,7 @@ class TestCorrectionLaw:
   def test_right_line_only_gets_eighty_percent_also_in_curves(self):
     for k in (0.0, 1 / 50):
       rl, res = steady(pl=0.0, pr=1.0, k=k, frames=600)
-      assert res.log['a'] == 1.0 and abs(res.log['s_r'] - 0.8) < 1e-9
+      assert res.log['a'] == 1.0 and abs(res.log['s_r'] - 0.8) < 0.005  # rev 9b: s_R reads the confidence part (5 s low-pass)
     # the rising variant (owner 17:24: for later): 0.8 -> 1.0 with |k_m| v^2
     for k, want in ((0.0, 0.8), (1 / 50, 1.0)):
       _, res = run_rl([Scene(pl=0.0, pr=1.0, k=k)] * 260, rl=RightLineBlendful(strength_rising=True))
@@ -1812,3 +1812,73 @@ class TestRev9bReference:
     r = reference_run(lambda i: 0.6 if i < 100 else max(0.2, 0.6 - 0.1 * (i - 100) * DT_MDL), 2.25, frames=400)
     assert np.all(r[:, 0] <= r[:, 1] + 1e-12)
     assert np.nanmax(np.diff(r[100:, 4])) <= br.MOVE_SPEED * DT_MDL + 1e-6
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# rev 9b (owner 20 Nov 2026 20:12 / 20:42): the strength in two parts: the confidence part through a 5 s low-pass both ways, the event part
+# falling at today's speed (1 s) and rising with 3 s
+def strength_run(pr_fn, frames, radar_fn=None, rl=None, v=13.0):
+  rl = rl or RightLineBlendful()
+  out = []
+  for i in range(frames):
+    radar = radar_fn(i) if radar_fn else None
+    inp = RightInputs(radar=radar) if radar is not None else RightInputs()
+    lg = rl.update(Scene(v=v, pr=pr_fn(i)).model_output(), v, True, 0.0, 0.0, inp).log
+    out.append((lg['a'], lg['a_star'], lg['a_star_q'], lg['q_R'], lg['q_strength']))
+  return rl, np.array(out)
+
+
+def fall_time(a, i0, level=0.1):
+  return (int(np.argmax(a[i0:] < level))) * DT_MDL
+
+
+class TestRev9bStrength:
+  def test_constants(self):
+    assert br.CONF_STRENGTH_TAU == 5.0 and br.STRENGTH_TAU_UP == 3.0 and br.STRENGTH_TAU_DOWN == br.STRENGTH_TAU == 1.0
+    assert not hasattr(br, 'STRENGTH_SPLIT')
+
+  def test_an_event_fades_at_todays_speed(self):
+    # a radar fault (an event) from a = 1: a falls from 1 to below 0.1 in 2.3 s, as rev 8's 1 s filter (ln 10 = 2.3 s), not slowed by the
+    # confidence part's 5 s filter
+    fault = br.RadarFrame(tracks=[], age=0.0, fault=True, new=True, config_ok=True)
+    _, r = strength_run(lambda i: 0.9, 800, radar_fn=lambda i: fault if i >= 600 else None)
+    assert r[599, 0] == 1.0
+    assert fall_time(r[:, 0], 600) <= np.log(10) * (br.STRENGTH_TAU + DT_MDL) + DT_MDL
+
+  def test_a_lost_right_line_is_an_event(self):
+    # the right line vanishes (q_R falls to 0, at or below the ramp's zero point): a falls at today's speed although the confidence part
+    # would follow only with its 5 s low-pass
+    _, r = strength_run(lambda i: 0.9 if i < 600 else 0.0, 800)
+    assert r[599, 0] == 1.0 and r[-1, 3] <= br.REF_USABLE_Q
+    i_unusable = 600 + int(np.argmax(r[600:, 3] <= br.STRENGTH_Q[0]))
+    assert fall_time(r[:, 0], i_unusable) <= np.log(10) * (br.STRENGTH_TAU + DT_MDL) + DT_MDL
+    assert r[i_unusable + 10, 2] > 0.5  # the confidence part itself is still high then
+
+  def test_the_return_after_an_event_rises_with_three_seconds(self):
+    fault = br.RadarFrame(tracks=[], age=0.0, fault=True, new=True, config_ok=True)
+    _, r = strength_run(lambda i: 0.9, 1500, radar_fn=lambda i: fault if 600 <= i < 900 else None)
+    assert r[899, 0] == 0.0
+    i_ok = 900 + int(np.argmax(r[900:, 1] > 0.0))  # the radar is healthy again 1 s after the fault ends
+    a3 = r[i_ok + int(3.0 / DT_MDL), 0]
+    assert 1.0 - np.exp(-3.0 / (br.STRENGTH_TAU_UP + DT_MDL)) - 0.03 < a3 < 1.0 - np.exp(-3.0 / (br.STRENGTH_TAU_UP + DT_MDL)) + 0.03
+
+  def test_a_partial_confidence_dip_moves_the_strength_far_less(self):
+    # the right line's probability drops from 0.9 to 0.5 for 2 s (a partial dip: the reference stays usable): rev 8's strength followed
+    # it with 1 s and dipped by its full depth within the dip; now the confidence part passes a 5 s low-pass both ways: the dip of a is at
+    # most a third of the dip of the unfiltered confidence strength, and it returns as slowly as it went
+    _, r = strength_run(lambda i: 0.5 if 600 <= i < 640 else 0.9, 1000)
+    assert r[599, 0] == 1.0
+    dip_raw = 1.0 - r[600:700, 1].min()
+    dip_a = 1.0 - r[600:900, 0].min()
+    assert dip_raw > 0.2 and dip_a <= dip_raw / 3
+    assert np.all(r[600:1000, 3] > br.STRENGTH_Q[0])  # a partial dip: no event
+
+  def test_the_confidence_part_is_symmetric(self):
+    # a step of the confidence down and back up moves the confidence part (q_R through its low-pass, logged q_strength) with the same time
+    # constant both ways: half-way after ln 2 x 5 s in both directions
+    _, r = strength_run(lambda i: 0.45 if 600 <= i < 1200 else 0.9, 1800)
+    q, qs = r[:, 3], r[:, 4]
+    hi, lo = q[599], q[1199]
+    t_down = int(np.argmax(qs[600:1200] <= hi - 0.5 * (hi - lo))) * DT_MDL
+    t_up = int(np.argmax(qs[1200:] >= lo + 0.5 * (q[-1] - lo))) * DT_MDL
+    assert abs(t_down - t_up) <= 0.3 and abs(t_down - np.log(2) * br.CONF_STRENGTH_TAU) < 1.0

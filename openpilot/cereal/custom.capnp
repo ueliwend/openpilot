@@ -622,8 +622,8 @@ struct BlendfulInster @0xa4f1eb3323f5f582 {
   blendfulRightGapNow @3 :Float32;  # right wheel to the right reference now, m
   blendfulRightQuality @4 :Float32;  # q_R
   blendfulLeftRefQuality @5 :Float32;
-  blendfulAuthority @6 :Float32;  # a
-  blendfulAuthorityTarget @7 :Float32;  # a*
+  blendfulAuthority @6 :Float32;  # a (rev 9b: confidence part x event part, see blendful_right.py)
+  blendfulAuthorityTarget @7 :Float32;  # a* (rev 9b: unfiltered confidence strength x event factors)
   blendfulFadeBend @8 :Float32;
   blendfulFadeYieldLeft @9 :Float32;
   blendfulFadeYieldRight @10 :Float32;  # rev 8: always 1 (the detector no longer fades the right-line share by a left-side cap)
@@ -707,7 +707,7 @@ struct BlendfulInster @0xa4f1eb3323f5f582 {
   blendfulHandOverCorrection @83 :Float32;  # delivered correction c at the latch of the last hand-over, 1/m
   blendfulHandOverTime @84 :Float32;  # s from the latch of the last hand-over until c reached 0, or until the hand-over ended if earlier (then kept)
   # rev 7 / 7.1: strength filter and the single detector
-  blendfulStrengthFromConfidence @85 :Float32;  # a*_q = clip((q_R - 0.2) / 0.5, 0, 1) before the factors
+  blendfulStrengthFromConfidence @85 :Float32;  # a*_q = clip((q - 0.2) / 0.5, 0, 1) before the factors; rev 9b: q = q_R through its 5 s low-pass (the confidence part of a)
   blendfulDetectorOffset @86 :Float32;  # mean (plan_y - lane centre) over 1.4-1.6 s, our own estimated move subtracted, m
   blendfulDetectorUsual @87 :Float32;  # 10 s (20 s going around) low-pass of the offset, m
   blendfulDetectorOwnMove @88 :Float32;  # estimated sideways move from our correction (30 s high-pass), m; (1 - 0.35) of it is subtracted

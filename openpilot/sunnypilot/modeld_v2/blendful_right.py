@@ -319,13 +319,13 @@ STRENGTH_TAU = 1.0  # s, rev 7 (owner 13 Nov 11:55): the strength a is a first-o
 # rev 9b (owner 20:12 / 20:42 "especially the size of the partial swings is very uncomfortable"): the strength is split into its two parts.
 # (1) The confidence part: the right reference's confidence q_R that sets the line-confidence strength (STRENGTH_Q ramp) and the fit
 #     strength s_R passes a first-order low-pass with CONF_STRENGTH_TAU both ways, so a partial confidence dip moves Keep Right slowly in
-#     both directions (part 2's V1 on the confidence alone); CONF_STRENGTH_TAU = 0 passes it through.
+#     both directions (part 2's V1 on the confidence alone).  5 s: the smallest sideways movement from partial dips of 2 / 3 / 5 s in the
+#     closed loop on logged roads (inster-dev results/2026-11-20_a8_rev9b/RESULT.md, SIM), no loss in the safety columns.
 # (2) The event part: every hand-back factor (bend, line jump, plausibility, blinker, radar yield, radar health, junction, a right reference
 #     that is not usable (q_R at or below the ramp's zero point), lane change / below 5 m/s, Regular) passes the strength filter, which
-#     falls with STRENGTH_TAU (today's 1 s: every fade-out as fast as before, not slowed by (1)) and rises with STRENGTH_TAU_UP ("slow in").
-#     a = strength(q_R filtered) x event filter.  STRENGTH_SPLIT False: rev 9 / part 2 C_R3_V2b, a = filter(strength(q_R) x events).
-STRENGTH_SPLIT = True
-CONF_STRENGTH_TAU = 3.0  # s
+#     falls with STRENGTH_TAU_DOWN (today's 1 s: every fade-out as fast as before, not slowed by (1)) and rises with STRENGTH_TAU_UP
+#     ("slow in", part 2's C_R3_V2b).  a = strength(q_R filtered) x event filter.
+CONF_STRENGTH_TAU = 5.0  # s
 STRENGTH_TAU_UP = 3.0  # s
 STRENGTH_TAU_DOWN = STRENGTH_TAU  # s, today's fade speed (kept)
 STRENGTH_Q = (0.2, 0.7)  # rev 7 (owner 13 Nov 11:59): strength 0 at a right-line confidence <= 0.2, 1 at >= 0.7, linear in between
@@ -1138,20 +1138,16 @@ class RightLineBlendful:
     f_event = f_bend_t * f_jump_t * f_plaus_t * self.f_blink * f_yl * f_ep * f_radar  # these factors hand back to Regular
     if force_regular or fading:
       f_event = 0.0
-    if STRENGTH_SPLIT:  # rev 9b: confidence part slow both ways, event part fast down (today's speed), slow up
-      if self.q_strength is None or CONF_STRENGTH_TAU <= 0.0:
-        self.q_strength = q_R
-      else:
-        self.q_strength += (q_R - self.q_strength) * dt / (dt + CONF_STRENGTH_TAU)
-      q_s = self.q_strength
-      qa = strength_from_confidence(q_s)
-      f_event *= 1.0 if qa_now > 0.0 else 0.0  # an unusable right reference is an event (fades at today's speed)
-      a_star = qa_now * f_event
-      a = qa * self.authority.update(f_event, dt)
+    # rev 9b: the confidence part slow both ways; the event part falls at today's speed and rises slowly
+    if self.q_strength is None or CONF_STRENGTH_TAU <= 0.0:
+      self.q_strength = q_R
     else:
-      q_s, qa = q_R, qa_now
-      a_star = qa_now * f_event
-      a = self.authority.update(a_star, dt)
+      self.q_strength += (q_R - self.q_strength) * dt / (dt + CONF_STRENGTH_TAU)
+    q_s = self.q_strength
+    qa = strength_from_confidence(q_s)
+    f_event *= 1.0 if qa_now > 0.0 else 0.0  # an unusable right reference is an event (fades at today's speed)
+    a_star = qa_now * f_event
+    a = qa * self.authority.update(f_event, dt)
     self.a_now = a
     # rev 8 review B1 (owner 13 Nov 09:27 "hand directly to the normal path, not to blendful", 11:23 no fall-back to Regular there): the
     # detector's scale-down goes to the model's own path like the hand-over, not into a (which would hand the share to Regular's centring
@@ -1225,7 +1221,7 @@ class RightLineBlendful:
       'applied': a > 0.0, 'gap': g, 'gap_now': gap_now, 'q_R': q_R, 'q_L': q_L, 'a': a, 'a_star': a_star,
       'f_bend': f_bend_t, 'f_yl': f_yl, 'f_yr': 1.0, 'f_jump': f_jump_t, 'f_plaus': f_plaus_t, 'f_blink': self.f_blink, 'f_radar': f_radar,
       'away_car': q_y, 'det_offset': self.detector.offset, 'det_usual': self.detector.usual or 0.0, 'det_own': self.detector.y_own,
-      'det_away': self.detector.away, 'a_star_q': qa, 's_r': s_r, 'w_c': w_c, 'right_only': right_only,
+      'det_away': self.detector.away, 'a_star_q': qa, 'q_strength': q_s, 's_r': s_r, 'w_c': w_c, 'right_only': right_only,
       'curve_accel': abs(model_curvature) * v ** 2, 'yield_active': yield_active or car_trig, 'bound_active': bound_active,
       'det_strength': f_det, 'det_levels': (det_lower, det_upper), 'det_gain': g_det,
       'k_rl': k0_rl, 'weights': (wts.w_rl, wts.w_up), 'l_c': profile_length(max(v, 1.0)), 'd': d_rl, 'd_clipped': d_clipped, 'filter_ms': t_filter,
