@@ -352,8 +352,9 @@ class SelfdriveD:
       direction = self.sm['modelV2'].meta.laneChangeDirection
       mdv2sp = self.sm['modelDataV2SP']
 
-      if (CS.leftBlindspot and direction == LaneChangeDirection.left) or \
-         (CS.rightBlindspot and direction == LaneChangeDirection.right):
+      # lamp on, or modeld's blind-spot hold (about 1 s after the lamp went off) that blocks the start
+      if ((CS.leftBlindspot or mdv2sp.leftLaneChangeBlindspotBlock) and direction == LaneChangeDirection.left) or \
+         ((CS.rightBlindspot or mdv2sp.rightLaneChangeBlindspotBlock) and direction == LaneChangeDirection.right):
         self.events.add(EventName.laneChangeBlocked)
 
       elif (mdv2sp.leftLaneChangeEdgeBlock and direction == LaneChangeDirection.left) or \

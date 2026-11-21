@@ -512,7 +512,7 @@
               "key": "AutoLaneChangeTimer",
               "widget": "option",
               "title": "Auto Lane Change by Blinker",
-              "description": "Set a timer to delay the auto lane change operation when the blinker is used. No nudge on the steering wheel is required to auto lane change if a timer is set. Default is Nudge.",
+              "description": "Set a timer to delay the auto lane change operation when the blinker is used. No nudge on the steering wheel is required to auto lane change if a timer is set. Default is Nudge. On cars with blind spot monitoring (BSM), no lane change starts toward a side, not even with a nudge, while BSM detects a vehicle there and for 1 second after it clears.",
               "details": "Please use caution when using this feature. Only use the blinker when traffic and road conditions permit.",
               "options": [
                 {
@@ -555,7 +555,7 @@
               "key": "AutoLaneChangeBsmDelay",
               "widget": "toggle",
               "title": "Auto Lane Change: Delay with Blind Spot",
-              "description": "Toggle to enable a delay timer for lane changes when blind spot monitoring (BSM) detects a vehicle in your blind spot.",
+              "description": "On: when blind spot monitoring (BSM) detects a vehicle during the wait, the auto lane change starts about 1 second after the blind spot clears; in the 2 s and 3 s modes this can be earlier than the set time. Off: the set time counts from the blinker. Either way, no lane change starts toward that side until 1 second after its blind spot clears.",
               "enablement": [
                 {
                   "type": "capability",

@@ -475,6 +475,8 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   blendfulLeftProb @7 :Float32;
   blendfulRightProb @8 :Float32;
   blendfulLaneWidth @9 :Float32;
+  leftLaneChangeBlindspotBlock @10 :Bool;   # left lamp on now or within BSM_HOLD_TIME after it went off (blocks a left lane-change start)
+  rightLaneChangeBlindspotBlock @11 :Bool;  # same, right side
 
 
   enum TurnDirection {

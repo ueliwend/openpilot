@@ -35,6 +35,42 @@ AUTO_LANE_CHANGE_TIMER = {
 ONE_SECOND_DELAY = -1
 EDGE_DELAY = -2
 
+# Blind-spot hold (owner, 21 Nov 2026): a side's blind spot counts as occupied while its lamp (carState.left/rightBlindspot)
+# is on and until BSM_HOLD_TIME after the lamp last went off, counting time before the blinker too. Counted in model frames
+# (DT_MDL): free from the (BSM_HOLD_FRAMES + 1)-th frame after the last frame with the lamp on, i.e. at least BSM_HOLD_TIME
+# after the lamp went off. A dropped model frame makes the hold longer in time, never shorter.
+BSM_HOLD_TIME = 1.0  # s
+BSM_HOLD_FRAMES = round(BSM_HOLD_TIME / DT_MDL)
+
+
+class BlindspotHold:
+  def __init__(self):
+    # model frames since the lamp was last on; BSM_HOLD_FRAMES + 1 = clear (also at start: no lamp seen yet)
+    self.left_frames_clear = BSM_HOLD_FRAMES + 1
+    self.right_frames_clear = BSM_HOLD_FRAMES + 1
+
+  def update(self, left_blindspot: bool, right_blindspot: bool) -> None:
+    """Call once per model frame, in every lane-change state, with the latest carState lamps."""
+    self.left_frames_clear = 0 if left_blindspot else min(self.left_frames_clear + 1, BSM_HOLD_FRAMES + 1)
+    self.right_frames_clear = 0 if right_blindspot else min(self.right_frames_clear + 1, BSM_HOLD_FRAMES + 1)
+
+  @property
+  def left(self) -> bool:
+    """Left blind spot occupied: lamp on now or within BSM_HOLD_TIME."""
+    return self.left_frames_clear <= BSM_HOLD_FRAMES
+
+  @property
+  def right(self) -> bool:
+    """Right blind spot occupied: lamp on now or within BSM_HOLD_TIME."""
+    return self.right_frames_clear <= BSM_HOLD_FRAMES
+
+  def held(self, direction) -> bool:
+    if direction == log.LaneChangeDirection.left:
+      return self.left
+    if direction == log.LaneChangeDirection.right:
+      return self.right
+    return False
+
 
 class AutoLaneChangeController:
   def __init__(self, desire_helper):
@@ -52,6 +88,7 @@ class AutoLaneChangeController:
     self.auto_lane_change_allowed = False
     self.prev_lane_change = False
     self.lane_change_blocked = False
+    self.blindspot_hold = BlindspotHold()
 
     self.read_params()
 
@@ -108,16 +145,20 @@ class AutoLaneChangeController:
     return bool(self.lane_change_wait_timer > self.lane_change_delay)
 
   def update_lane_change(self, blindspot_detected: bool, edge_detected: bool, brake_pressed: bool,
-                         torque_applied: bool = False) -> None:
+                         torque_applied: bool = False, blindspot_held: bool = False) -> None:
+    """blindspot_detected: the signalled side's lamp in this frame; blindspot_held: that side's BlindspotHold
+    (lamp on or within BSM_HOLD_TIME after it went off)."""
     if brake_pressed and not self.prev_brake_pressed:
       self.prev_brake_pressed = brake_pressed
 
+    # The wait timers ("Delay with Blind Spot") keep reading the lamp itself, not the hold: the hold only blocks the start
+    # and never moves a timer, so it cannot make a timed wait shorter than it is without it.
     self.update_lane_change_timers(blindspot_detected, edge_detected)
 
     self.auto_lane_change_allowed = self.update_allowed()
 
-    # BSM always blocks. Edge blocks auto mode but nudge can override.
-    if blindspot_detected:
+    # BSM (lamp or hold) always blocks, nudge included. Edge blocks auto mode but nudge can override.
+    if blindspot_detected or blindspot_held:
       self.lane_change_blocked = True
     elif edge_detected:
       self.lane_change_blocked = not torque_applied

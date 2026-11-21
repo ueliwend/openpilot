@@ -40,6 +40,9 @@ class DesireHelper:
     one_blinker = carstate.leftBlinker != carstate.rightBlinker
     below_lane_change_speed = v_ego < LANE_CHANGE_SPEED_MIN
 
+    # Blind-spot hold: tracked every model frame, before and outside a lane change too
+    self.alc.blindspot_hold.update(carstate.leftBlindspot, carstate.rightBlindspot)
+
     # Lane turn controller update
     self.lane_turn_controller.update_lane_turn(blindspot_left=carstate.leftBlindspot, blindspot_right=carstate.rightBlindspot,
                                                left_blinker=carstate.leftBlinker, right_blinker=carstate.rightBlinker, v_ego=v_ego)
@@ -70,7 +73,9 @@ class DesireHelper:
         edge_detected = ((left_edge_detected and self.lane_change_direction == LaneChangeDirection.left) or
                          (right_edge_detected and self.lane_change_direction == LaneChangeDirection.right))
 
-        self.alc.update_lane_change(blindspot_detected, edge_detected, carstate.brakePressed, torque_applied)
+        blindspot_held = self.alc.blindspot_hold.held(self.lane_change_direction)
+
+        self.alc.update_lane_change(blindspot_detected, edge_detected, carstate.brakePressed, torque_applied, blindspot_held)
 
         if not one_blinker or below_lane_change_speed:
           self.lane_change_state = LaneChangeState.off
