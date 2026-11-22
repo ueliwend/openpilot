@@ -1444,7 +1444,8 @@ class BlendfulCorrection:
 
 def mode_from_params(blendful_on: bool, kind: int) -> int:
   """Blendful (BOOL, upstream's key) and BlendfulMode (INT, 0 Regular / 1 Right line) -> MODE_*. Other toggles (second UI, sunnylink) only
-  set Blendful, so they restore the last selected kind; an old backup without BlendfulMode reads the default 0 = Regular."""
+  set Blendful, so they restore the last selected kind; an old backup without BlendfulMode reads the default 1 = Right line
+  (since 22 Nov 2026; 0 = Regular before)."""
   if not blendful_on:
     return MODE_OFF
   return MODE_RIGHT if int(kind) == 1 else MODE_REGULAR

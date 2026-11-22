@@ -39,7 +39,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"DoUninstall", {CLEAR_ON_MANAGER_START, BOOL}},
     {"DriverTooDistracted", {CLEAR_ON_MANAGER_START | CLEAR_ON_IGNITION_ON, BOOL}},
     {"DriverLockoutCount", {CLEAR_ON_MANAGER_START | CLEAR_ON_IGNITION_ON, INT, "0"}},
-    {"AlphaLongitudinalEnabled", {PERSISTENT | DEVELOPMENT_ONLY | BACKUP, BOOL}},
+    {"AlphaLongitudinalEnabled", {PERSISTENT | DEVELOPMENT_ONLY | BACKUP, BOOL, "1"}},  // on by default since 22 Nov 2026 (owner; no default before); filled only when unset: a device with it off stays off; acts only where alphaLongitudinalAvailable
     {"FirmwareQueryDone", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},
     {"ForcePowerDown", {PERSISTENT, BOOL}},
     {"GitBranch", {PERSISTENT, STRING}},
@@ -85,7 +85,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"LocationFilterInitialState", {PERSISTENT, BYTES}},
     {"LateralManeuverMode", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
     {"LongitudinalManeuverMode", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
-    {"LongitudinalPersonality", {PERSISTENT | BACKUP, INT, std::to_string(static_cast<int>(cereal::LongitudinalPersonality::AGGRESSIVE))}},
+    {"LongitudinalPersonality", {PERSISTENT | BACKUP, INT, std::to_string(static_cast<int>(cereal::LongitudinalPersonality::STANDARD))}},  // Standard by default since 22 Nov 2026 (owner; was Aggressive); filled only when unset
     {"NetworkMetered", {PERSISTENT | BACKUP, BOOL}},
     {"ObdMultiplexingChanged", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},
     {"ObdMultiplexingEnabled", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},
@@ -152,7 +152,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AccelBoostSP", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"ApiCache_DriveStats", {PERSISTENT, JSON}},
     {"AutoLaneChangeBsmDelay", {PERSISTENT | BACKUP, BOOL, "1"}},  // on by default since 11 Nov 2026 (owner); filled only when unset: a device with it off stays off
-    {"AutoLaneChangeTimer", {PERSISTENT | BACKUP, INT, "0"}},
+    {"AutoLaneChangeTimer", {PERSISTENT | BACKUP, INT, "2"}},  // 0.5 s by default since 22 Nov 2026 (owner; was 0 = Nudge); filled only when unset
     {"BlinkerLateralReengageDelay", {PERSISTENT | BACKUP, INT, "0"}},  // seconds
     {"BlinkerMinLateralControlSpeed", {PERSISTENT | BACKUP, INT, "20"}},  // MPH or km/h
     {"BlinkerPauseLateralControl", {PERSISTENT | BACKUP, INT, "0"}},
@@ -162,13 +162,13 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"CarParamsSPCache", {CLEAR_ON_MANAGER_START, BYTES}},
     {"CarParamsSPPersistent", {PERSISTENT, BYTES}},
     {"CarPlatformBundle", {PERSISTENT | BACKUP, JSON}},
-    {"ChevronInfo", {PERSISTENT | BACKUP, INT, "0"}},
+    {"ChevronInfo", {PERSISTENT | BACKUP, INT, "4"}},  // All by default since 22 Nov 2026 (owner; was 0 = Off); filled only when unset
     {"CompletedSunnylinkConsentVersion", {PERSISTENT, STRING, "0"}},
     {"CustomAccIncrementsEnabled", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"CustomAccLongPressIncrement", {PERSISTENT | BACKUP, INT, "5"}},
     {"CustomAccShortPressIncrement", {PERSISTENT | BACKUP, INT, "1"}},
     {"DeviceBootMode", {PERSISTENT | BACKUP, INT, "0"}},
-    {"DevUIInfo", {PERSISTENT | BACKUP, INT, "0"}},
+    {"DevUIInfo", {PERSISTENT | BACKUP, INT, "1"}},  // Bottom by default since 22 Nov 2026 (owner; was 0 = Off); filled only when unset
     {"EnableCopyparty", {PERSISTENT | BACKUP, BOOL}},
     {"EnableGithubRunner", {PERSISTENT | BACKUP, BOOL}},
     {"GreenLightAlert", {PERSISTENT | BACKUP, BOOL, "1"}},
@@ -261,9 +261,9 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"LagdValueCache", {PERSISTENT, FLOAT, "0.2"}},
     {"LaneTurnDesire", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"LaneTurnValue", {PERSISTENT | BACKUP, FLOAT, "19.62"}},
-    {"Blendful", {PERSISTENT | BACKUP, BOOL, "0"}},
-    {"BlendfulMode", {PERSISTENT | BACKUP, INT, "0"}},  // 0 = Regular, 1 = Right line (used while Blendful is on)
-    {"BlendfulRightGapLow", {PERSISTENT | BACKUP, FLOAT, "0.5"}},  // Right line: right wheel gap to the line at <= 50 km/h (m)
+    {"Blendful", {PERSISTENT | BACKUP, BOOL, "1"}},  // on by default since 22 Nov 2026 (owner; was off); filled only when unset; acts only with a non-Default model
+    {"BlendfulMode", {PERSISTENT | BACKUP, INT, "1"}},  // 0 = Regular, 1 = Right line (used while Blendful is on); Right line by default since 22 Nov 2026 (owner; was Regular)
+    {"BlendfulRightGapLow", {PERSISTENT | BACKUP, FLOAT, "0.4"}},  // Right line: right wheel gap to the line at <= 50 km/h (m); 0.4 by default since 22 Nov 2026 (owner; was 0.5)
     {"BlendfulRightGapHigh", {PERSISTENT | BACKUP, FLOAT, "1.0"}},  // Right line: right wheel gap to the line at >= 100 km/h (m)
     {"PlanplusControl", {PERSISTENT | BACKUP, FLOAT, "1.0"}},
 
@@ -296,15 +296,15 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"RoadNameToggle", {PERSISTENT | BACKUP, BOOL, "1"}},
 
     // Speed Limit
-    {"SpeedLimitMode", {PERSISTENT | BACKUP, INT, "2"}},
+    {"SpeedLimitMode", {PERSISTENT | BACKUP, INT, "3"}},  // Assist by default since 22 Nov 2026 (owner; was 2 = Warning); filled only when unset; rewritten to Warning where Assist is unavailable
     {"SpeedLimitOffsetType", {PERSISTENT | BACKUP, INT, "2"}},
     {"SpeedLimitPolicy", {PERSISTENT | BACKUP, INT, "4"}},
-    {"SpeedLimitValueOffset", {PERSISTENT | BACKUP, INT, "3"}},
+    {"SpeedLimitValueOffset", {PERSISTENT | BACKUP, INT, "2"}},  // 2 (%, with SpeedLimitOffsetType 2) by default since 22 Nov 2026 (owner; was 3); filled only when unset
 
     // Smart Cruise Control
     {"MapTargetVelocities", {CLEAR_ON_ONROAD_TRANSITION, STRING}},
-    {"SmartCruiseControlMap", {PERSISTENT | BACKUP, BOOL, "0"}},
-    {"SmartCruiseControlVision", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"SmartCruiseControlMap", {PERSISTENT | BACKUP, BOOL, "1"}},  // on by default since 22 Nov 2026 (owner; was off); filled only when unset; removed where openpilot longitudinal is off
+    {"SmartCruiseControlVision", {PERSISTENT | BACKUP, BOOL, "1"}},  // on by default since 22 Nov 2026 (owner; was off); filled only when unset; removed where openpilot longitudinal is off
 
     // Torque lateral control custom params
     {"CustomTorqueParams", {PERSISTENT | BACKUP , BOOL}},

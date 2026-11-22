@@ -512,7 +512,7 @@
               "key": "AutoLaneChangeTimer",
               "widget": "option",
               "title": "Auto Lane Change by Blinker",
-              "description": "Set a timer to delay the auto lane change operation when the blinker is used. No nudge on the steering wheel is required to auto lane change if a timer is set. Default is Nudge. On cars with blind spot monitoring (BSM), no lane change starts toward a side, not even with a nudge, while BSM detects a vehicle there and for 1 second after it clears.",
+              "description": "Set a timer to delay the auto lane change operation when the blinker is used. No nudge on the steering wheel is required to auto lane change if a timer is set. Default is 0.5 s. On cars with blind spot monitoring (BSM), no lane change starts toward a side, not even with a nudge, while BSM detects a vehicle there and for 1 second after it clears.",
               "details": "Please use caution when using this feature. Only use the blinker when traffic and road conditions permit.",
               "options": [
                 {
@@ -1816,7 +1816,7 @@
               "widget": "toggle",
               "needs_onroad_cycle": true,
               "title": "sunnypilot Longitudinal Control (Alpha)",
-              "description": "WARNING: sunnypilot longitudinal control is in alpha for this car and will disable Automatic Emergency Braking (AEB). On this car, sunnypilot defaults to the car's built-in ACC instead of sunnypilot's longitudinal control. Enable this to switch to sunnypilot longitudinal control. Enabling Experimental mode is recommended when enabling sunnypilot longitudinal control alpha. Changing this setting will restart sunnypilot if the car is powered on.",
+              "description": "WARNING: sunnypilot longitudinal control is in alpha for this car and will disable Automatic Emergency Braking (AEB). On this branch it is on by default where the car supports it (a fresh install or Reset Settings starts with it on). Switch it off to use the car's built-in ACC instead of sunnypilot's longitudinal control. Enabling Experimental mode is recommended when enabling sunnypilot longitudinal control alpha. Changing this setting will restart sunnypilot if the car is powered on.",
               "visibility": [
                 {
                   "type": "all",

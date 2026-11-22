@@ -32,7 +32,7 @@ class LaneChangeSettingsLayout(Widget):
       title=lambda: tr("Auto Lane Change by Blinker"),
       param="AutoLaneChangeTimer",
       description=lambda: tr("Set a timer to delay the auto lane change operation when the blinker is used. " +
-                             "No nudge on the steering wheel is required to auto lane change if a timer is set. Default is Nudge.<br>" +
+                             "No nudge on the steering wheel is required to auto lane change if a timer is set. Default is 0.5 s.<br>" +
                              "On cars with blind spot monitoring (BSM), no lane change starts toward a side, not even with a nudge, " +
                              "while BSM detects a vehicle there and for 1 second after it clears.<br>" +
                              "Please use caution when using this feature. Only use the blinker when traffic and road conditions permit."),

@@ -24,8 +24,8 @@ DESCRIPTIONS = {
   ),
   'alpha_longitudinal': tr_noop(
     "<b>WARNING: sunnypilot longitudinal control is in alpha for this car and may disable Automatic Emergency Braking (AEB).</b><br><br>" +
-    "On this car, sunnypilot defaults to the car's built-in ACC instead of sunnypilot's longitudinal control. " +
-    "Enable this to switch to sunnypilot longitudinal control. " +
+    "On this branch it is on by default where the car supports it (a fresh install or Reset Settings starts with it on). " +
+    "Switch it off to use the car's built-in ACC instead of sunnypilot's longitudinal control. " +
     "Enabling Experimental mode is recommended when enabling sunnypilot longitudinal control alpha. " +
     "Changing this setting will restart sunnypilot if the car is powered on."
   ),

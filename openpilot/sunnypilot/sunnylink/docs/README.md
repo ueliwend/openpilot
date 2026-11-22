@@ -185,7 +185,7 @@ Inline `description` shows under the title. For longer caveats, safety notes, or
   description: |-
     Set a timer to delay the auto lane change operation when the blinker is used.
     No nudge on the steering wheel is required to auto lane change if a timer is set.
-    Default is Nudge.
+    Default is 0.5 s.
   details: |-
     Please use caution when using this feature. Only use the blinker when traffic
     and road conditions permit.

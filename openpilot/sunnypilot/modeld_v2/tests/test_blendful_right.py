@@ -1301,8 +1301,8 @@ class TestModes:
     assert selection_to_params(0) == (False, None)
     assert selection_to_params(1) == (True, 0) and selection_to_params(2) == (True, 1)
 
-  def test_old_backup_without_the_kind_reads_regular(self):
-    assert mode_from_params(True, 0) == MODE_REGULAR  # BlendfulMode absent reads its default 0
+  def test_stored_kind_regular_reads_regular(self):
+    assert mode_from_params(True, 0) == MODE_REGULAR  # an absent BlendfulMode reads its default 1 (Right line) since 22 Nov 2026
 
   def test_mici_toggle_restores_the_last_selected_kind(self):
     stored = {'Blendful': True, 'BlendfulMode': 1}
