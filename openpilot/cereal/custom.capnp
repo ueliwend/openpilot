@@ -720,6 +720,6 @@ struct BlendfulInster @0xa4f1eb3323f5f582 {
   blendfulDetectorGain @94 :Float32;  # rev 8 review B1 / S3: the detector factor through its own 1 s low-pass; multiplies Keep Right's share in Right line
   # rev 9 / 9b (owner 20 Nov 2026; inster-dev results/2026-11-20_a8_rev9b/DESIGN.md)
   blendfulRadarClearanceObjects @95 :UInt8;  # corridor objects the clearance deficit counts (lane obstacles and road users not ignored as the car ahead; objects moving toward the lane)
-  blendfulRadarLeadObjects @96 :UInt8;  # corridor objects ignored as the car ahead in the own lane (moving, in the car's path, not near the right line, not closed on, headway >= 2 s)
+  blendfulRadarLeadObjects @96 :UInt8;  # corridor objects ignored as the car ahead in the own lane (moving, in the car's path, not near the right line, time to contact not under 4.5 s (released above 5.625 s for 1 s), not within 9 m (released beyond 11.25 m); car-ahead rule 22 Nov 2026, rev 9b before: not closed on, headway >= 2 s)
   blendfulRightLineHold @97 :Float32;  # factor holding the right reference at the right line where the line / edge blend lies outward of it (0 .. 1 from line confidence 0.3 .. 0.5)
 }
