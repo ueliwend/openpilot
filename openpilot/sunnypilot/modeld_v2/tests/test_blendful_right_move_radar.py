@@ -304,8 +304,9 @@ def move_speeds(*failing):
 
 class TestClosedLoop:
   # rev 9b final (event rise 1 s + start-up seed, owner 22 Nov 00:37): overshoot 0.040 / 0.036 / 0.004 m at 30 / 50 / 80 km/h (base
-  # 0.046 / 0.044 / 0.019; round 2's 3 s rise: none), so 30 km/h is again just over the 0.04 m line (xfail as on base, where 30 and 50 were)
-  @pytest.mark.parametrize("kmh", move_speeds(30))
+  # 0.046 / 0.044 / 0.019; round 2's 3 s rise: none).  Keep Right lane limit (weighted strength from 0 with 2 s, no seed): 30 km/h within
+  # the 0.04 m line, 50 km/h 0.040 m, just over it (xfail as on base, where 30 and 50 were)
+  @pytest.mark.parametrize("kmh", move_speeds(50))
   def test_step_of_half_a_metre(self, kmh):
     t, y, vs, _, _ = closed_loop(kmh / 3.6, lambda t: {}, seconds=60.0)
     final = 1.75 - br.W_R - 0.44  # 0.5 m right of the centre
@@ -344,7 +345,8 @@ class TestClosedLoop:
     t, y, vs, tg, _ = closed_loop(kmh / 3.6, scene, seconds=60.0)
     assert vs[t >= 5.0].max() <= br.MOVE_SPEED + 0.02
     assert np.nanmax(np.diff(tg[t >= 0.5]) / DT_MDL) <= br.MOVE_SPEED + 0.01
-    assert abs(y[-1] - (2.15 - br.EDGE_EXTRA - br.W_R - 0.44)) < 0.01  # ends at the edge-referenced position, no false yield on the way
+    # ends at the edge-referenced position (Keep Right lane limit: the edge counts EDGE_ADJUST inward), no false yield on the way
+    assert abs(y[-1] - (2.15 - br.EDGE_ADJUST - br.W_R - 0.44)) < 0.01
 
   @pytest.mark.parametrize("kmh", SPEEDS)
   @pytest.mark.parametrize("step,start", [(-0.3, 5.0), (-1.5, 5.0), (-0.3, 30.0), (-1.5, 30.0)])
@@ -815,7 +817,9 @@ class TestLargerOfWindowAndHysteresis:
     v = 50 / 3.6
     ys = [-0.1, 0.01, -0.01, 0.03, 0.01, -0.01, -0.03, 0.01]
     want = [True, True, True, False, False, False, True, True]
-    _, logs = static_run(v, ys, seconds_each=4.0)
+    # Keep Right lane limit: the fixture moves the car by up to 0.11 m in one frame; a lane limit moving outward follows with 1.5 s, so each
+    # position is held 6 s (4 s before) until the centre-limit offset has settled
+    _, logs = static_run(v, ys, seconds_each=6.0)
     offs = [float(lg['c_ctr'][0]) for lg in logs]
     for y, o in zip(ys, offs, strict=True):
       assert abs(o + y) < 0.004, (y, o)  # the fixture: the centre-limit offset at the car is the car's distance left of the centre

@@ -228,32 +228,34 @@ class TestMeasurementFilter:
 
 
 class TestReferences:
+  # Keep Right lane limit (owner 22 Nov 2026 02:31): the soft blend, its push and the line hold are replaced by the lane limit (TestLaneLimit)
   @pytest.mark.parametrize("side,y_true", [(+1, 1.6), (-1, -1.9)])
-  def test_lone_candidate_sits_at_its_true_position(self, side, y_true):
-    worst = 0.0
-    for q in np.linspace(0.3, 0.7, 41):
-      for tau in (0.05, br.SOFTMIN_TAU):  # rev 8's softness and rev 9b's
-        ys = np.array([[y_true] * 33, [y_true + side * 3.0] * 33])
-        y, qa, _ = RightLineBlendful._reference(ys, [q, 0.0], [br.push_factor(q), 0.0], side, tau)
-        worst = max(worst, float(np.max(np.abs(y - y_true))))
-    assert worst < 0.01
+  def test_lone_line_sits_at_its_true_position(self, side, y_true):
+    # a present line inward of a far adjusted edge: the raw limit and (from the start) the lane limit are the line itself
+    for q in np.linspace(0.11, 1.0, 21):
+      lim = br.LaneLimit(side)
+      line, edge = np.full(33, y_true), np.full(33, y_true + side * 3.0)
+      for _ in range(40):
+        y, sw = lim.update(line, q, edge, True, 20.0, 0.0, DT_MDL, 1.0, np.zeros(33), np.zeros(33))
+      assert np.max(np.abs(y - y_true)) < 1e-9 and np.all(sw == 0.0)
 
-  def test_inner_wins_when_both_clear_and_coinciding_candidates_agree(self):
-    # the soft minimum itself at rev 8's softness 0.05 m (rev 9b passes its softness explicitly; rev 9b's 0.20 m: TestRev9bReference)
-    ys = np.array([[1.6] * 33, [1.8] * 33])
-    y, _, w = RightLineBlendful._reference(ys, [0.9, 0.9], [1.0, 1.0], +1, 0.05)
-    assert abs(y[10] - 1.6) < 0.01 and w[0, 10] > 0.98
-    for tau in (0.05, br.SOFTMIN_TAU):
-      y, _, _ = RightLineBlendful._reference(np.array([[1.6] * 33, [1.6] * 33]), [0.9, 0.9], [1.0, 1.0], +1, tau)
-      assert abs(y[0] - 1.6) < 1e-12  # no inward bias for coinciding candidates
-    yl, _, _ = RightLineBlendful._reference(np.array([[-1.6] * 33, [-1.8] * 33]), [0.9, 0.9], [1.0, 1.0], -1, 0.05)
-    assert abs(yl[0] + 1.6) < 0.01
+  def test_inner_wins_and_coinciding_candidates_agree(self):
+    lim = br.LaneLimit(+1)
+    y, _ = lim.update(np.full(33, 1.6), 0.9, np.full(33, 1.8 + br.EDGE_ADJUST), True, 20.0, 0.0, DT_MDL, 1.0, np.zeros(33), np.zeros(33))
+    assert np.allclose(y, 1.6) and np.all(lim.sel == 1.0)
+    lim = br.LaneLimit(+1)  # the adjusted edge inward of the line: the adjusted edge
+    y, _ = lim.update(np.full(33, 1.6), 0.9, np.full(33, 1.5 + br.EDGE_ADJUST), True, 20.0, 0.0, DT_MDL, 1.0, np.zeros(33), np.zeros(33))
+    assert np.allclose(y, 1.5) and np.all(lim.sel == 0.0)
+    lim = br.LaneLimit(-1)  # left side: inward = larger y
+    y, _ = lim.update(np.full(33, -1.6), 0.9, np.full(33, -1.8 - br.EDGE_ADJUST), True, 20.0, 0.0, DT_MDL, 1.0, np.zeros(33), np.zeros(33))
+    assert np.allclose(y, -1.6)
 
-  @pytest.mark.parametrize("conf,expected", [(0.0, 1.80), (0.5, 1.80), (0.9, 1.65), (1.0, 1.60)])
+  @pytest.mark.parametrize("conf,expected", [(0.0, 1.80), (0.1, 1.80), (0.11, 1.60), (0.5, 1.60), (1.0, 1.60)])
   def test_static_confidence_of_the_inner_line(self, conf, expected):
-    # at rev 8's softness 0.05 m (the push itself; rev 9b's softness: TestRev9bReference)
-    y, _, _ = RightLineBlendful._reference(np.array([[1.6] * 33, [1.8] * 33]), [0.9, 0.9], [conf, 1.0], +1, 0.05)
-    assert abs(y[5] - expected) < 0.02
+    # step 2: the line counts above LINE_PRESENT_Q (filtered confidence), else the adjusted edge (edge 2.05 -> 1.80)
+    lim = br.LaneLimit(+1)
+    y, _ = lim.update(np.full(33, 1.6), conf, np.full(33, 1.8 + br.EDGE_ADJUST), True, 20.0, 0.0, DT_MDL, 1.0, np.zeros(33), np.zeros(33))
+    assert abs(y[5] - expected) < 1e-9
 
   @staticmethod
   def _moves(tg, v=20.0):
@@ -280,20 +282,20 @@ class TestReferences:
 
   def test_inner_line_fading_in_glides(self):
     refs, tg = self._edge_line_run(lambda t: 0.05 if t < 1.0 else float(np.clip(0.05 + (t - 1.0), 0, 0.9)), 120)
-    assert abs(refs[0] - 1.8) < 0.05 and abs(refs[-1] - 1.6) < 0.05
+    assert abs(refs[0] - (1.9 - br.EDGE_ADJUST)) < 0.01 and abs(refs[-1] - 1.6) < 0.01
     d = self._moves(tg)
     assert d.min() >= -br.TARGET_RATE * DT_MDL - 1e-9 and d.max() <= br.TARGET_RATE * DT_MDL + 1e-9  # the rate limit turns it into a glide
 
   def test_inner_line_fading_out_and_vanishing_glide(self):
     for prob in (lambda t: 0.9 if t < 1.0 else float(np.clip(0.9 - (t - 1.0) / 0.3, 0.0, 0.9)), lambda t: 0.9 if t < 1.0 else 0.0):
       refs, tg = self._edge_line_run(prob, 120)
-      assert abs(refs[10] - 1.6) < 0.05 and abs(refs[-1] - 1.8) < 0.05
+      assert abs(refs[10] - 1.6) < 0.05 and abs(refs[-1] - (1.9 - br.EDGE_ADJUST)) < 0.02
       d = self._moves(tg)
       assert d.min() >= -br.TARGET_RATE * DT_MDL - 1e-9 and d.max() <= br.TARGET_RATE * DT_MDL + 1e-9
 
   def test_inner_line_flicker_at_threshold_changes_nothing(self):
     refs, tg = self._edge_line_run(lambda t: 0.35 + 0.1 * np.sin(2 * np.pi * 3 * t), 120)
-    assert np.ptp(refs[-40:]) < 0.02 and abs(refs[-1] - 1.8) < 0.02
+    assert np.ptp(refs[-40:]) < 0.02 and abs(refs[-1] - (1.9 - br.EDGE_ADJUST)) < 0.02
 
   def test_inner_outer_handover_on_the_left_side(self):
     rl = RightLineBlendful()
@@ -305,21 +307,20 @@ class TestReferences:
       res = rl.update(mo, 20.0, True, 0.0, 0.0, RightInputs())
       if i >= 0:
         refs.append(res.log['reference'][0])
-    # left edge at -1.9 counts at -1.8, the line at -1.6: the inner (larger y) line takes over smoothly (rev 9b: the softness 0.20 m leaves
-    # the blend up to 0.28 x 0.20 = 0.056 m outward of the inner line; the left reference has no line hold)
-    assert abs(refs[0] + 1.8) < 0.05 and abs(refs[-1] + 1.6) < 0.06
+    # left edge at -1.9 counts at -1.65 (adjusted), the line at -1.6: the inner (larger y) line takes over once present (filtered confidence
+    # above 0.1), moving inward with LIMIT_TAU_IN
+    assert abs(refs[0] + 1.9 - br.EDGE_ADJUST) < 0.01 and abs(refs[-1] + 1.6) < 0.01
     assert np.max(np.abs(np.diff(refs))) < 0.25  # K2 / check 15: up to 4 m/s before the offset rate limit, never a step
 
-  @pytest.mark.parametrize("width,gap50,gap120", [(2.6, 0.49, 0.49), (3.0, 0.60, 0.69), (4.5, 0.60, 1.10), (6.0, 0.60, 1.10)])
+  @pytest.mark.parametrize("width,gap50,gap120", [(2.6, 0.49, 0.49), (3.0, 0.69, 0.69), (4.5, 0.75, 1.25), (6.0, 0.75, 1.25)])
   def test_narrow_roads_without_lines_table(self, width, gap50, gap120):
-    # rev 8 item 4: the high gap applies from 120 km/h (was 100 km/h)
+    # rev 8 item 4: the high gap applies from 120 km/h (was 100 km/h).  Keep Right lane limit (owner 22 Nov 2026 02:31): the edge counts
+    # EDGE_ADJUST (0.25 m) inward (rev 9b: 0.1 m, so 0.15 m more gap to the edge), never left of the lane centre; no absent-line pull any more
     for v, expected in ((50 / 3.6, gap50), (120 / 3.6, gap120)):
       rl, res = steady(v=v, pl=0.0, pr=0.0, edges=True, edge_half=width / 2, edge_std=0.3, frames=300)
       gap_edge = width / 2 - (target_at(res.log, v) + W_R)
-      if width < 5.5:
-        assert abs(gap_edge - expected) < 0.03, (width, v, gap_edge)
-      else:  # rev 9b (softness 0.20 m): the absent line 1.15 m inside the edge gets some weight: more gap than set, never less
-        assert expected - 0.03 < gap_edge < expected + 0.2, (width, v, gap_edge)
+      assert abs(gap_edge - expected) < 0.03, (width, v, gap_edge)
+      assert abs(expected - min(br.gap_for_speed(v, 0.5, 1.0) + br.EDGE_ADJUST, width / 2 - W_R)) < 0.005
 
   def test_unclipped_width_between_references(self):
     # lane width 6 m (upstream would clip its half width to 2.25 m): the centre stays the middle between the references
@@ -338,7 +339,7 @@ class TestReferences:
     assert res.log['f_plaus'] == 1.0
 
 
-EDGE_X = br.EDGE_EXTRA  # edge candidates count this much further in
+EDGE_X = br.EDGE_ADJUST  # Keep Right lane limit: the edge counts this much further in
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
@@ -375,9 +376,12 @@ class TestCorrectionLaw:
     a = np.array([r.log['a'] for r in res])
     assert np.max(np.abs(np.diff(a))) <= A_STEP
     assert np.all(np.diff(a) >= -1e-12) and a[-1] == 1.0
-    rl2, res2 = run_rl([Scene(pl=1.0, pr=0.0)] * 200, k0_up=0.003, rl=rl)  # right line vanishes: a falls with the same filter
+    rl2, res2 = run_rl([Scene(pl=1.0, pr=0.0)] * 200, k0_up=0.003, rl=rl)  # right line vanishes: a falls continuously
     a2 = np.array([r.log['a'] for r in res2])
-    assert np.max(np.abs(np.diff(np.concatenate([[a[-1]], a2])))) <= A_STEP and np.all(np.diff(a2) <= 1e-12)
+    # Keep Right lane limit: the weighted line strength falls with 1 s and the strength ramp (0.2 .. 0.7) is twice as steep, so a falls at up
+    # to 2 x 0.8 x dt / (dt + 1 s) per frame (today's event filter: 1 x dt / (dt + 1 s)); still no step, monotone
+    a_step_conf = 0.8 / (br.STRENGTH_Q[1] - br.STRENGTH_Q[0]) * DT_MDL / (DT_MDL + br.STRENGTH_TAU_WEAKER) + 1e-3
+    assert np.max(np.abs(np.diff(np.concatenate([[a[-1]], a2])))) <= a_step_conf and np.all(np.diff(a2) <= 1e-12)
     assert a2[-1] == 0.0 and res2[-1].k0 == 0.003
 
   @pytest.mark.parametrize("left", [1.0, 0.0])
@@ -1376,13 +1380,12 @@ class TestTransitions:
     assert _glide_ok(rows, 13.0)
 
   def test_detectors_at_their_thresholds(self):
-    lo, hi = br.CONF_PUSH_Q  # rev 9 item 3a: the right candidates' push factor is linear between the two levels (no memory)
-    assert br.push_factor(lo) == 0.0 and br.push_factor(hi) == 1.0 and br.push_factor((lo + hi) / 2) == pytest.approx(0.5)
-    g = br.ConfGate()  # the left reference keeps the gate
-    assert g.update(0.4) == 0.0 and g.update(0.6) == 1.0  # rising branch: 0 at 0.4, full at 0.6
-    assert g.update(0.3) == 0.0  # falling branch (entered from above 0.5): 0 at 0.3
-    g.c = 1.0
-    assert g.update(0.5) == 1.0  # ... and full at 0.5
+    # Keep Right lane limit: a line counts above LINE_PRESENT_Q, on both sides, without memory (the InputFilter's own coast aside)
+    for side in (+1, -1):
+      for q, line in ((br.LINE_PRESENT_Q, False), (br.LINE_PRESENT_Q + 1e-6, True)):
+        lim = br.LaneLimit(side)
+        lim.update(np.full(33, side * 1.6), q, np.full(33, side * 3.0), True, 13.0, 0.0, DT_MDL, 1.0, np.zeros(33), np.zeros(33))
+        assert lim.present == line and np.all(lim.sel == float(line))
     # bend detector: nothing below the thresholds, full above
     mo = Scene(pl=1.0, pr=1.0, widen=0.0).model_output()
     assert bend_score(X, mo['lane_lines'][0, 2, :, 0], mo['lane_lines'][0, 1, :, 0], 13.0)[3] == 0.0
@@ -1681,7 +1684,11 @@ class TestLagBoundUnderFarFieldErrors:
       res = rl.update(k1_world(world, s), 14.0, True, 1 / 100, 0.0, RightInputs())
     look = 1.5 * 14.0
     lag = res.log['t_lim'] - res.log['t_raw']
-    assert abs(float(np.interp(look, X, lag))) <= 0.05 and abs(float(np.interp(1.5 * look, X, lag))) <= 0.05
+    # Keep Right lane limit: under the other scale hypothesis the lane limit's own filter (1.5 s outward) carries the per-frame prediction
+    # error, so the lane limit and with it T_raw bend inward and T_lim lags T_raw by up to 0.22 m on the conservative side (left, < 0).
+    # Rightward (outward of T_raw) at most 0.06 m (0.050 m measured; rev 9b: within 0.05 m either way).  DESIGN.md / RESULT.md warnings
+    for xq in (look, 1.5 * look):
+      assert -0.25 <= float(np.interp(xq, X, lag)) <= 0.06
 
   def test_points_beyond_2_L_equal_the_raw_target_every_frame(self):
     gt = GroundTarget()
@@ -1720,40 +1727,186 @@ class TestLagBoundUnderFarFieldErrors:
 # ---------------------------------------------------------------------------------------------------------------------------------
 # rev 9b (owner 20 Nov 2026 11:56 / 12:03 / 20:12): ONE right reference, formed gently and read by everything: softer blend (0.20 m) on both
 # references, gradual confidence push on the right, line hold (review S2 of rev 9); no filter after the combination (TARGET_REF_TAU dropped)
-def reference_run(pr_fn, edge_right, frames=400, v=13.0):
+def reference_run(pr_fn, edge_right, frames=400, v=13.0, rl=None):
   """RightLineBlendful on a straight lane (right line at 1.75 m) with a clear right edge at edge_right, the right line's probability pr_fn(i).
-  Per frame: the right reference at L, the blend before the line hold at L, the line's push factor and filtered confidence, the target at L,
-  the line bound at L, the line hold factor."""
-  rl = RightLineBlendful()
+  Per frame: the right reference (lane limit) at L, the raw limit at L, whether the line counts (present), the line's filtered confidence,
+  the target at L, the line bound at L, the line's share in the raw limit, the unified confidence, the weighted line strength."""
+  rl = rl or RightLineBlendful()
   look = 1.5 * v
   out = []
   for i in range(frames):
     lg = rl.update(Scene(v=v, edges=True, edge_right=edge_right, pr=pr_fn(i)).model_output(), v, True, 0.0, 0.0, RightInputs()).log
     out.append((lg['reference'][1], lg['blend_reference'], lg['cand_conf'][2], lg['confidence'][2],
-                float(np.interp(look, X, lg['target'])), float(np.interp(look, X, lg['y_r'] - W_R - br.LINE_BOUND)), lg['line_hold']))
+                float(np.interp(look, X, lg['target'])), float(np.interp(look, X, lg['y_r'] - W_R - br.LINE_BOUND)), lg['line_hold'],
+                lg['q_unified'][1], lg['q_strength']))
   return np.array(out)
 
 
-class TestRev9bReference:
-  def test_the_push_factor_follows_the_confidence_without_memory(self):
-    # gradual push (rev 9): the line's confidence swings through the old gate's band (0.25 .. 0.75, period 4 s); its push factor is the same
-    # function of the confidence rising and falling (before: rising branch 0.4 .. 0.6, falling 0.3 .. 0.5: up to 0.73 apart at the same q)
-    r = reference_run(lambda i: 0.5 + 0.25 * np.sin(2 * np.pi * i * DT_MDL / 4), 2.15, frames=600)[100:]
-    np.testing.assert_allclose(r[:, 2], [br.push_factor(q) for q in r[:, 3]], atol=1e-12)
-    lo, hi = br.CONF_PUSH_Q
-    assert br.push_factor(lo - 0.01) == 0.0 and br.push_factor(hi + 0.01) == 1.0
+Z33 = np.zeros(33)
 
-  def test_the_softness_is_read_at_call_time(self, monkeypatch):
-    # rev 9 bound SOFTMIN_TAU as a default argument (a module setting changed nothing); rev 9b passes it: the setting changes the blend
-    sc = Scene(v=13.0, edges=True, edge_right=1.95, pr=0.9).model_output()
-    y20 = RightLineBlendful().update(sc, 13.0, True, 0.0, 0.0, RightInputs()).log['blend_reference']
-    monkeypatch.setattr(br, 'SOFTMIN_TAU', 0.05)
-    y05 = RightLineBlendful().update(sc, 13.0, True, 0.0, 0.0, RightInputs()).log['blend_reference']
-    assert br.SOFTMIN_TAU == 0.05 and y20 - y05 > 0.01
+
+def limit_steps(raws, side=+1, line_q=0.9, edge_ok=True):
+  """LaneLimit fed with straight, static profiles: raws = list of (line, edge) values; returns the limit at x = 20 m and the switch part."""
+  lim = br.LaneLimit(side)
+  out = []
+  for line, edge in raws:
+    y, sw = lim.update(np.full(33, line), line_q, np.full(33, edge), edge_ok, 20.0, 0.0, DT_MDL, 1.0, Z33, Z33)
+    out.append((float(np.interp(20.0, X, y)), float(np.interp(20.0, X, sw))))
+  return np.array(out)
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------
+# Keep Right lane limit (owner 22 Nov 2026 02:31, inster-dev docs/decisions/2026-11-22.md, results/2026-11-22_kr_lane_limit/DESIGN.md)
+class TestLaneLimit:
+  def test_constants_are_the_owners_values(self):
+    assert br.EDGE_ADJUST == 0.25 and br.LINE_PRESENT_Q == 0.1 and br.LIMIT_TAU_IN == 0.1 and br.LIMIT_TAU_OUT == 1.5
+    assert br.UNIFY_SPAN == 0.25 and br.STRENGTH_TAU_WEAKER == 1.0 and br.STRENGTH_TAU_STRONGER == 2.0
+    for gone in ('SOFTMIN_TAU', 'PUSH', 'CONF_PUSH_Q', 'LINE_HOLD_Q', 'ConfGate', 'push_factor', 'line_hold', 'CONF_STRENGTH_TAU'):
+      assert not hasattr(br, gone), gone
+
+  # step 1
+  @pytest.mark.parametrize("adjust", [0.15, 0.25, 0.35])
+  def test_step1_the_edge_counts_edge_adjust_toward_the_lane_centre(self, monkeypatch, adjust):
+    # no lines, clear edges at +-2.4 m: both lane limits sit EDGE_ADJUST inside their edge (read at call time)
+    monkeypatch.setattr(br, 'EDGE_ADJUST', adjust)
+    rl, res = steady(v=13.0, pl=0.0, pr=0.0, edges=True, edge_half=2.4, frames=100)
+    assert abs(res.log['reference'][1] - (2.4 - adjust)) < 1e-6 and abs(res.log['reference'][0] + (2.4 - adjust)) < 1e-6
+
+  # step 2
+  def test_step2_the_line_counts_by_its_filtered_confidence(self):
+    # the line's probability falls from 0.9 to 0.2 (raw confidence 0.2 < the coast level 0.3): the filtered confidence decays over the 1 s
+    # coast; the line counts while that filtered value is above 0.1 (not the raw one), then the adjusted edge (2.25 - 0.25 = 2.0) is the raw limit
+    r = reference_run(lambda i: 0.9 if i < 100 else 0.2, 2.25, frames=200)
+    present, qf = r[:, 2], r[:, 3]
+    np.testing.assert_array_equal(present == 1.0, qf > br.LINE_PRESENT_Q)
+    i_off = int(np.argmax(present[100:] == 0.0)) + 100
+    assert i_off > 101 and r[i_off - 1, 3] > br.LINE_PRESENT_Q >= r[i_off, 3]
+    assert abs(r[i_off - 1, 1] - 1.75) < 1e-6 and abs(r[i_off, 1] - 2.0) < 1e-6
+
+  def test_step2_per_point_the_inner_of_line_and_adjusted_edge(self):
+    # a present line crossing the adjusted edge along x: the raw limit is the inner one at every point (continuous at the crossing)
+    lim = br.LaneLimit(+1)
+    line = 1.5 + 0.02 * X
+    edge = np.full(33, 2.0 + br.EDGE_ADJUST)
+    lim.update(line, 0.9, edge, True, 20.0, 0.0, DT_MDL, 1.0, Z33, Z33)
+    np.testing.assert_allclose(lim.raw, np.minimum(line, 2.0), atol=1e-12)
+    lim = br.LaneLimit(-1)
+    lim.update(-line, 0.9, -edge, True, 20.0, 0.0, DT_MDL, 1.0, Z33, Z33)
+    np.testing.assert_allclose(lim.raw, np.maximum(-line, -2.0), atol=1e-12)
+
+  def test_step2_without_road_edges_the_line_is_the_limit(self):
+    r = limit_steps([(1.6, 1e3)] * 5, line_q=0.0, edge_ok=False)
+    assert np.allclose(r[:, 0], 1.6)
+
+  # step 3
+  def test_step3_inward_fast_outward_slow_exactly(self):
+    # a 0.5 m step of the raw limit inward, then back out: per frame the remainder shrinks by dt / (dt + tau), tau 0.1 s inward, 1.5 s outward
+    k_in, k_out = br.LIMIT_TAU_IN / (br.LIMIT_TAU_IN + DT_MDL), br.LIMIT_TAU_OUT / (br.LIMIT_TAU_OUT + DT_MDL)
+    raws = [(1.5, 3.0)] * 5 + [(1.0, 3.0)] * 40 + [(1.5, 3.0)] * 200
+    y = limit_steps(raws)[:, 0]
+    for n in (1, 2, 5, 10, 30):
+      assert abs((y[4 + n] - 1.0) - 0.5 * k_in ** n) < 1e-9 if n <= 10 else True
+      assert abs((1.5 - y[44 + n]) - (1.5 - y[44]) * k_out ** n) < 1e-9
+    assert y[45] - y[44] < 0.5 * (1 - k_out) + 1e-9  # outward: about 1.6 cm per frame at first
+
+  def test_step3_symmetric_filter_would_fail(self, monkeypatch):
+    # discrimination: with both time constants 1.5 s the inward step is not followed within 0.3 s
+    monkeypatch.setattr(br, 'LIMIT_TAU_IN', 1.5)
+    y = limit_steps([(1.5, 3.0)] * 5 + [(1.0, 3.0)] * 6)[:, 0]
+    assert y[-1] - 1.0 > 0.3
+
+  @pytest.mark.parametrize("R,v", [(15.0, 30 / 3.6), (50.0, 50 / 3.6), (200.0, 80 / 3.6)])
+  def test_step3_motion_compensated_on_a_steady_circle(self, R, v):
+    # the filter state is carried with the input filters' motion model: on a steady circle the lane limit sits on the line (no lag bias)
+    k = 1.0 / R
+    y_true = 1.6 + br.L_D * k * X + k * X ** 2 / 2
+    lim = br.LaneLimit(+1)
+    for _ in range(300):
+      y, sw = lim.update(y_true, 0.9, y_true + 5.0, True, v, v * k, DT_MDL, 1.0, Z33, Z33)
+    assert float(np.max(np.abs(np.interp([10.0, 20.0, 30.0], X, y - y_true)))) < 0.01
+
+  def test_step3_switch_part_is_the_switch_not_the_road(self):
+    # line (1.6) lost -> adjusted edge (2.0): the whole 0.4 m outward creep is switch part (rebased in the move-speed limit), frame by frame
+    lim = br.LaneLimit(+1)
+    line, edge = np.full(33, 1.6), np.full(33, 2.25)
+    for _ in range(10):
+      lim.update(line, 0.9, edge, True, 0.0, 0.0, DT_MDL, 1.0, Z33, Z33)
+    prev, total = lim.y.copy(), 0.0
+    for _ in range(300):
+      y, sw = lim.update(line, 0.0, edge, True, 0.0, 0.0, DT_MDL, 1.0, Z33, Z33)
+      np.testing.assert_allclose(sw, y - prev, atol=1e-12)
+      total += sw[10]
+      prev = y.copy()
+    assert abs(total - 0.4) < 1e-4  # the last 0.4 x 0.968^300 is still on its way
+    # the road moving the selected line outward by 0.3 m (no selection change): the limit follows slowly and none of it is switch part
+    lim = br.LaneLimit(+1)
+    for _ in range(10):
+      lim.update(line, 0.9, edge + 2.0, True, 0.0, 0.0, DT_MDL, 1.0, Z33, Z33)
+    for _ in range(100):
+      y, sw = lim.update(line + 0.3, 0.9, edge + 2.0, True, 0.0, 0.0, DT_MDL, 1.0, Z33, Z33)
+      assert np.all(sw == 0.0)
+    assert 1.6 < y[10] < 1.9
+
+  def test_step3_an_inward_switch_is_switch_part_at_the_inward_speed(self):
+    lim = br.LaneLimit(+1)
+    line, edge = np.full(33, 1.6), np.full(33, 2.25)
+    for _ in range(10):
+      lim.update(line, 0.0, edge, True, 0.0, 0.0, DT_MDL, 1.0, Z33, Z33)
+    sws = [lim.update(line, 0.9, edge, True, 0.0, 0.0, DT_MDL, 1.0, Z33, Z33)[1][10] for _ in range(20)]
+    assert sum(sws) == pytest.approx(-0.4, abs=1e-3) and sum(sws[:6]) < -0.35
+
+  # step 4
+  @pytest.mark.parametrize("d", [0.25, 0.3, 1.0])
+  def test_step4_apart_the_inner_ones_confidence(self, d):
+    assert br.unified_confidence(1.6, 0.3, 1.6 + d, 0.8, +1, True, True) == pytest.approx(0.3)  # line inner
+    assert br.unified_confidence(1.6 + d, 0.9, 1.6, 0.4, +1, True, True) == pytest.approx(0.4)  # adjusted edge inner
+    assert br.unified_confidence(-1.6, 0.3, -1.6 - d, 0.8, -1, True, True) == pytest.approx(0.3)  # left side: inner = larger y
+
+  def test_step4_coinciding_the_higher_and_smooth_between(self):
+    assert br.unified_confidence(1.6, 0.3, 1.6, 0.8, +1, True, True) == pytest.approx(0.8)
+    ds = np.linspace(0.0, 0.3, 61)
+    u = np.array([br.unified_confidence(1.6, 0.3, 1.6 + d, 0.8, +1, True, True) for d in ds])
+    assert np.all(np.diff(u) <= 1e-12) and np.max(np.abs(np.diff(u))) < 0.03  # monotone, no step
+    assert u[ds.searchsorted(0.125)] == pytest.approx(0.55, abs=1e-9)  # half way at half the span (smoothstep)
+
+  def test_step4_a_line_that_is_not_present_does_not_count(self):
+    assert br.unified_confidence(1.6, 0.05, 2.0, 0.7, +1, False, True) == 0.7
+    assert br.unified_confidence(1.6, 0.6, 1e3, 0.0, +1, True, False) == 0.6
+
+  # step 5
+  def test_step5_weaker_fast_stronger_slow_exactly(self):
+    ws = br.WeightedStrength()
+    for _ in range(400):
+      ws.update(0.9, DT_MDL)
+    ws.q = 0.9
+    q = [ws.update(0.4, DT_MDL) for _ in range(20)]
+    k = br.STRENGTH_TAU_WEAKER / (br.STRENGTH_TAU_WEAKER + DT_MDL)
+    assert q[-1] == pytest.approx(0.4 + 0.5 * k ** 20, abs=1e-9)
+    q0 = q[-1]
+    up = [ws.update(0.9, DT_MDL) for _ in range(40)]
+    k2 = br.STRENGTH_TAU_STRONGER / (br.STRENGTH_TAU_STRONGER + DT_MDL)
+    assert up[-1] == pytest.approx(0.9 - (0.9 - q0) * k2 ** 40, abs=1e-9)
+
+  def test_step5_the_left_side_has_its_own_lane_limit_and_strength(self):
+    # left edge only (line absent): the left lane limit is the adjusted left edge and its strength the left edge's confidence
+    rl, res = steady(v=13.0, pl=0.0, pr=0.9, edges=True, edge_half=2.4, frames=200)
+    assert abs(res.log['reference'][0] + 2.4 - br.EDGE_ADJUST) < 1e-6 and res.log['q_unified'][0] == pytest.approx(0.8, abs=1e-6)
+    assert res.log['q_strength_lr'][0] == pytest.approx(0.8, abs=0.01)
+
+  def test_the_centre_limit_form_reads_the_weighted_strengths(self, monkeypatch):
+    seen = []
+    rl = RightLineBlendful()
+    upd = rl.centre_src.update
+
+    def spy(q_r, q_l, dt=DT_MDL):
+      seen.append((q_r, q_l))
+      return upd(q_r, q_l, dt)
+    monkeypatch.setattr(rl.centre_src, 'update', spy)
+    for i in range(100):
+      lg = rl.update(Scene(v=13.0, edges=True, pr=0.9 if i < 50 else 0.0).model_output(), 13.0, True, 0.0, 0.0, RightInputs()).log
+      assert seen[-1] == (lg['q_strength_lr'][1], lg['q_strength_lr'][0])
 
   def test_one_reference_for_the_target_the_bounds_the_centre_and_the_detector(self, monkeypatch):
-    # rev 9 gave the target its own softer reference while the centre limit, the line bound, the radar, the detector and the junction cues
-    # read a sharp one; rev 9b has one: the target, the line bound and the centre limit are formed from the logged y_r, the detector gets y_r(0)
     seen = []
     rl = RightLineBlendful()
     det_update = rl.detector.update
@@ -1767,58 +1920,44 @@ class TestRev9bReference:
       lg = rl.update(Scene(v=v, edges=True, edge_right=2.05, pr=0.6 + 0.3 * np.sin(i * 0.05)).model_output(), v, True, 0.0, 0.0, RightInputs()).log
       assert abs(seen[-1] - lg['y_r'][0]) < 1e-12
       assert abs(lg['reference'][1] - float(np.interp(1.5 * v, X, lg['y_r']))) < 1e-12
-      assert 'y_rt' not in lg and 'target_reference' not in lg
-    assert not hasattr(br, 'TARGET_SOFTMIN_TAU') and not hasattr(br, 'TARGET_REF_TAU') and not hasattr(br, 'ReferenceFilter')
+      assert abs(lg['reference'][1] - float(np.interp(1.5 * v, X, rl.limits[1].y))) < 1e-12
 
-  def test_a_confidence_drop_passes_without_a_filter_after_the_combination(self):
-    # item 5 (TARGET_REF_TAU dropped: it raised the time beyond the right line): the confident inner line (1.75 m) is lost at frame 100, the edge
-    # counts at 2.05 m; the reference follows the line hold and the blend in the same frame (no further filter), the target moves within the
-    # move speed (the switch part rebases the move limit) and ends at the edge-referenced position
-    r = reference_run(lambda i: 0.9 if i < 100 else 0.0, 2.15)
-    np.testing.assert_allclose(r[:, 0], r[:, 1] - r[:, 6] * np.maximum(r[:, 1] - 1.75, 0.0), atol=1e-3)  # straight lane: the line at 1.75
+  def test_a_lost_line_moves_the_target_out_at_the_move_speed(self):
+    # the confident line (1.75 m) is lost at frame 100, the edge at 2.3 m counts at 2.05 m: the lane limit creeps out (1.5 s), the switch part
+    # rebases the move-speed limit, so the target moves right at no more than MOVE_SPEED and ends at the edge-referenced position
+    r = reference_run(lambda i: 0.9 if i < 100 else 0.0, 2.3, frames=500)
     assert np.nanmax(np.diff(r[100:, 4])) <= br.MOVE_SPEED * DT_MDL + 1e-6
-    assert abs(r[-1, 0] - 2.05) < 2e-3
-
-  def test_the_softer_blend_stays_within_its_stated_outward_shift(self):
-    # two confident candidates d apart: the blend sits outward of the inner one by at most 0.28 x the softness
-    for d in (0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5):
-      ys = np.array([[1.6] * 33, [1.6 + d] * 33])
-      y, _, _ = RightLineBlendful._reference(ys, [0.9, 0.8], [1.0, 1.0], +1, br.SOFTMIN_TAU)
-      assert 0.0 <= y[5] - 1.6 <= 0.28 * br.SOFTMIN_TAU + 1e-6
-
-  def test_an_absent_line_only_pulls_the_softer_blend_inward_within_its_stated_amount(self):
-    # a line of confidence 0 that lies d inside a clear edge (confidence 0.8) gets some weight once d is large: the reference moves inward only
-    # (more gap than set), 0.17 m at d = 1.15 m (a 6 m road without lines), less than 1 cm at d <= 0.65 m (a 5 m road)
-    for d, most in ((0.3, 0.01), (0.65, 0.01), (1.15, 0.18)):
-      ys = np.array([[2.9 - d] * 33, [2.9] * 33])
-      y, _, _ = RightLineBlendful._reference(ys, [0.0, 0.8], [br.push_factor(0.0), br.push_factor(0.8)], +1, br.SOFTMIN_TAU)
-      assert 0.0 <= 2.9 - y[5] <= most
+    assert abs(r[-1, 0] - 2.05) < 2e-3 and abs(r[99, 0] - 1.75) < 1e-6
 
   @pytest.mark.parametrize("edge_beyond", [0.15, 0.3, 0.5])
-  @pytest.mark.parametrize("p", [0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 1.0])
-  def test_a_faint_line_with_a_clear_edge_beyond_holds_the_set_gap(self, p, edge_beyond):
-    # review S2 of rev 9: a line of probability 0.55-0.75 with a clear edge 0.3-0.5 m beyond: rev 9 held the car up to 0.15 m inside the set gap
-    # and its line bound sat 0.17-0.20 m outward of the line (the wheel could reach it).  The line hold keeps the reference at the line:
-    # target at L at the set gap from the line (never nearer), line bound 0.2 m inside the line
+  @pytest.mark.parametrize("p", [0.55, 0.6, 0.75, 1.0])
+  def test_a_faint_line_with_a_clear_edge_beyond_holds_at_least_the_set_gap(self, p, edge_beyond):
+    # review S2 of rev 9 (kept as a property): a present line is never left outward by the reference; with the edge only 0.15 m beyond the
+    # line the adjusted edge (0.10 m inside the line) is the limit: more gap, never less
     v, g = 13.0, br.gap_for_speed(13.0, 0.5, 1.0)
     r = reference_run(lambda i: p, 1.75 + edge_beyond, frames=300, v=v)[-50:]
-    assert np.all(r[:, 0] <= 1.75 + 1e-6)
+    assert np.all(r[:, 0] <= min(1.75, 1.75 + edge_beyond - br.EDGE_ADJUST) + 1e-6)
     assert np.all(r[:, 4] <= 1.75 - W_R - g + 1e-6)
     assert np.all(r[:, 5] <= 1.75 - W_R - br.LINE_BOUND + 1e-6)
 
-  def test_the_line_hold_is_continuous_and_inward_only(self):
-    # the hold factor is linear in the line's confidence over (0.3, 0.5); the reference is never outward of the blend; releasing the hold
-    # (confidence falling 0.6 -> 0.2 over 4 s, edge 0.5 m beyond) moves the target right at no more than the move speed
-    assert br.line_hold(0.3) == 0.0 and br.line_hold(0.5) == 1.0 and br.line_hold(0.4) == pytest.approx(0.5)
-    r = reference_run(lambda i: 0.6 if i < 100 else max(0.2, 0.6 - 0.1 * (i - 100) * DT_MDL), 2.25, frames=400)
-    assert np.all(r[:, 0] <= r[:, 1] + 1e-12)
-    assert np.nanmax(np.diff(r[100:, 4])) <= br.MOVE_SPEED * DT_MDL + 1e-6
+  def test_the_radar_reads_the_edge_share_of_the_raw_limit(self, monkeypatch):
+    got = []
+    rl = RightLineBlendful()
+    upd = rl.radar.update
+
+    def spy(*a, **k):
+      got.append(np.array(a[10]))
+      return upd(*a, **k)
+    monkeypatch.setattr(rl.radar, 'update', spy)
+    for i in range(80):
+      rl.update(Scene(v=13.0, edges=True, edge_right=2.5, pr=0.9 if i < 40 else 0.0).model_output(), 13.0, True, 0.0, 0.0, RightInputs())
+      np.testing.assert_array_equal(got[-1], 1.0 - rl.limits[1].sel)
+    assert np.all(got[39] == 0.0) and np.all(got[-1] == 1.0)  # line counted: no edge share; line lost: the edge
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
-# rev 9b (owner 20 Nov 2026 20:12 / 20:42): the strength in two parts: the confidence part through a 5 s low-pass both ways, the event part
-# falling at today's speed (1 s) and rising with STRENGTH_TAU_UP (owner 22 Nov 00:37: 1 s; round 2: 3 s); the confidence part seeded at the
-# first usable q_R after a (re)start
+# the strength: the confidence part is the right weighted line strength (step 5); the event part falls at today's speed (1 s) and rises
+# with STRENGTH_TAU_UP (owner 22 Nov 00:37: 1 s); the weighted strength is seeded at the first usable unified confidence after a (re)start
 def strength_run(pr_fn, frames, radar_fn=None, rl=None, v=13.0):
   rl = rl or RightLineBlendful()
   out = []
@@ -1834,68 +1973,46 @@ def fall_time(a, i0, level=0.1):
   return (int(np.argmax(a[i0:] < level))) * DT_MDL
 
 
-class TestRev9bStrength:
+class TestStrength:
   def test_constants(self):
-    assert br.CONF_STRENGTH_TAU == 5.0 and br.STRENGTH_TAU_UP == 1.0 and br.STRENGTH_TAU_DOWN == br.STRENGTH_TAU == 1.0
-    assert not hasattr(br, 'STRENGTH_SPLIT')
+    assert br.STRENGTH_TAU_UP == 1.0 and br.STRENGTH_TAU_DOWN == br.STRENGTH_TAU == 1.0
+    assert not hasattr(br, 'STRENGTH_SPLIT') and not hasattr(br, 'CONF_STRENGTH_TAU')
 
   def test_an_event_fades_at_todays_speed(self):
-    # a radar fault (an event) from a = 1: a falls from 1 to below 0.1 in 2.3 s, as rev 8's 1 s filter (ln 10 = 2.3 s), not slowed by the
-    # confidence part's 5 s filter
     fault = br.RadarFrame(tracks=[], age=0.0, fault=True, new=True, config_ok=True)
     _, r = strength_run(lambda i: 0.9, 800, radar_fn=lambda i: fault if i >= 600 else None)
     assert r[599, 0] == 1.0
     assert fall_time(r[:, 0], 600) <= np.log(10) * (br.STRENGTH_TAU + DT_MDL) + DT_MDL
 
-  def test_a_lost_right_line_is_an_event(self):
-    # the right line vanishes (q_R falls to 0, at or below the ramp's zero point): a falls at today's speed although the confidence part
-    # would follow only with its 5 s low-pass
+  def test_a_lost_right_line_fades_at_least_at_todays_speed(self):
+    # the right line vanishes: the weighted strength falls with 1 s, so a reaches 0 when it passes the ramp's zero point (about 1.4 s)
     _, r = strength_run(lambda i: 0.9 if i < 600 else 0.0, 800)
-    assert r[599, 0] == 1.0 and r[-1, 3] <= br.REF_USABLE_Q
-    i_unusable = 600 + int(np.argmax(r[600:, 3] <= br.STRENGTH_Q[0]))
-    assert fall_time(r[:, 0], i_unusable) <= np.log(10) * (br.STRENGTH_TAU + DT_MDL) + DT_MDL
-    assert r[i_unusable + 10, 2] > 0.5  # the confidence part itself is still high then
+    assert r[599, 0] == 1.0
+    assert fall_time(r[:, 0], 600) <= np.log(10) * (br.STRENGTH_TAU + DT_MDL) + DT_MDL
+    assert r[650, 0] == 0.0
 
   def test_the_return_after_an_event_rises_with_strength_tau_up(self):
     fault = br.RadarFrame(tracks=[], age=0.0, fault=True, new=True, config_ok=True)
     _, r = strength_run(lambda i: 0.9, 1500, radar_fn=lambda i: fault if 600 <= i < 900 else None)
     assert r[899, 0] == 0.0
-    i_ok = 900 + int(np.argmax(r[900:, 1] > 0.0))  # the radar is healthy again 1 s after the fault ends
-    k_up = br.STRENGTH_TAU_UP / (br.STRENGTH_TAU_UP + DT_MDL)  # the filter's factor per frame while rising
+    i_ok = 900 + int(np.argmax(r[900:, 1] > 0.0))
+    k_up = br.STRENGTH_TAU_UP / (br.STRENGTH_TAU_UP + DT_MDL)
     for t in (0.5, 1.0, 2.0):
       n = int(round(t / DT_MDL))
       assert abs(r[i_ok + n, 0] - (1.0 - k_up ** (n + 1))) < 0.01
 
-  def test_a_partial_confidence_dip_moves_the_strength_far_less(self):
-    # the right line's probability drops from 0.9 to 0.5 for 2 s (a partial dip: the reference stays usable): rev 8's strength followed
-    # it with 1 s and dipped by its full depth within the dip; now the confidence part passes a 5 s low-pass both ways: the dip of a is at
-    # most a third of the dip of the unfiltered confidence strength, and it returns as slowly as it went
-    _, r = strength_run(lambda i: 0.5 if 600 <= i < 640 else 0.9, 1000)
-    assert r[599, 0] == 1.0
-    dip_raw = 1.0 - r[600:700, 1].min()
-    dip_a = 1.0 - r[600:900, 0].min()
-    assert dip_raw > 0.2 and dip_a <= dip_raw / 3
-    assert np.all(r[600:1000, 3] > br.STRENGTH_Q[0])  # a partial dip: no event
-
-  def test_the_confidence_part_is_symmetric(self):
-    # a step of the confidence down and back up moves the confidence part (q_R through its low-pass, logged q_strength) with the same time
-    # constant both ways: half-way after ln 2 x 5 s in both directions
+  def test_the_confidence_part_falls_with_1_s_and_rises_with_2_s(self):
+    # a step of the confidence down and back up: frame by frame the weighted strength (logged q_strength) is the unified confidence (q_R)
+    # through the filter with 1 s while it is below and 2 s while it is above
     _, r = strength_run(lambda i: 0.45 if 600 <= i < 1200 else 0.9, 1800)
     q, qs = r[:, 3], r[:, 4]
-    hi, lo = q[599], q[1199]
-    t_down = int(np.argmax(qs[600:1200] <= hi - 0.5 * (hi - lo))) * DT_MDL
-    t_up = int(np.argmax(qs[1200:] >= lo + 0.5 * (q[-1] - lo))) * DT_MDL
-    assert abs(t_down - t_up) <= 0.3 and abs(t_down - np.log(2) * br.CONF_STRENGTH_TAU) < 1.0
+    tau = np.where(q[1:] < qs[:-1], br.STRENGTH_TAU_WEAKER, br.STRENGTH_TAU_STRONGER)
+    np.testing.assert_allclose(qs[1:], qs[:-1] + (q[1:] - qs[:-1]) * DT_MDL / (DT_MDL + tau), atol=1e-12)
+    assert (q[1:] < qs[:-1])[600:700].all() and (q[1:] > qs[:-1])[1200:1300].all()  # both branches used
 
-  def test_the_confidence_part_is_held_while_the_reference_is_unusable(self):
-    # review N1: a 3 s line drop-out is an event (fast fade); the confidence part is not dragged down meanwhile (it was counted twice and slowed
-    # the return): after the line returns the confidence part starts where it was before the drop-out
-    _, r = strength_run(lambda i: 0.0 if 600 <= i < 660 else 0.9, 800)
-    unusable = r[:, 3] <= br.STRENGTH_Q[0]
-    assert unusable[600:660].any()
-    i0 = 600 + int(np.argmax(unusable[600:]))
-    i1 = i0 + int(np.argmax(~unusable[i0:]))
-    assert np.all(r[i0:i1, 4] == r[i0, 4]) and r[i0, 4] > 0.7
+  def test_the_strength_follows_the_weighted_strength(self):
+    _, r = strength_run(lambda i: 0.45 if 600 <= i < 1200 else 0.9, 1800)
+    np.testing.assert_allclose(r[:, 2], [br.strength_from_confidence(x) for x in r[:, 4]], atol=1e-12)
 
 
 def base_strength(a_star):
@@ -1905,33 +2022,33 @@ def base_strength(a_star):
   return np.array([f.update(float(x)) for x in a_star])
 
 
-class TestRev9bStartUpSeed:
-  """Owner 22 Nov 2026 00:37 ("1s with seed"): after a (re)start the confidence part starts at the first usable q_R (the rev 9b reviewer's
-  round-2 probe), not at the start-up value 0 it then climbed from with 5 s (first engagement 9-22 s in the rev 8 scenes)."""
-
-  @staticmethod
-  def first_usable(r):
-    usable = r[:, 3] > br.STRENGTH_Q[0]
-    assert usable.any()
-    return int(np.argmax(usable))
+class TestStartUp:
+  """Start-up of the weighted line strength: 0 after a (re)start, rising with STRENGTH_TAU_STRONGER (rev 9b final's seed is not kept:
+  without the unusable-reference event it would step the strength; DESIGN.md)."""
 
   @pytest.mark.parametrize("pr", [0.6, 0.75, 0.9, 1.0])
-  def test_seeded_at_the_first_usable_confidence(self, pr):
-    rl, r = strength_run(lambda i: pr, 200)
-    i0 = self.first_usable(r)
-    assert i0 > 0 and r[i0 - 1, 3] <= br.STRENGTH_Q[0]  # the start-up frames before it: the reference is not usable yet
-    assert rl.q_strength is not None
-    assert r[i0, 4] == r[i0, 3]  # seeded with q_R itself
-    assert np.all(r[:i0, 4] == r[:i0, 3])  # until then the confidence part is q_R (unfiltered; its strength is 0 there)
-    assert np.all(r[:i0, 0] == 0.0)
-    # from the seed on it follows q_R with its 5 s low-pass (not reseeded every frame)
-    q, qs = r[i0 + 1, 3], r[i0, 4]
-    assert r[i0 + 1, 4] == pytest.approx(qs + (q - qs) * DT_MDL / (DT_MDL + br.CONF_STRENGTH_TAU), abs=1e-6)
+  def test_starts_at_zero_and_rises_continuously(self, pr):
+    rl, r = strength_run(lambda i: pr, 300)
+    assert r[0, 4] < 0.05
+    assert np.max(np.diff(r[:, 4])) <= DT_MDL / (DT_MDL + br.STRENGTH_TAU_STRONGER) + 1e-9  # never a step: at most 1/41 per frame
+    assert np.max(np.abs(np.diff(r[:, 0]))) < 0.05
+
+  def test_the_seed_would_step_the_strength(self, monkeypatch):
+    # discrimination: rev 9b final's seed (jump to the first usable value) without its unusable-reference event steps a by more than 0.2
+    def seeded(self, u, dt):
+      if not getattr(self, 'seeded', False):
+        if br.strength_from_confidence(u) > 0.0:
+          self.q, self.seeded = float(u), True
+        return float(u) if not getattr(self, 'seeded', False) else self.q
+      tau = br.STRENGTH_TAU_WEAKER if u < self.q else br.STRENGTH_TAU_STRONGER
+      self.q += (u - self.q) * dt / (dt + tau)
+      return self.q
+    monkeypatch.setattr(br.WeightedStrength, 'update', seeded)
+    _, r = strength_run(lambda i: 0.9 * min(1.0, i / 60), 300)
+    assert np.max(np.diff(r[:, 0])) > 0.2
 
   @pytest.mark.parametrize("pr", [0.75, 0.9, 1.0])
   def test_first_engagement_is_about_as_fast_as_base(self, pr):
-    # a reaches 0.9 within 6 s of the start (3.3-5.7 s for pr 1.0-0.75; base 3.3 s; with the 1 s rise but without the seed the confidence
-    # part climbed from 0: 6.0-10.9 s)
     _, r = strength_run(lambda i: pr, 400)
     a = r[:, 0]
     t90 = int(np.argmax(a >= 0.9)) * DT_MDL
@@ -1942,33 +2059,21 @@ class TestRev9bStartUpSeed:
   @pytest.mark.parametrize("ramp_s", [0.0, 1.0, 3.0])
   @pytest.mark.parametrize("pr", [0.6, 0.9])
   def test_strength_at_start_up_never_above_base(self, pr, ramp_s):
-    # the line's probability rises from 0 to pr over ramp_s, then stays: at every frame of the first 20 s a <= base's 1 s filter of a*, to
-    # within 0.005 (the event part has risen with 1 s since the start while base's filter of a* starts from a lower a*: once the confidence
-    # part reaches full strength the build's a can lie up to 0.003 above base's, at a > 0.97)
     n_ramp = max(1, int(ramp_s / DT_MDL))
     _, r = strength_run(lambda i: pr * min(1.0, i / n_ramp), 400)
     b = base_strength(r[:, 1])
-    assert np.all(r[:, 0] <= b + 0.005)
-    assert np.all((r[:, 0] <= b + 1e-9) | (b > 0.97))
+    # the 2 s rise of the weighted strength reaches the ramp's full end (0.7) before base's 1 s filter of a* reaches 1: above base by at most
+    # 0.03, only where base is above 0.95 (TEST probe: +0.028 at 0.9 over 3 s)
+    assert np.all((r[:, 0] <= b + 0.005) | ((b > 0.95) & (r[:, 0] <= b + 0.03)))
 
-  def test_reseeded_after_a_restart(self):
-    # a restart (reset of the right-line instance, e.g. after Regular) seeds again at the first usable q_R of the new start
+  def test_restarts_from_zero(self):
     rl, r1 = strength_run(lambda i: 0.9, 400)
     assert r1[-1, 0] == 1.0
     rl.reset()
-    assert rl.q_strength is None
-    _, r2 = strength_run(lambda i: 0.75, 200, rl=rl)
-    i0 = self.first_usable(r2)
-    assert r2[i0, 4] == r2[i0, 3]
+    assert rl.strengths[1].q == 0.0 and rl.strengths[0].q == 0.0
 
-  def test_a_drop_out_after_the_seed_holds_and_does_not_reseed(self):
-    # review N1 unchanged: once seeded, an unusable reference holds the confidence part; when the line returns it continues from the held
-    # value with its low-pass, not from a new seed
+  def test_a_drop_out_falls_with_1_s_and_returns_with_2_s(self):
     _, r = strength_run(lambda i: 0.0 if 300 <= i < 360 else (0.9 if i < 300 else 0.6), 600)
-    unusable = r[:, 3] <= br.STRENGTH_Q[0]
-    i0 = 300 + int(np.argmax(unusable[300:]))
-    i1 = i0 + int(np.argmax(~unusable[i0:]))
-    held = r[i0, 4]
-    assert np.all(r[i0:i1, 4] == held) and held > 0.7
-    assert r[i1, 4] == pytest.approx(held + (r[i1, 3] - held) * DT_MDL / (DT_MDL + br.CONF_STRENGTH_TAU), abs=1e-6)
-    assert r[i1, 4] != r[i1, 3]
+    i1 = 360 + int(np.argmax(r[360:, 3] > br.STRENGTH_Q[0]))
+    assert r[i1, 4] < r[i1, 3]
+    assert r[i1 + 1, 4] == pytest.approx(r[i1, 4] + (r[i1 + 1, 3] - r[i1, 4]) * DT_MDL / (DT_MDL + br.STRENGTH_TAU_STRONGER), abs=1e-6)
