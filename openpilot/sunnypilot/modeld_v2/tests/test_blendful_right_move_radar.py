@@ -1614,6 +1614,23 @@ class TestCarAheadRule:
     assert near[-1, 0] == 1 and near[-1, 1] == 0 and near[-1, 2]
     assert far[-1, 0] == 0 and far[-1, 1] == 1 and not far[-1, 2]
 
+  def test_a_road_user_beside_the_path_away_from_the_line_counts(self):
+    # rule (4) on its own: with the right line 2.5 m right of the car (not near it) a road user at our speed 0.9 m right of the car's centre lies
+    # beyond the car's half width 0.81 m: it counts (a car ahead must lie within the car's path width); 0.6 m right of the centre it is the car
+    # ahead
+    beside, _ = self.unit([[(1, self.FAR, -0.9, 0.0)]] * 40, y_ref=2.5)
+    inpath, _ = self.unit([[(1, self.FAR, -0.6, 0.0)]] * 40, y_ref=2.5)
+    assert beside[-1, 0] == 1 and beside[-1, 1] == 0 and beside[-1, 2]
+    assert inpath[-1, 0] == 0 and inpath[-1, 1] == 1 and not inpath[:, 2].any()
+
+  def test_no_time_to_contact_below_the_closing_minimum(self):
+    # the deadband: closing under 0.5 m/s never sets the time-to-contact state, also 1 m ahead (there the distance state counts)
+    tr = rc.Track(x=1.0 + rc.RADAR_TO_MODEL_X, y=0.2, d_rel=1.0, y_rel=-0.2, v_rel=-0.3)
+    tr.ttc_message(-0.3)  # 3.3 s
+    assert not tr.ttc_on and tr.close()
+    tr.ttc_message(-0.5)  # 2.0 s at the minimum
+    assert tr.ttc_on
+
   def test_the_same_object_standing_still_yields(self):
     # guard (also rev 8): standing at the cyclist's place it is a lane obstacle for the clearance check
     logs = self.run(lambda i: [(1, 15.0, -1.30, -self.V)] if i >= 40 else [])
