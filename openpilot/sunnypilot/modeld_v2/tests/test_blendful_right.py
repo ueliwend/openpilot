@@ -294,8 +294,9 @@ class TestReferences:
       assert d.min() >= -br.TARGET_RATE * DT_MDL - 1e-9 and d.max() <= br.TARGET_RATE * DT_MDL + 1e-9
 
   def test_inner_line_flicker_at_threshold_changes_nothing(self):
+    # a line flickering between 0.25 and 0.45 stays above the presence level 0.1 (Keep Right lane limit): it is the limit, steadily
     refs, tg = self._edge_line_run(lambda t: 0.35 + 0.1 * np.sin(2 * np.pi * 3 * t), 120)
-    assert np.ptp(refs[-40:]) < 0.02 and abs(refs[-1] - (1.9 - br.EDGE_ADJUST)) < 0.02
+    assert np.ptp(refs[-40:]) < 0.02 and abs(refs[-1] - 1.6) < 0.02
 
   def test_inner_outer_handover_on_the_left_side(self):
     rl = RightLineBlendful()
@@ -1774,14 +1775,24 @@ class TestLaneLimit:
 
   # step 2
   def test_step2_the_line_counts_by_its_filtered_confidence(self):
-    # the line's probability falls from 0.9 to 0.2 (raw confidence 0.2 < the coast level 0.3): the filtered confidence decays over the 1 s
-    # coast; the line counts while that filtered value is above 0.1 (not the raw one), then the adjusted edge (2.25 - 0.25 = 2.0) is the raw limit
-    r = reference_run(lambda i: 0.9 if i < 100 else 0.2, 2.25, frames=200)
-    present, qf = r[:, 2], r[:, 3]
-    np.testing.assert_array_equal(present == 1.0, qf > br.LINE_PRESENT_Q)
-    i_off = int(np.argmax(present[100:] == 0.0)) + 100
-    assert i_off > 101 and r[i_off - 1, 3] > br.LINE_PRESENT_Q >= r[i_off, 3]
-    assert abs(r[i_off - 1, 1] - 1.75) < 1e-6 and abs(r[i_off, 1] - 2.0) < 1e-6
+    # "confidence after filtering" = the line's confidence through its 0.5 s filter (logged q_candidates), not the InputFilter's gate: the
+    # line's probability falls from 0.9 to 0: the line counts while the filtered confidence is above 0.1 (about 1.1 s), then the adjusted
+    # edge (2.25 - 0.25 = 2.0) is the raw limit
+    rl = RightLineBlendful()
+    rows = []
+    for i in range(200):
+      lg = rl.update(Scene(v=13.0, edges=True, edge_right=2.25, pr=0.9 if i < 100 else 0.0).model_output(), 13.0, True, 0.0, 0.0,
+                     RightInputs()).log
+      rows.append((lg['cand_conf'][2], lg['q_candidates'][2], lg['blend_reference']))
+    r = np.array(rows)
+    np.testing.assert_array_equal(r[:, 0] == 1.0, r[:, 1] > br.LINE_PRESENT_Q)
+    i_off = int(np.argmax(r[100:, 0] == 0.0)) + 100
+    assert 115 < i_off < 130 and abs(r[i_off - 1, 2] - 1.75) < 1e-6 and abs(r[i_off, 2] - 2.0) < 1e-6
+
+  def test_step2_a_line_below_the_input_filters_start_level_counts(self):
+    # a line held at probability 0.3 (never above the InputFilter's start level 0.5) counts: the raw limit is the line, not the edge
+    r = reference_run(lambda i: 0.3, 2.5, frames=100)
+    assert np.all(r[-20:, 2] == 1.0) and np.all(r[-20:, 3] == 0.0) and abs(r[-1, 1] - 1.75) < 1e-6
 
   def test_step2_per_point_the_inner_of_line_and_adjusted_edge(self):
     # a present line crossing the adjusted edge along x: the raw limit is the inner one at every point (continuous at the crossing)
@@ -2033,19 +2044,13 @@ class TestStartUp:
     assert np.max(np.diff(r[:, 4])) <= DT_MDL / (DT_MDL + br.STRENGTH_TAU_STRONGER) + 1e-9  # never a step: at most 1/41 per frame
     assert np.max(np.abs(np.diff(r[:, 0]))) < 0.05
 
-  def test_the_seed_would_step_the_strength(self, monkeypatch):
-    # discrimination: rev 9b final's seed (jump to the first usable value) without its unusable-reference event steps a by more than 0.2
-    def seeded(self, u, dt):
-      if not getattr(self, 'seeded', False):
-        if br.strength_from_confidence(u) > 0.0:
-          self.q, self.seeded = float(u), True
-        return float(u) if not getattr(self, 'seeded', False) else self.q
-      tau = br.STRENGTH_TAU_WEAKER if u < self.q else br.STRENGTH_TAU_STRONGER
-      self.q += (u - self.q) * dt / (dt + tau)
-      return self.q
-    monkeypatch.setattr(br.WeightedStrength, 'update', seeded)
-    _, r = strength_run(lambda i: 0.9 * min(1.0, i / 60), 300)
-    assert np.max(np.diff(r[:, 0])) > 0.2
+  def test_an_upward_jump_of_the_unified_confidence_is_no_step(self):
+    # the unified confidence can jump up (a line more than 0.25 m inside the edge stops counting: the edge's confidence applies at once); the
+    # weighted strength rises from 0 with 2 s.  Rev 9b final's seed (jump to the first usable value) would step it from 0 to 0.8 here
+    ws = br.WeightedStrength()
+    q = [ws.update(u, DT_MDL) for u in [0.05] * 20 + [0.8] * 20]
+    assert max(np.diff(q)) <= 0.8 * DT_MDL / (DT_MDL + br.STRENGTH_TAU_STRONGER) + 1e-12
+    assert q[-1] == pytest.approx(0.8 - (0.8 - q[19]) * (br.STRENGTH_TAU_STRONGER / (br.STRENGTH_TAU_STRONGER + DT_MDL)) ** 20, abs=1e-9)
 
   @pytest.mark.parametrize("pr", [0.75, 0.9, 1.0])
   def test_first_engagement_is_about_as_fast_as_base(self, pr):

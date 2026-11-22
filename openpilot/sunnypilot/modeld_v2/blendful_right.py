@@ -47,8 +47,9 @@ COAST_Q, COAST_MAX, REINIT_Q = 0.3, 1.0, 0.5
 # Per side (right and left alike), replacing rev 9b's soft blend of the line and the edge, its confidence push, the line hold and the left
 # ConfGate:
 # (1) the adjusted road edge is the filtered road edge moved EDGE_ADJUST toward the lane centre;
-# (2) the raw lane limit is the filtered line where the line is present (filtered confidence above LINE_PRESENT_Q) and lies closer to the lane
-#     centre than the adjusted edge, else the adjusted edge (per point of the profile; without road edges in the model output: the line);
+# (2) the raw lane limit is the filtered line where the line is present (its confidence through the 0.5 s filter above LINE_PRESENT_Q) and
+#     lies closer to the lane centre than the adjusted edge, else the adjusted edge (per point; without road edges in the model output: the
+#     line);
 # (3) the lane limit is that raw limit through a motion compensated first-order filter that moves toward the lane centre with LIMIT_TAU_IN and
 #     outward with LIMIT_TAU_OUT (the conservative side);
 # (4) the unified confidence (at the look-ahead): the inner one's confidence when the line and the adjusted edge are UNIFY_SPAN or more apart,
@@ -213,7 +214,7 @@ class InputFilter:
 
 class LaneLimit:
   """Keep Right lane limit, steps 1-3 (owner 22 Nov 2026 02:31), one side; side = +1 right (outward = larger y), -1 left.  Reads the filtered
-  line and edge (InputFilter outputs) and the line's filtered confidence.  The raw limit is the line where it is present and inward of the
+  line and edge (InputFilter outputs) and the line's confidence through its 0.5 s filter.  The raw limit is the line where it is present and inward of the
   adjusted edge, else the adjusted edge (per point); the limit follows it through a motion compensated first-order filter, LIMIT_TAU_IN
   toward the lane centre and LIMIT_TAU_OUT outward (per point, by the direction of its innovation).
   The switch part (B5 amendment 1, for the move-speed limit): the share of the limit's change that comes from a change of the selection
@@ -1034,12 +1035,15 @@ class RightLineBlendful:
     # --- B3, Keep Right lane limit (owner 22 Nov 2026 02:31) steps 1-4 per side: the lane limits are THE references, read by everything
     # (target, move-speed limit, centre limit, line bound, radar filters, detector, junction cues, width, plausibility)
     lim_l, lim_r = self.limits
-    y_l, _ = lim_l.update(filt[0], qf[0], filt[1], edge_ok, vx0, yaw_rate, dt, scale, self.filters[0].step, self.filters[1].step)
-    y_r, switch_part = lim_r.update(filt[2], qf[2], filt[3], edge_ok, vx0, yaw_rate, dt, scale, self.filters[2].step, self.filters[3].step)
+    # "confidence after filtering" (owner): the candidates' confidences through their 0.5 s filters (line: probability filter x std ramp,
+    # edge: std ramp filter), qraw; not the InputFilter's q, which stays 0 until a raw confidence above 0.5 has initialised the filter
+    # (a line held at 0.3 would never count) and is the position filter's own gate
+    y_l, _ = lim_l.update(filt[0], qraw[0], filt[1], edge_ok, vx0, yaw_rate, dt, scale, self.filters[0].step, self.filters[1].step)
+    y_r, switch_part = lim_r.update(filt[2], qraw[2], filt[3], edge_ok, vx0, yaw_rate, dt, scale, self.filters[2].step, self.filters[3].step)
     sel_r, sel_l = lim_r.sel, lim_l.sel  # 1 where the line is the raw limit
-    q_R = unified_confidence(float(np.interp(iL, X_IDXS, filt[2])), qf[2], float(np.interp(iL, X_IDXS, filt[3])) - EDGE_ADJUST, qf[3], +1,
+    q_R = unified_confidence(float(np.interp(iL, X_IDXS, filt[2])), qraw[2], float(np.interp(iL, X_IDXS, filt[3])) - EDGE_ADJUST, qraw[3], +1,
                              lim_r.present, edge_ok)
-    q_L = unified_confidence(float(np.interp(iL, X_IDXS, filt[0])), qf[0], float(np.interp(iL, X_IDXS, filt[1])) + EDGE_ADJUST, qf[1], -1,
+    q_L = unified_confidence(float(np.interp(iL, X_IDXS, filt[0])), qraw[0], float(np.interp(iL, X_IDXS, filt[1])) + EDGE_ADJUST, qraw[1], -1,
                              lim_l.present, edge_ok)
     # step 5: the weighted line strength per side (right: Keep Right's strength; both: the centre limit's form)
     ws_l = self.strengths[0].update(q_L, dt)
@@ -1266,7 +1270,8 @@ class RightLineBlendful:
       'cand_weight': np.array([w_line_l, 1.0 - w_line_l, w_at[0], w_at[1]]),
       'reference': np.array([np.interp(iL, X_IDXS, y_l), np.interp(iL, X_IDXS, y_r)]), 'target': target,
       'line_hold': w_at[0], 'blend_reference': float(np.interp(iL, X_IDXS, lim_r.raw)),
-      'q_unified': np.array([q_L, q_R]), 'q_strength_lr': np.array([ws_l, ws_r]), 'limit_raw_l': float(np.interp(iL, X_IDXS, lim_l.raw)),
+      'q_unified': np.array([q_L, q_R]), 'q_candidates': np.array(qraw), 'q_strength_lr': np.array([ws_l, ws_r]),
+      'limit_raw_l': float(np.interp(iL, X_IDXS, lim_l.raw)),
       'episode': in_episode, 'episode_ended': em.ended, 'episode_dist': em.dist if in_episode else 0.0, 'model_alone_time': em.model_alone_time,
       'cues': cue_bits, 'cue_values': np.array([c1 if c1 is not None else 0.0, c2 if c2 is not None else 0.0, ed_g if ed_ok else 0.0, ed_a if ed_ok else 0.0,
                                                  gore_min if gore_min is not None else 0.0, kink, b]),
