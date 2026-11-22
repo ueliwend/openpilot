@@ -304,9 +304,9 @@ def move_speeds(*failing):
 
 class TestClosedLoop:
   # rev 9b final (event rise 1 s + start-up seed, owner 22 Nov 00:37): overshoot 0.040 / 0.036 / 0.004 m at 30 / 50 / 80 km/h (base
-  # 0.046 / 0.044 / 0.019; round 2's 3 s rise: none).  Keep Right lane limit (weighted strength from 0 with 2 s, no seed): 30 km/h within
-  # the 0.04 m line, 50 km/h 0.040 m, just over it (xfail as on base, where 30 and 50 were)
-  @pytest.mark.parametrize("kmh", move_speeds(50))
+  # 0.046 / 0.044 / 0.019; round 2's 3 s rise: none).  Keep Right lane limit (weighted strength from 0 with 2 s, no seed): within the
+  # 0.04 m line at every speed (no xfail)
+  @pytest.mark.parametrize("kmh", move_speeds())
   def test_step_of_half_a_metre(self, kmh):
     t, y, vs, _, _ = closed_loop(kmh / 3.6, lambda t: {}, seconds=60.0)
     final = 1.75 - br.W_R - 0.44  # 0.5 m right of the centre

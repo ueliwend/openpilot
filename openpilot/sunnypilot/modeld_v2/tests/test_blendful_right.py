@@ -361,13 +361,16 @@ class TestCorrectionLaw:
       # rev 9b: s_R reads the confidence part (5 s low-pass from the first frame's confidence)
       assert abs(res[-1].log['s_r'] - want) < 0.005 and abs(res[-1].log['w_c'] - want) < 1e-9
 
-  def test_left_only_is_regular_upstream(self):
+  def test_left_only_is_regular_upstream(self, monkeypatch):
     k0_up = 0.0021
     rl, res = run_rl([Scene(pl=1.0, pr=0.0)] * 150, k0_up=k0_up)
     assert rl.a == 0.0
+    assert all(r.k0 == k0_up for r in res)
     # a = 0: exactly upstream's correction (blend law kappa0 = a RL + (1 - a) up), also while the detector factor is below 1 (review S3: the
-    # gain scales Keep Right's share only; here the start-up step of the centre limit, 0.1 m, is above the 72 km/h lower level 0.064 m:
-    # gain down to 0.87; 3fedb5476 delivered gain x upstream)
+    # gain scales Keep Right's share only; 3fedb5476 delivered gain x upstream).  Keep Right lane limit: the lane limits start at their raw
+    # positions, so the fixture's start-up step of the centre limit (which pulled the gain to 0.87) is gone; the factor is forced to 0.5 here
+    monkeypatch.setattr(br, 'detector_strength', lambda *a: 0.5)
+    rl, res = run_rl([Scene(pl=1.0, pr=0.0)] * 150, k0_up=k0_up)
     assert all(r.k0 == k0_up for r in res) and min(r.log['det_gain'] for r in res) < 0.9
 
   def test_blend_is_continuous_in_a(self):
