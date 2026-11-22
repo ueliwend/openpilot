@@ -1696,6 +1696,27 @@ class TestCarAheadRule:
     young.moving_votes.extend([True] * 4 + [False] * 2)
     assert not young.moving  # 4 of 6 < 80 %
 
+  @pytest.mark.parametrize("how", ["lost", "jump"])
+  def test_a_remembered_object_beyond_the_release_distance_still_counts_by_its_time_to_contact(self, how):
+    # review 1fe432a0 finding 7: a road user 15 m ahead closing at 4 m/s (3.75 s) counts by its time-to-contact state alone (15 m is beyond the
+    # distance state's 11.25 m).  Lost from view ("lost": remembered beside the car) or its slot jumping to another object ("jump": remembered
+    # for 1 s), the remembered object keeps that state and keeps counting while it is still beyond 11.25 m (it does not become the car ahead)
+    v = 50 / 3.6
+    rcl = RadarClearance()
+    yr = np.full(br.NX, 1.75)
+    for _ in range(8):
+      res = TestRadarClearanceUnit().step(rcl, [(1, 15.0, -0.2, -4.0)], v=v, y_ref=yr)
+    assert res.clearance_objects == 1 and res.lead_objects == 0 and rcl.tracks[1].ttc_on and not rcl.tracks[1].close_on
+    checked = 0
+    for _ in range(3):
+      res = TestRadarClearanceUnit().step(rcl, [] if how == "lost" else [(1, 40.0, -0.2, 0.0)], v=v, y_ref=yr)
+      mem = [t for t in list(rcl.tracks.values()) + rcl.ghosts if not t.seen]
+      assert len(mem) == 1 and mem[0].ttc_on
+      if mem[0].x - rc.RADAR_TO_MODEL_X > rc.CAR_AHEAD_DIST_RELEASE:
+        assert not mem[0].close_on and res.clearance_objects == 1 and res.lead_objects == 0
+        checked += 1
+    assert checked >= 2
+
   def test_a_remembered_track_keeps_its_states(self):
     # a track 8 m ahead closing at 2 m/s (4 s) that loses its confirmation is remembered with its time-to-contact and distance states (it does
     # not become the car ahead meanwhile)
