@@ -142,7 +142,8 @@ class VisualsLayout(Widget):
     else:
       self._chevron_info.set_description(tr(CHEVRON_INFO_DESCRIPTION["disabled"]))
       self._chevron_info.action_item.set_enabled(False)
-      ui_state.params.put("ChevronInfo", 0)
+      if ui_state.car_recognised:  # an unrecognised start keeps the setting
+        ui_state.params.put("ChevronInfo", 0)
 
   def _render(self, rect):
     self._scroller.render(rect)

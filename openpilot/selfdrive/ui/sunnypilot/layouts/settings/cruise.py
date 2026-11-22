@@ -128,7 +128,8 @@ class CruiseLayout(Widget):
         self.icbm_toggle.action_item.set_enabled(ui_state.is_offroad())
         self.icbm_toggle.set_description(tr(ICBM_DESC))
       else:
-        ui_state.params.remove("IntelligentCruiseButtonManagement")
+        if ui_state.car_recognised:  # an unrecognised start keeps the setting
+          ui_state.params.remove("IntelligentCruiseButtonManagement")
         self.icbm_toggle.action_item.set_enabled(False)
 
         long_desc = ICMB_UNAVAILABLE
@@ -150,9 +151,10 @@ class CruiseLayout(Widget):
         self.scc_v_toggle.action_item.set_enabled(True)
         self.scc_m_toggle.action_item.set_enabled(True)
       else:
-        ui_state.params.remove("CustomAccIncrementsEnabled")
-        ui_state.params.remove("SmartCruiseControlVision")
-        ui_state.params.remove("SmartCruiseControlMap")
+        if ui_state.car_recognised:  # an unrecognised start keeps the settings
+          ui_state.params.remove("CustomAccIncrementsEnabled")
+          ui_state.params.remove("SmartCruiseControlVision")
+          ui_state.params.remove("SmartCruiseControlMap")
         self.custom_acc_toggle.action_item.set_enabled(False)
         self.scc_v_toggle.action_item.set_enabled(False)
         self.scc_m_toggle.action_item.set_enabled(False)

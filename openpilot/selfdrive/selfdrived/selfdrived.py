@@ -17,6 +17,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.common.gps import get_gps_location_service
 
 from openpilot.selfdrive.car.car_events import CarEvents
+from openpilot.selfdrive.car.helpers import is_car_recognised
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 from openpilot.selfdrive.selfdrived.events import Events, ET
 from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck
@@ -119,10 +120,10 @@ class SelfdriveD:
     self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
     self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
 
-    car_recognized = self.CP.brand != 'mock'
+    car_recognized = is_car_recognised(self.CP)
 
-    # cleanup old params
-    if not self.CP.alphaLongitudinalAvailable:
+    # cleanup old params (only for a recognised car: an unrecognised start keeps every setting)
+    if car_recognized and not self.CP.alphaLongitudinalAvailable:
       self.params.remove("AlphaLongitudinalEnabled")
 
     self.CS_prev = car.CarState.new_message()

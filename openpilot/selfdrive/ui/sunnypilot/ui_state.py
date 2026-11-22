@@ -10,6 +10,7 @@ from openpilot.cereal import messaging, log, custom
 from opendbc.car.structs import car
 from opendbc.sunnypilot.car.interfaces import has_bsm
 from openpilot.common.params import Params
+from openpilot.selfdrive.car.helpers import is_car_recognised
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.display import OnroadBrightness
 from openpilot.sunnypilot.models.helpers import ACTIVE_BUNDLE_KEYS, get_active_source
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import any_inster_switch, is_inster
@@ -102,6 +103,12 @@ class UIStateSP:
         self.onroad_brightness_timer = 15 * gui_app.target_fps
       else:
         self.onroad_brightness_timer = self.onroad_brightness_timer_param * gui_app.target_fps
+
+  @property
+  def car_recognised(self) -> bool:
+    """The last start's CarParams describe a recognised car; only then may the UI remove or rewrite a setting the car
+    does not support (an unrecognised start keeps every setting, see is_car_recognised)."""
+    return is_car_recognised(getattr(self, "CP", None))
 
   @property
   def onroad_brightness_timer_expired(self) -> bool:
@@ -202,48 +209,47 @@ class UIStateSP:
       self.reset_onroad_sleep_timer()
 
   def _enforce_constraints(self) -> None:
+    # Settings are adjusted to the car's capabilities only when the last start recognised the car. Without CarParams,
+    # or with the mock platform card falls back to when fingerprinting fails, nothing is removed or rewritten: such a
+    # start says nothing about the car (owner, 21 Nov 2026: an unrecognised start reset the longitudinal settings).
+    if not self.car_recognised:
+      return
+
     has_long = self.has_longitudinal_control
     CP = self.CP
 
-    if CP is not None:
-      if self.params.get_bool("EnforceTorqueControl") and self.params.get_bool("NeuralNetworkLateralControl"):
-        self.params.put_bool("EnforceTorqueControl", False, block=True)
-        self.params.put_bool("NeuralNetworkLateralControl", False, block=True)
+    if self.params.get_bool("EnforceTorqueControl") and self.params.get_bool("NeuralNetworkLateralControl"):
+      self.params.put_bool("EnforceTorqueControl", False, block=True)
+      self.params.put_bool("NeuralNetworkLateralControl", False, block=True)
 
-      if self.params.get_bool("LateralJerkTorqueController") and self.params.get_bool("NeuralNetworkLateralControl"):
-        self.params.put_bool("LateralJerkTorqueController", False, block=True)
-        self.params.put_bool("NeuralNetworkLateralControl", False, block=True)
+    if self.params.get_bool("LateralJerkTorqueController") and self.params.get_bool("NeuralNetworkLateralControl"):
+      self.params.put_bool("LateralJerkTorqueController", False, block=True)
+      self.params.put_bool("NeuralNetworkLateralControl", False, block=True)
 
-      # Hyundai Inster steering switches (torque controller v0) replace the Lateral Jerk Torque Controller
-      if is_inster(CP) and self.params.get_bool("LateralJerkTorqueController") and any_inster_switch(self.params):
-        self.params.put_bool("LateralJerkTorqueController", False, block=True)
+    # Hyundai Inster steering switches (torque controller v0) replace the Lateral Jerk Torque Controller
+    if is_inster(CP) and self.params.get_bool("LateralJerkTorqueController") and any_inster_switch(self.params):
+      self.params.put_bool("LateralJerkTorqueController", False, block=True)
 
-      # Angle steering: no torque-based lateral controls
-      if CP.steerControlType == car.CarParams.SteerControlType.angle:
-        self.params.remove("EnforceTorqueControl")
-        self.params.remove("NeuralNetworkLateralControl")
-        self.params.remove("LateralJerkTorqueController")
-
-      # Alpha longitudinal: clear if not available
-      if not CP.alphaLongitudinalAvailable:
-        self.params.remove("AlphaLongitudinalEnabled")
-
-      # BSM not available: clear BSM-dependent settings
-      if not has_bsm(CP, self.CP_SP):
-        self.params.remove("AutoLaneChangeBsmDelay")
-    else:
-      # No CarParams: clear all car-dependent params as safety default
+    # Angle steering: no torque-based lateral controls
+    if CP.steerControlType == car.CarParams.SteerControlType.angle:
       self.params.remove("EnforceTorqueControl")
       self.params.remove("NeuralNetworkLateralControl")
       self.params.remove("LateralJerkTorqueController")
+
+    # Alpha longitudinal: clear if not available
+    if not CP.alphaLongitudinalAvailable:
       self.params.remove("AlphaLongitudinalEnabled")
 
+    # BSM not available: clear BSM-dependent settings
+    if not has_bsm(CP, self.CP_SP):
+      self.params.remove("AutoLaneChangeBsmDelay")
+
+    # The rules below need the same start's CarParamsSP; without it nothing more is removed
+    if self.CP_SP is None:
+      return
+
     # ICBM: clear if not available or if full longitudinal control is active
-    if self.CP_SP is not None:
-      if not self.CP_SP.intelligentCruiseButtonManagementAvailable or has_long:
-        self.params.remove("IntelligentCruiseButtonManagement")
-        self.has_icbm = False
-    else:
+    if not self.CP_SP.intelligentCruiseButtonManagementAvailable or has_long:
       self.params.remove("IntelligentCruiseButtonManagement")
       self.has_icbm = False
 

@@ -9,6 +9,7 @@ from openpilot.cereal import custom
 from opendbc.car.structs import car
 from openpilot.common.constants import CV
 from openpilot.common.params import Params
+from openpilot.selfdrive.car.helpers import is_car_recognised
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode as SpeedLimitMode
 
 
@@ -26,6 +27,11 @@ def compare_cluster_target(v_cruise_cluster: float, target_set_speed: float, is_
 def set_speed_limit_assist_availability(CP: car.CarParams, CP_SP: custom.CarParamsSP, params: Params | None = None) -> bool:
   if params is None:
     params = Params()
+
+  # Unrecognised car (mock platform after a failed fingerprint): Speed Limit Assist is not available, but the
+  # user's Speed Limit mode is kept as it is for the next recognised start
+  if not is_car_recognised(CP):
+    return False
 
   is_release = params.get_bool("IsReleaseSpBranch")
   disallow_in_release = CP.brand == "tesla" and is_release

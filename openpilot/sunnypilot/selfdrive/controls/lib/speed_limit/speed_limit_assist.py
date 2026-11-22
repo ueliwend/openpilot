@@ -61,8 +61,8 @@ class SpeedLimitAssist:
     self.long_engaged_timer = 0
     self.pre_active_timer = 0
     self.is_metric = self.params.get_bool("IsMetric")
-    set_speed_limit_assist_availability(self.CP, self.CP_SP, self.params)
-    self.enabled = self.params.get("SpeedLimitMode", return_default=True) == Mode.assist
+    self.available = set_speed_limit_assist_availability(self.CP, self.CP_SP, self.params)
+    self.enabled = self.available and self.params.get("SpeedLimitMode", return_default=True) == Mode.assist
     self.long_enabled = False
     self.long_enabled_prev = False
     self.is_enabled = False
@@ -143,8 +143,8 @@ class SpeedLimitAssist:
   def update_params(self) -> None:
     if self.frame % int(PARAMS_UPDATE_PERIOD / DT_MDL) == 0:
       self.is_metric = self.params.get_bool("IsMetric")
-      set_speed_limit_assist_availability(self.CP, self.CP_SP, self.params)
-      self.enabled = self.params.get("SpeedLimitMode", return_default=True) == Mode.assist
+      self.available = set_speed_limit_assist_availability(self.CP, self.CP_SP, self.params)
+      self.enabled = self.available and self.params.get("SpeedLimitMode", return_default=True) == Mode.assist
 
   def update_buttons(self, release_toggle: int) -> None:
     released = self._release_toggle_prev ^ release_toggle

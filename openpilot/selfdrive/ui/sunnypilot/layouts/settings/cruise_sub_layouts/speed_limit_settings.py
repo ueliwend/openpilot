@@ -139,7 +139,7 @@ class SpeedLimitSettingsLayout(Widget):
       sla_always_disallow = brand == "rivian"
       sla_available = (has_long or has_icbm) and not sla_disallow_in_release and not sla_always_disallow
 
-      if not sla_available and speed_limit_mode_param == int(SpeedLimitMode.assist):
+      if not sla_available and speed_limit_mode_param == int(SpeedLimitMode.assist) and ui_state.car_recognised:
         ui_state.params.put("SpeedLimitMode", int(SpeedLimitMode.warning))
 
     else:

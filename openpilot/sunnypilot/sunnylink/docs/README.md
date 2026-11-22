@@ -578,7 +578,9 @@ The device-side UI enforces capability constraints in `selfdrive/ui/sunnypilot/u
 
 Settings layouts should not duplicate these params.remove() calls. Instead, rely on schema rules and centralized enforcement to prevent duplicate logic and ensure consistency.
 
+Every capability rule first checks `is_car_recognised(CP)` (`selfdrive/car/helpers.py`); card (`_cleanup_unsupported_params`), Speed Limit Assist (`set_speed_limit_assist_availability`) and selfdrived (alpha longitudinal cleanup) use the same check, so a start without a recognised car keeps every setting.
+
 Example constraints in `_enforce_constraints()`:
 - Angle steering cars: remove `EnforceTorqueControl` and `NeuralNetworkLateralControl`
-- No CarParams: remove all car-dependent params
+- No CarParams, or an unrecognised car (mock platform, `is_car_recognised` false): nothing is removed or rewritten
 - No ICBM: remove `IntelligentCruiseButtonManagement`

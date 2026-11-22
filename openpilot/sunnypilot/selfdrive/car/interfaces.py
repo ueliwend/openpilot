@@ -10,6 +10,7 @@ from opendbc.car import structs
 from opendbc.car.interfaces import CarInterfaceBase
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
+from openpilot.selfdrive.car.helpers import is_car_recognised
 from openpilot.sunnypilot.selfdrive.controls.lib.inster_lateral import any_inster_switch, is_inster
 from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.helpers import get_nn_model_path
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import set_speed_limit_assist_availability
@@ -64,6 +65,12 @@ def _initialize_torque_lateral_control(CI: CarInterfaceBase, CP: structs.CarPara
 def _cleanup_unsupported_params(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params: Params | None = None) -> None:
   if params is None:
     params = Params()
+
+  # An unrecognised car (mock platform after a failed fingerprint) says nothing about the car's capabilities:
+  # keep every setting as it is (the car runs in dashcam mode anyway)
+  if not is_car_recognised(CP):
+    cloudlog.warning("car not recognised, keeping all settings")
+    return
 
   if params.get_bool("LateralJerkTorqueController") and params.get_bool("NeuralNetworkLateralControl"):
     cloudlog.warning("LateralJerkTorqueController and NeuralNetworkLateralControl both enabled, disabling both")

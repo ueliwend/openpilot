@@ -15,6 +15,19 @@ def is_mock_car(CP) -> bool:
   return CP.brand == "mock"
 
 
+def is_car_recognised(CP) -> bool:
+  """True when CP describes a recognised car: CarParams exist and fingerprinting found a real platform.
+
+  Every code path that removes or rewrites a user setting because the car lacks a capability (alpha longitudinal,
+  blind spot monitoring, ICBM, Speed Limit Assist, ...) must check this first. A start without a recognised car (no
+  CarParams yet, or the mock platform card falls back to when fingerprinting fails, e.g. after a panda fault) says
+  nothing about the car's capabilities, so such a start keeps every setting as it is; the car then runs in dashcam mode
+  (safety model noOutput) whatever the settings say."""
+  if CP is None:
+    return False
+  return not is_mock_car(CP) and CP.brand != "" and CP.carFingerprint not in ("", "MOCK")
+
+
 def is_dataclass(obj):
   """Similar to dataclasses.is_dataclass without instance type check checking"""
   return hasattr(obj, _FIELDS)
