@@ -231,13 +231,15 @@ class LaneLimit:
     self.present = False
 
   def update(self, y_line: np.ndarray, q_line: float, y_edge: np.ndarray, edge_ok: bool, vx0: float, yaw_rate: float, dt: float,
-             scale: float, step_line: np.ndarray, step_edge: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+             scale: float, step_line: np.ndarray, step_edge: np.ndarray, q_edge: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
     s = self.side
     adj = y_edge - s * EDGE_ADJUST
     self.present = bool(q_line > LINE_PRESENT_Q)
     if not edge_ok:  # no road edges in the model output: the line is the only candidate
       sel = np.ones(NX)
-    elif self.present:
+    elif self.present or q_edge <= LINE_PRESENT_Q:
+      # the line where it lies inward of the adjusted edge; with neither candidate confident (no line present and the edge's confidence
+      # not above the same level, e.g. the first frames after a restart, when both confidence filters start from 0) the inner of the two
       sel = (s * (y_line - adj) < 0.0).astype(float)
     else:
       sel = np.zeros(NX)
@@ -263,10 +265,11 @@ class LaneLimit:
 def unified_confidence(y_line: float, q_line: float, y_edge_adj: float, q_edge: float, side: int, present: bool, edge_ok: bool) -> float:
   """Keep Right lane limit, step 4 (owner 22 Nov 2026 02:31), at one distance: line and adjusted edge UNIFY_SPAN or more apart -> the inner
   one's confidence; coinciding -> the higher confidence; between: smoothstep from the inner one's to the higher one.  A line that is not
-  present does not count (the raw limit is the adjusted edge: its confidence); without road edges the line's."""
+  present does not count (the raw limit is the adjusted edge: its confidence) unless the edge's confidence is not above the same level either
+  (the raw limit is then the inner of the two); without road edges the line's."""
   if not edge_ok:
     return float(q_line)
-  if not present:
+  if not present and q_edge > LINE_PRESENT_Q:
     return float(q_edge)
   line_inner = side * (y_line - y_edge_adj) < 0.0
   q_in = q_line if line_inner else q_edge
@@ -1038,8 +1041,9 @@ class RightLineBlendful:
     # "confidence after filtering" (owner): the candidates' confidences through their 0.5 s filters (line: probability filter x std ramp,
     # edge: std ramp filter), qraw; not the InputFilter's q, which stays 0 until a raw confidence above 0.5 has initialised the filter
     # (a line held at 0.3 would never count) and is the position filter's own gate
-    y_l, _ = lim_l.update(filt[0], qraw[0], filt[1], edge_ok, vx0, yaw_rate, dt, scale, self.filters[0].step, self.filters[1].step)
-    y_r, switch_part = lim_r.update(filt[2], qraw[2], filt[3], edge_ok, vx0, yaw_rate, dt, scale, self.filters[2].step, self.filters[3].step)
+    y_l, _ = lim_l.update(filt[0], qraw[0], filt[1], edge_ok, vx0, yaw_rate, dt, scale, self.filters[0].step, self.filters[1].step, qraw[1])
+    y_r, switch_part = lim_r.update(filt[2], qraw[2], filt[3], edge_ok, vx0, yaw_rate, dt, scale, self.filters[2].step, self.filters[3].step,
+                                    qraw[3])
     sel_r, sel_l = lim_r.sel, lim_l.sel  # 1 where the line is the raw limit
     q_R = unified_confidence(float(np.interp(iL, X_IDXS, filt[2])), qraw[2], float(np.interp(iL, X_IDXS, filt[3])) - EDGE_ADJUST, qraw[3], +1,
                              lim_r.present, edge_ok)

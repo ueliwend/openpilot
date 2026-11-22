@@ -1773,8 +1773,9 @@ class TestLaneLimit:
   def test_step1_the_edge_counts_edge_adjust_toward_the_lane_centre(self, monkeypatch, adjust):
     # no lines, clear edges at +-2.4 m: both lane limits sit EDGE_ADJUST inside their edge (read at call time)
     monkeypatch.setattr(br, 'EDGE_ADJUST', adjust)
-    rl, res = steady(v=13.0, pl=0.0, pr=0.0, edges=True, edge_half=2.4, frames=100)
-    assert abs(res.log['reference'][1] - (2.4 - adjust)) < 1e-6 and abs(res.log['reference'][0] + (2.4 - adjust)) < 1e-6
+    # (the first frames, before the edges' confidence passes 0.1, take the inner absent lines; the limit then creeps out with 1.5 s)
+    rl, res = steady(v=13.0, pl=0.0, pr=0.0, edges=True, edge_half=2.4, frames=400)
+    assert abs(res.log['reference'][1] - (2.4 - adjust)) < 1e-3 and abs(res.log['reference'][0] + (2.4 - adjust)) < 1e-3
 
   # step 2
   def test_step2_the_line_counts_by_its_filtered_confidence(self):
@@ -1807,6 +1808,30 @@ class TestLaneLimit:
     lim = br.LaneLimit(-1)
     lim.update(-line, 0.9, -edge, True, 20.0, 0.0, DT_MDL, 1.0, Z33, Z33)
     np.testing.assert_allclose(lim.raw, np.maximum(-line, -2.0), atol=1e-12)
+
+  def test_step2_neither_confident_takes_the_inner_one(self):
+    # no line present and the edge's confidence not above 0.1 either (e.g. the first frames after a restart, both confidence filters from 0):
+    # the inner of line and adjusted edge, not a far unconfident edge; the unified confidence is then the inner one's (strength 0)
+    lim = br.LaneLimit(+1)
+    lim.update(np.full(33, 1.6), 0.05, np.full(33, 3.9), True, 25.0, 0.0, DT_MDL, 1.0, Z33, Z33, 0.05)
+    assert np.all(lim.sel == 1.0) and np.allclose(lim.raw, 1.6)
+    lim = br.LaneLimit(+1)  # a confident edge: the owner's fallback, the adjusted edge
+    lim.update(np.full(33, 1.6), 0.05, np.full(33, 3.9), True, 25.0, 0.0, DT_MDL, 1.0, Z33, Z33, 0.8)
+    assert np.all(lim.sel == 0.0) and np.allclose(lim.raw, 3.9 - br.EDGE_ADJUST)
+    assert br.unified_confidence(1.6, 0.05, 3.65, 0.05, +1, False, True) == pytest.approx(0.05)
+
+  def test_a_restart_keeps_the_centre_limit_on_the_lines(self):
+    # lane-tracking restart with lines at +-1.75 m and edges far out (+3.9 / -5.4 m): the first frame's centre limit stays near the lane centre
+    # (the first build took the far edges for the first frames: the detector's usual started 3.9 m off and scaled Keep Right down for 10 s)
+    rl = RightLineBlendful()
+    sc = Scene(v=25.0, width=3.5, edges=True, edge_half=5.4, edge_right=3.9)
+    for _ in range(100):
+      rl.update(sc.model_output(), 25.0, True, 0.0, 0.0, RightInputs())
+    rl.update(sc.model_output(), 25.0, False, 0.0, 0.0, RightInputs())  # a lane change (not active), then the restart
+    for _ in range(10):
+      lg = rl.update(sc.model_output(), 25.0, True, 0.0, 0.0, RightInputs()).log
+      assert abs(float(np.interp(37.5, X, lg['c_ctr']))) < 0.3
+    assert lg['det_strength'] == 1.0
 
   def test_step2_without_road_edges_the_line_is_the_limit(self):
     r = limit_steps([(1.6, 1e3)] * 5, line_q=0.0, edge_ok=False)
@@ -1903,8 +1928,8 @@ class TestLaneLimit:
 
   def test_step5_the_left_side_has_its_own_lane_limit_and_strength(self):
     # left edge only (line absent): the left lane limit is the adjusted left edge and its strength the left edge's confidence
-    rl, res = steady(v=13.0, pl=0.0, pr=0.9, edges=True, edge_half=2.4, frames=200)
-    assert abs(res.log['reference'][0] + 2.4 - br.EDGE_ADJUST) < 1e-6 and res.log['q_unified'][0] == pytest.approx(0.8, abs=1e-6)
+    rl, res = steady(v=13.0, pl=0.0, pr=0.9, edges=True, edge_half=2.4, frames=400)
+    assert abs(res.log['reference'][0] + 2.4 - br.EDGE_ADJUST) < 1e-3 and res.log['q_unified'][0] == pytest.approx(0.8, abs=1e-6)
     assert res.log['q_strength_lr'][0] == pytest.approx(0.8, abs=0.01)
 
   def test_the_centre_limit_form_reads_the_weighted_strengths(self, monkeypatch):
