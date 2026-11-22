@@ -145,9 +145,11 @@ class InitialCruiseSpeedPicker(BigDialogBase):
 
 class InitialCruiseSpeedButton(BigButton):
   def __init__(self):
-    super().__init__("initial max speed", " ", description="Max speed when engaging openpilot.\n" +
-                                                           "If you are already driving faster, your current speed is used.\n" +
-                                                           "Resume restores the previous max speed.")
+    super().__init__("initial max speed (fallback)", " ", description="Max speed when engaging sunnypilot.\n" +
+                                                                      "Speed Limit Assist on, car's displayed limit and map agree: " +
+                                                                      "limit + Speed Limit Offset.\n" +
+                                                                      "Otherwise your current speed, or this value if you are slower.\n" +
+                                                                      "Resume restores the previous max speed.")
     self._picker = InitialCruiseSpeedPicker(self.refresh)
     self.set_click_callback(lambda: gui_app.push_widget(self._picker))
     self.refresh()

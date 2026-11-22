@@ -7,6 +7,7 @@ from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.selfdrive.ui.layouts.settings.initial_cruise_speed import InitialCruiseSpeedControl
+from openpilot.selfdrive.ui.sunnypilot.layouts.settings.initial_cruise_speed import INITIAL_MAX_SPEED_TITLE, INITIAL_MAX_SPEED_DESC
 
 if gui_app.sunnypilot_ui():
   from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp as toggle_item
@@ -111,9 +112,8 @@ class TogglesLayout(Widget):
 
     self._toggles = {}
     self._initial_cruise_speed = ListItem(
-      title=lambda: tr("Initial Max Speed"),
-      description=lambda: tr("Max speed when engaging openpilot. If you are already driving faster, your current speed is used. " +
-                             "Resume restores the previous max speed. Changes apply the next time you engage."),
+      title=lambda: tr(INITIAL_MAX_SPEED_TITLE),
+      description=lambda: tr(INITIAL_MAX_SPEED_DESC),
       action_item=InitialCruiseSpeedControl(),
       icon="speed_limit.png",
     )
@@ -149,7 +149,9 @@ class TogglesLayout(Widget):
       # insert longitudinal personality after NDOG toggle
       if param == "DisengageOnAccelerator":
         self._toggles["LongitudinalPersonality"] = self._long_personality_setting
-        self._toggles["InitialCruiseSpeedKph"] = self._initial_cruise_speed
+        # sunnypilot UI: on the Cruise page instead, next to Speed Limit (owner, 21 Nov 2026)
+        if not gui_app.sunnypilot_ui():
+          self._toggles["InitialCruiseSpeedKph"] = self._initial_cruise_speed
 
     self._scroller = Scroller(list(self._toggles.values()), line_separator=True, spacing=0)
 

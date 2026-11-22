@@ -7,6 +7,8 @@ See the LICENSE.md file in the root directory for more details.
 from enum import IntEnum
 
 from openpilot.selfdrive.ui.sunnypilot.layouts.settings.cruise_sub_layouts.speed_limit_settings import SpeedLimitSettingsLayout
+from openpilot.selfdrive.ui.sunnypilot.layouts.settings.initial_cruise_speed import INITIAL_MAX_SPEED_TITLE, INITIAL_MAX_SPEED_DESC, \
+  InitialCruiseSpeedControlSP, initial_cruise_speed_item_sp
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.system.ui.sunnypilot.widgets.list_view import toggle_item_sp, option_item_sp, simple_button_item_sp
@@ -82,6 +84,14 @@ class CruiseLayout(Widget):
       min_value=1, max_value=3, value_change_step=1,
       inline=True)
 
+    # Initial Max Speed (fallback): moved here from Toggles, next to Speed Limit (owner, 21 Nov 2026)
+    self.initial_cruise_speed = initial_cruise_speed_item_sp(
+      title=lambda: tr(INITIAL_MAX_SPEED_TITLE),
+      description=lambda: tr(INITIAL_MAX_SPEED_DESC),
+      action_item=InitialCruiseSpeedControlSP(),
+    )
+    self.initial_cruise_speed.set_visible(lambda: ui_state.CP is not None and ui_state.has_longitudinal_control and not ui_state.CP.pcmCruise)
+
     self.sla_settings_button = simple_button_item_sp(
       button_text=lambda: tr("Speed Limit"),
       button_width=800,
@@ -96,6 +106,7 @@ class CruiseLayout(Widget):
       self.custom_acc_toggle,
       self.custom_acc_short_increment,
       self.custom_acc_long_increment,
+      self.initial_cruise_speed,
       self.sla_settings_button,
     ]
     return items
@@ -109,6 +120,8 @@ class CruiseLayout(Widget):
   def show_event(self):
     self._set_current_panel(PanelType.CRUISE)
     self._scroller.show_event()
+    ui_state.update_params()
+    self.initial_cruise_speed.action_item.refresh()
     self.icbm_toggle.show_description(True)
     self.custom_acc_toggle.show_description(True)
 

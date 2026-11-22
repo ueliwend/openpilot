@@ -33,6 +33,9 @@ DEVICE_DEFAULTS = {
   "RecordRoadFull": False,
   # owner, 13 Nov 2026 (E11, Q3 a): every map tile of the selected countries is checked once a week
   "OsmAutoUpdate": True,
+  # owner, 16 Nov 2026 (initial set speed): Toggles -> Initial Max Speed (fallback) ranges from 20 km/h, default 20 (was 40); a stored
+  # value is kept, also through a start with an unrecognised car (test_existing_store_unchanged)
+  "InitialCruiseSpeedKph": 20,
 }
 
 # a value different from each default (the owner's store must survive a start unchanged)

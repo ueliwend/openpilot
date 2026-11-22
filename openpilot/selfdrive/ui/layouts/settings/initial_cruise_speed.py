@@ -1,3 +1,4 @@
+import math
 import time
 import pyray as rl
 
@@ -22,9 +23,11 @@ def _speed_conversion() -> float:
 
 
 def get_speed_options() -> tuple[list[int], int]:
-  """Initial cruise speeds in display units, and the index of the nearest to the saved one"""
+  """Initial cruise speeds in display units, and the index of the nearest to the saved one. They start at the first step at or above
+  V_CRUISE_INITIAL (20 km/h; 15 mph = 24 km/h)"""
   conversion = _speed_conversion()
-  options = list(range(round(V_CRUISE_INITIAL * conversion), round(V_CRUISE_MAX * conversion) + 1, SPEED_STEP))
+  first = math.ceil(V_CRUISE_INITIAL * conversion / SPEED_STEP) * SPEED_STEP
+  options = list(range(first, round(V_CRUISE_MAX * conversion) + 1, SPEED_STEP))
   idx = round((ui_state.initial_cruise_speed * conversion - options[0]) / SPEED_STEP)
   return options, max(0, min(len(options) - 1, idx))
 

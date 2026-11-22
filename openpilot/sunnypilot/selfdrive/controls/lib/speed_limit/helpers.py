@@ -10,7 +10,19 @@ from opendbc.car.structs import car
 from openpilot.common.constants import CV
 from openpilot.common.params import Params
 from openpilot.selfdrive.car.helpers import is_car_recognised
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode as SpeedLimitMode
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Mode as SpeedLimitMode, OffsetType
+
+
+def get_speed_limit_offset(offset_type: int, offset_value: float, speed_limit: float, is_metric: bool) -> float:
+  """Speed Limit Offset setting applied to a speed limit (m/s): None 0, Fixed value in km/h or mph, % of the limit"""
+  if offset_type == OffsetType.off:
+    return 0.
+  elif offset_type == OffsetType.fixed:
+    return float(offset_value * (CV.KPH_TO_MS if is_metric else CV.MPH_TO_MS))
+  elif offset_type == OffsetType.percentage:
+    return float(offset_value * 0.01 * speed_limit)
+  else:
+    raise NotImplementedError("Offset not supported")
 
 
 def compare_cluster_target(v_cruise_cluster: float, target_set_speed: float, is_metric: bool) -> tuple[bool, bool]:

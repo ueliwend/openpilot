@@ -12,7 +12,7 @@ from openpilot.sunnypilot.selfdrive.car.cruise_ext import VCruiseHelperSP
 V_CRUISE_MIN = 8
 V_CRUISE_MAX = 145
 V_CRUISE_UNSET = 255
-V_CRUISE_INITIAL = 40
+V_CRUISE_INITIAL = 20  # lowest Initial Max Speed (fallback) (Cruise page; param InitialCruiseSpeedKph); 40 upstream. Owner, Inster, 16 Nov 2026
 IMPERIAL_INCREMENT = round(CV.MPH_TO_KPH, 1)  # round here to avoid rounding errors incrementing set speed
 
 ButtonEvent = car.CarState.ButtonEvent
@@ -144,7 +144,11 @@ class VCruiseHelper(VCruiseHelperSP):
 
     if any(b.type in (ButtonType.accelCruise, ButtonType.resumeCruise) for b in CS.buttonEvents) and self.v_cruise_initialized:
       self.v_cruise_kph = self.v_cruise_kph_last
+    elif (limit_set_speed := self.get_speed_limit_initial_set_speed()) is not None:
+      # Speed Limit Assist, the car's displayed limit and the map agree: that limit + Speed Limit Offset (sunnypilot/selfdrive/car/initial_set_speed.py)
+      self.v_cruise_kph = float(np.clip(limit_set_speed, V_CRUISE_MIN, V_CRUISE_MAX))
     else:
+      # current speed, or Initial Max Speed when slower
       self.v_cruise_kph = int(round(np.clip(max(CS.vEgo * CV.MS_TO_KPH, initial_speed), V_CRUISE_INITIAL, V_CRUISE_MAX)))
 
     self.v_cruise_cluster_kph = self.v_cruise_kph

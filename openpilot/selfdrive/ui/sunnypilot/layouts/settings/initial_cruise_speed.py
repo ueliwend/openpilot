@@ -6,9 +6,17 @@ See the LICENSE.md file in the root directory for more details.
 """
 from openpilot.selfdrive.ui.layouts.settings.initial_cruise_speed import get_speed_options, set_initial_cruise_speed
 from openpilot.selfdrive.ui.ui_state import ui_state
-from openpilot.system.ui.lib.multilang import tr
+from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.system.ui.sunnypilot.widgets.list_view import ListItemSP
 from openpilot.system.ui.sunnypilot.widgets.option_control import OptionControlSP
+
+# Cruise > Initial Max Speed (fallback): the set speed at engagement (sunnypilot/selfdrive/car/initial_set_speed.py)
+INITIAL_MAX_SPEED_TITLE = tr_noop("Initial Max Speed (fallback)")
+INITIAL_MAX_SPEED_DESC = tr_noop("Max speed when engaging sunnypilot. With Cruise > Speed Limit > Speed Limit set to Assist, if the car's " +
+                                 "displayed speed limit (sign camera or navigation) and the map show the same limit, that limit plus " +
+                                 "the Speed Limit Offset is used. " +
+                                 "Otherwise your current speed is used, or this value if you are slower. " +
+                                 "Resume restores the previous max speed. Changes apply the next time you engage.")
 
 
 class InitialCruiseSpeedControlSP(OptionControlSP):

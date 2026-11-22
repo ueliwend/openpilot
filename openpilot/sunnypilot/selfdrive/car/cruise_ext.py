@@ -11,6 +11,7 @@ from opendbc.car.structs import car
 from opendbc.car import structs
 from openpilot.common.constants import CV
 from openpilot.common.params import Params
+from openpilot.sunnypilot.selfdrive.car.initial_set_speed import speed_limit_initial_set_speed
 from openpilot.sunnypilot.selfdrive.car.intelligent_cruise_button_management.helpers import get_minimum_set_speed
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import ACTIVE_STATES as SLA_ACTIVE_STATES
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import compare_cluster_target
@@ -65,10 +66,33 @@ class VCruiseHelperSP:
     self.req_plus = False
     self.req_minus = False
 
+    # Initial set speed from the speed limit (sunnypilot/selfdrive/car/initial_set_speed.py): the car's and the map's limit at
+    # engagement (set by card) and the Speed Limit settings, read only (never written here)
+    self.is_metric = True
+    self.car_speed_limit = 0.
+    self.map_speed_limit = 0.
+    self.read_speed_limit_params()
+
   def read_custom_set_speed_params(self) -> None:
     self.custom_acc_enabled = self.params.get_bool("CustomAccIncrementsEnabled")
     self.short_increment = self.params.get("CustomAccShortPressIncrement", return_default=True)
     self.long_increment = self.params.get("CustomAccLongPressIncrement", return_default=True)
+    self.read_speed_limit_params()
+
+  def read_speed_limit_params(self) -> None:
+    self.speed_limit_mode = self.params.get("SpeedLimitMode", return_default=True)
+    self.speed_limit_offset_type = self.params.get("SpeedLimitOffsetType", return_default=True)
+    self.speed_limit_offset_value = self.params.get("SpeedLimitValueOffset", return_default=True)
+
+  def set_initial_speed_limits(self, car_limit: float, map_limit: float) -> None:
+    """the car's displayed speed limit and the map's current-road limit (0 when not usable), m/s, for the next engagement"""
+    self.car_speed_limit = car_limit
+    self.map_speed_limit = map_limit
+
+  def get_speed_limit_initial_set_speed(self) -> float | None:
+    """Rule 1 of the initial set speed (km/h), or None when it does not apply"""
+    return speed_limit_initial_set_speed(self.car_speed_limit, self.map_speed_limit, self.speed_limit_mode,
+                                         self.speed_limit_offset_type, self.speed_limit_offset_value, self.is_metric)
 
   def update_v_cruise_delta(self, long_press: bool, v_cruise_delta: float) -> tuple[bool, float]:
     if not self.custom_acc_enabled:
@@ -110,6 +134,7 @@ class VCruiseHelperSP:
 
   def update_speed_limit_assist(self, is_metric, LP_SP: custom.LongitudinalPlanSP) -> None:
     resolver = LP_SP.speedLimit.resolver
+    self.is_metric = is_metric
     self.has_speed_limit = resolver.speedLimitValid or resolver.speedLimitLastValid
     self.speed_limit_final_last = LP_SP.speedLimit.resolver.speedLimitFinalLast
     self.speed_limit_final_last_kph = self.speed_limit_final_last * CV.MS_TO_KPH
