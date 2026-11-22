@@ -345,7 +345,7 @@ EDGE_X = br.EDGE_EXTRA  # edge candidates count this much further in
 class TestCorrectionLaw:
   """B4: the right-line part, strengths, authority and the blend with regular upstream."""
   def test_both_lines_clear(self):
-    rl, res = steady(pl=1.0, pr=1.0, center=0.0, frames=600)  # rev 9b: the strength rises with 3 s (STRENGTH_TAU_UP)
+    rl, res = steady(pl=1.0, pr=1.0, center=0.0, frames=600)  # rev 9b: the strength rises with STRENGTH_TAU_UP (sized for round 2's 3 s; kept)
     assert res.log['a'] == 1.0 and abs(res.log['s_r'] - 1.0) < 1e-9
     assert res.k0 > 0.0  # the car at the lane centre is pulled right to the target
 
@@ -370,7 +370,7 @@ class TestCorrectionLaw:
 
   def test_blend_is_continuous_in_a(self):
     # rev 7: a is a first-order low-pass (tau 1 s) of a*: no step larger than the filter's (plus the 1e-3 end snap), monotone toward a*
-    # (rev 9b: rising with 3 s, falling with 1 s as before)
+    # (rev 9b: rising with STRENGTH_TAU_UP, falling with 1 s as before)
     rl, res = run_rl([Scene(pl=1.0, pr=1.0)] * 600, k0_up=0.0)
     a = np.array([r.log['a'] for r in res])
     assert np.max(np.abs(np.diff(a))) <= A_STEP
@@ -1254,7 +1254,7 @@ def _glide_ok(rows, v):
 
 class TestBlinkers:
   def test_left_blinker_fades_the_correction_in_one_second(self):
-    rl, res = run_rl([Scene(pl=1.0, pr=1.0)] * 300, k0_up=0.0)  # rev 9b: 15 s for the 3 s rise
+    rl, res = run_rl([Scene(pl=1.0, pr=1.0)] * 300, k0_up=0.0)  # rev 9b: 15 s (sized for round 2's 3 s rise; kept)
     a0 = res[-1].log['a']
     assert a0 > 0.9
     _, res = run_rl([Scene(pl=1.0, pr=1.0)] * 40, rl=rl, inputs=RightInputs(left_blinker=True))
@@ -1817,7 +1817,8 @@ class TestRev9bReference:
 
 # ---------------------------------------------------------------------------------------------------------------------------------
 # rev 9b (owner 20 Nov 2026 20:12 / 20:42): the strength in two parts: the confidence part through a 5 s low-pass both ways, the event part
-# falling at today's speed (1 s) and rising with 3 s
+# falling at today's speed (1 s) and rising with STRENGTH_TAU_UP (owner 22 Nov 00:37: 1 s; round 2: 3 s); the confidence part seeded at the
+# first usable q_R after a (re)start
 def strength_run(pr_fn, frames, radar_fn=None, rl=None, v=13.0):
   rl = rl or RightLineBlendful()
   out = []
@@ -1835,7 +1836,7 @@ def fall_time(a, i0, level=0.1):
 
 class TestRev9bStrength:
   def test_constants(self):
-    assert br.CONF_STRENGTH_TAU == 5.0 and br.STRENGTH_TAU_UP == 3.0 and br.STRENGTH_TAU_DOWN == br.STRENGTH_TAU == 1.0
+    assert br.CONF_STRENGTH_TAU == 5.0 and br.STRENGTH_TAU_UP == 1.0 and br.STRENGTH_TAU_DOWN == br.STRENGTH_TAU == 1.0
     assert not hasattr(br, 'STRENGTH_SPLIT')
 
   def test_an_event_fades_at_todays_speed(self):
@@ -1855,13 +1856,15 @@ class TestRev9bStrength:
     assert fall_time(r[:, 0], i_unusable) <= np.log(10) * (br.STRENGTH_TAU + DT_MDL) + DT_MDL
     assert r[i_unusable + 10, 2] > 0.5  # the confidence part itself is still high then
 
-  def test_the_return_after_an_event_rises_with_three_seconds(self):
+  def test_the_return_after_an_event_rises_with_strength_tau_up(self):
     fault = br.RadarFrame(tracks=[], age=0.0, fault=True, new=True, config_ok=True)
     _, r = strength_run(lambda i: 0.9, 1500, radar_fn=lambda i: fault if 600 <= i < 900 else None)
     assert r[899, 0] == 0.0
     i_ok = 900 + int(np.argmax(r[900:, 1] > 0.0))  # the radar is healthy again 1 s after the fault ends
-    a3 = r[i_ok + int(3.0 / DT_MDL), 0]
-    assert 1.0 - np.exp(-3.0 / (br.STRENGTH_TAU_UP + DT_MDL)) - 0.03 < a3 < 1.0 - np.exp(-3.0 / (br.STRENGTH_TAU_UP + DT_MDL)) + 0.03
+    k_up = br.STRENGTH_TAU_UP / (br.STRENGTH_TAU_UP + DT_MDL)  # the filter's factor per frame while rising
+    for t in (0.5, 1.0, 2.0):
+      n = int(round(t / DT_MDL))
+      assert abs(r[i_ok + n, 0] - (1.0 - k_up ** (n + 1))) < 0.01
 
   def test_a_partial_confidence_dip_moves_the_strength_far_less(self):
     # the right line's probability drops from 0.9 to 0.5 for 2 s (a partial dip: the reference stays usable): rev 8's strength followed
@@ -1893,3 +1896,79 @@ class TestRev9bStrength:
     i0 = 600 + int(np.argmax(unusable[600:]))
     i1 = i0 + int(np.argmax(~unusable[i0:]))
     assert np.all(r[i0:i1, 4] == r[i0, 4]) and r[i0, 4] > 0.7
+
+
+def base_strength(a_star):
+  """The strength of the base (inster before rev 9b): one 1 s low-pass of the unfiltered a* (logged a_star = confidence strength x event
+  factors), the same Authority filter."""
+  f = br.Authority()
+  return np.array([f.update(float(x)) for x in a_star])
+
+
+class TestRev9bStartUpSeed:
+  """Owner 22 Nov 2026 00:37 ("1s with seed"): after a (re)start the confidence part starts at the first usable q_R (the rev 9b reviewer's
+  round-2 probe), not at the start-up value 0 it then climbed from with 5 s (first engagement 9-22 s in the rev 8 scenes)."""
+
+  @staticmethod
+  def first_usable(r):
+    usable = r[:, 3] > br.STRENGTH_Q[0]
+    assert usable.any()
+    return int(np.argmax(usable))
+
+  @pytest.mark.parametrize("pr", [0.6, 0.75, 0.9, 1.0])
+  def test_seeded_at_the_first_usable_confidence(self, pr):
+    rl, r = strength_run(lambda i: pr, 200)
+    i0 = self.first_usable(r)
+    assert i0 > 0 and r[i0 - 1, 3] <= br.STRENGTH_Q[0]  # the start-up frames before it: the reference is not usable yet
+    assert rl.q_strength is not None
+    assert r[i0, 4] == r[i0, 3]  # seeded with q_R itself
+    assert np.all(r[:i0, 4] == r[:i0, 3])  # until then the confidence part is q_R (unfiltered; its strength is 0 there)
+    assert np.all(r[:i0, 0] == 0.0)
+    # from the seed on it follows q_R with its 5 s low-pass (not reseeded every frame)
+    q, qs = r[i0 + 1, 3], r[i0, 4]
+    assert r[i0 + 1, 4] == pytest.approx(qs + (q - qs) * DT_MDL / (DT_MDL + br.CONF_STRENGTH_TAU), abs=1e-6)
+
+  @pytest.mark.parametrize("pr", [0.75, 0.9, 1.0])
+  def test_first_engagement_is_about_as_fast_as_base(self, pr):
+    # a reaches 0.9 within 6 s of the start (3.3-5.7 s for pr 1.0-0.75; base 3.3 s; with the 1 s rise but without the seed the confidence
+    # part climbed from 0: 6.0-10.9 s)
+    _, r = strength_run(lambda i: pr, 400)
+    a = r[:, 0]
+    t90 = int(np.argmax(a >= 0.9)) * DT_MDL
+    assert a.max() >= 0.9 and t90 <= 6.0
+    t90_base = int(np.argmax(base_strength(r[:, 1]) >= 0.9)) * DT_MDL
+    assert t90 - t90_base <= 2.5
+
+  @pytest.mark.parametrize("ramp_s", [0.0, 1.0, 3.0])
+  @pytest.mark.parametrize("pr", [0.6, 0.9])
+  def test_strength_at_start_up_never_above_base(self, pr, ramp_s):
+    # the line's probability rises from 0 to pr over ramp_s, then stays: at every frame of the first 20 s a <= base's 1 s filter of a*, to
+    # within 0.005 (the event part has risen with 1 s since the start while base's filter of a* starts from a lower a*: once the confidence
+    # part reaches full strength the build's a can lie up to 0.003 above base's, at a > 0.97)
+    n_ramp = max(1, int(ramp_s / DT_MDL))
+    _, r = strength_run(lambda i: pr * min(1.0, i / n_ramp), 400)
+    b = base_strength(r[:, 1])
+    assert np.all(r[:, 0] <= b + 0.005)
+    assert np.all((r[:, 0] <= b + 1e-9) | (b > 0.97))
+
+  def test_reseeded_after_a_restart(self):
+    # a restart (reset of the right-line instance, e.g. after Regular) seeds again at the first usable q_R of the new start
+    rl, r1 = strength_run(lambda i: 0.9, 400)
+    assert r1[-1, 0] == 1.0
+    rl.reset()
+    assert rl.q_strength is None
+    _, r2 = strength_run(lambda i: 0.75, 200, rl=rl)
+    i0 = self.first_usable(r2)
+    assert r2[i0, 4] == r2[i0, 3]
+
+  def test_a_drop_out_after_the_seed_holds_and_does_not_reseed(self):
+    # review N1 unchanged: once seeded, an unusable reference holds the confidence part; when the line returns it continues from the held
+    # value with its low-pass, not from a new seed
+    _, r = strength_run(lambda i: 0.0 if 300 <= i < 360 else (0.9 if i < 300 else 0.6), 600)
+    unusable = r[:, 3] <= br.STRENGTH_Q[0]
+    i0 = 300 + int(np.argmax(unusable[300:]))
+    i1 = i0 + int(np.argmax(~unusable[i0:]))
+    held = r[i0, 4]
+    assert np.all(r[i0:i1, 4] == held) and held > 0.7
+    assert r[i1, 4] == pytest.approx(held + (r[i1, 3] - held) * DT_MDL / (DT_MDL + br.CONF_STRENGTH_TAU), abs=1e-6)
+    assert r[i1, 4] != r[i1, 3]

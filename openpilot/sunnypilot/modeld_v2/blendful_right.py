@@ -325,9 +325,13 @@ STRENGTH_TAU = 1.0  # s, rev 7 (owner 13 Nov 11:55): the strength a is a first-o
 # (2) The event part: every hand-back factor (bend, line jump, plausibility, blinker, radar yield, radar health, junction, a right reference
 #     that is not usable (q_R at or below the ramp's zero point), lane change / below 5 m/s, Regular) passes the strength filter, which
 #     falls with STRENGTH_TAU_DOWN (today's 1 s: every fade-out as fast as before, not slowed by (1)) and rises with STRENGTH_TAU_UP
-#     ("slow in", part 2's C_R3_V2b; 3 s committed default, 1 s the alternative reported for the owner).  a = strength(q_R filtered) x event filter.
+#     (owner 22 Nov 2026 00:37 "1s with seed": 1 s, as fast as it falls; 3 s was round 2's committed default).
+#     a = strength(q_R filtered) x event filter.
+# (3) Start-up seed (owner 22 Nov 00:37, the rev 9b reviewer's round-2 probe): after a (re)start the confidence part is seeded with q_R at the
+#     first frame on which the reference is usable (q_R above the ramp's zero point), not at the first frame (often a low start-up value it
+#     then had to climb from with 5 s); until then q_R itself is used (the strength is 0 there anyway: an unusable reference is an event).
 CONF_STRENGTH_TAU = 5.0  # s
-STRENGTH_TAU_UP = 3.0  # s
+STRENGTH_TAU_UP = 1.0  # s
 STRENGTH_TAU_DOWN = STRENGTH_TAU  # s, today's fade speed (kept)
 STRENGTH_Q = (0.2, 0.7)  # rev 7 (owner 13 Nov 11:59): strength 0 at a right-line confidence <= 0.2, 1 at >= 0.7, linear in between
 
@@ -866,8 +870,9 @@ class RightLineBlendful:
     self.reset()
 
   def reset(self):
-    self.authority = Authority(STRENGTH_TAU_UP, STRENGTH_TAU_DOWN)  # rev 9b: slow in (3 s), fades as today (1 s)
-    self.q_strength: float | None = None  # rev 9b: the confidence part, q_R through its own low-pass (CONF_STRENGTH_TAU both ways)
+    self.authority = Authority(STRENGTH_TAU_UP, STRENGTH_TAU_DOWN)  # rev 9b: rises with STRENGTH_TAU_UP (1 s), fades as today (1 s)
+    self.q_strength: float | None = None  # rev 9b: the confidence part, q_R through its own low-pass (CONF_STRENGTH_TAU both ways); None until
+    # the first usable q_R after this (re)start, which seeds it
     self.a_now = 0.0  # rev 9b: the strength a of the last frame
     # rev 8 review B1: the detector factor's own 1 s low-pass (same filter as the strength), starting at 1 (no scale-down)
     self.det_gain = Authority()
@@ -1140,11 +1145,11 @@ class RightLineBlendful:
     if force_regular or fading:
       f_event = 0.0
     # rev 9b: the confidence part slow both ways; the event part falls at today's speed and rises slowly
-    if self.q_strength is None or CONF_STRENGTH_TAU <= 0.0:
-      self.q_strength = q_R
-    elif qa_now > 0.0:  # review N1: held while the reference is unusable (that is an event already; counting it twice slowed the return)
+    if CONF_STRENGTH_TAU <= 0.0 or (self.q_strength is None and qa_now > 0.0):
+      self.q_strength = q_R  # start-up seed at the first usable q_R (owner 22 Nov 00:37)
+    elif self.q_strength is not None and qa_now > 0.0:  # review N1: held while the reference is unusable (an event already)
       self.q_strength += (q_R - self.q_strength) * dt / (dt + CONF_STRENGTH_TAU)
-    q_s = self.q_strength
+    q_s = self.q_strength if self.q_strength is not None else q_R
     qa = strength_from_confidence(q_s)
     f_event *= 1.0 if qa_now > 0.0 else 0.0  # an unusable right reference is an event (fades at today's speed)
     a_star = qa_now * f_event
