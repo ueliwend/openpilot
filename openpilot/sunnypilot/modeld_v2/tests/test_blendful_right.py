@@ -1729,8 +1729,8 @@ class TestLagBoundUnderFarFieldErrors:
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------
-# rev 9b (owner 20 Nov 2026 11:56 / 12:03 / 20:12): ONE right reference, formed gently and read by everything: softer blend (0.20 m) on both
-# references, gradual confidence push on the right, line hold (review S2 of rev 9); no filter after the combination (TARGET_REF_TAU dropped)
+# ONE right reference read by everything (rev 9b principle); Keep Right lane limit (owner 22 Nov 2026 02:31): the reference is the lane limit
+# (line or adjusted edge, asymmetric filter), replacing rev 9b's softer blend, confidence push and line hold
 def reference_run(pr_fn, edge_right, frames=400, v=13.0, rl=None):
   """RightLineBlendful on a straight lane (right line at 1.75 m) with a clear right edge at edge_right, the right line's probability pr_fn(i).
   Per frame: the right reference (lane limit) at L, the raw limit at L, whether the line counts (present), the line's filtered confidence,
@@ -1996,7 +1996,7 @@ class TestLaneLimit:
 
 # ---------------------------------------------------------------------------------------------------------------------------------
 # the strength: the confidence part is the right weighted line strength (step 5); the event part falls at today's speed (1 s) and rises
-# with STRENGTH_TAU_UP (owner 22 Nov 00:37: 1 s); the weighted strength is seeded at the first usable unified confidence after a (re)start
+# with STRENGTH_TAU_UP (owner 22 Nov 00:37: 1 s); the weighted strength starts at 0 after a (re)start (no seed, TestStartUp)
 def strength_run(pr_fn, frames, radar_fn=None, rl=None, v=13.0):
   rl = rl or RightLineBlendful()
   out = []
